@@ -52,3 +52,38 @@ node_modules/
 ./pretrain
 .idea/
 .aider*
+
+# ============================================================
+# manu/（qlib 量化研究工程自研层）· 2026-11-05 补
+# 上游 .gitignore 已覆盖：__pycache__/ *.pyc *.pkl *.csv .env
+#                          *.egg-info/ .pytest_cache/ .mypy_cache/ .idea/
+# 本段只补「上游没覆盖、且本工程真实会生成」的那几类
+# ============================================================
+
+# ---- 运行日志（host 与服务器都会生成，一律不入库）----
+*.log
+
+# ---- host 侧运行产物根（权威副本在服务器 /mnt/data/siping/runs/etf_rotation）----
+runs/
+logs/
+output/
+outputs/
+
+# ---- 一次性备份 / 探针临时目录（可再生，不是事实源）----
+*_host_backup*/
+*_backup*/
+*_backup_pre*/
+_probe*/
+
+# ---- 工具缓存 ----
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---- PyCharm ----
+.idea/
+*.iml
+
+# ---- 例外（必须进库，顺序要紧：放在 *.csv 之后才生效）----
+# 账户快照是**输入真值**（analyze.py / account.py 的默认账户口径），
+# 上游 .gitignore 的全局 *.csv 会把它误忽略 ⇒ 这里显式白名单放行。
+!manu/etf_rotation/data/account_snapshot.csv
