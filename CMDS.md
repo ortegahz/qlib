@@ -254,3 +254,74 @@ cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/run_gates.sh
 > 改完 `.gitattributes` 若 index 仍是旧版，须 `git rm --cached` 再 `git add`。
 > 🔴 **指纹表**：`CMDS.md` 与 memory 四件套在 `/mnt/data/siping/runs/etf_rotation/_ms5_md5.txt` 的 35 条登记项里
 > ⇒ 改动它们**必然**让闸门 P2 变红 ⇒ 按 `rules.md §十四.92` 第 7 条重生成（先备份 → 从当前良好版重建 → 断言登记项集合不变）。
+
+## 每日 ETF 轮动流水线（2026-11-05 新增；服务器侧；**按需分析**）
+
+> 🔴 **交付形态（2026-11-05 用户改口，当前唯一形态）**：**按需分析** —— 用户在窗口喊「分析」⇒ 主 agent 在服务器跑流程 ⇒ **Markdown 报告直接回窗口**。
+> ❌ **服务器 crontab 已无本工程任何条目**（5 条定时任务已全部卸载）；❌ **邮件不再是默认动作**（保留为显式 `--send-email` 的 opt-in）。
+> 六阶段全流程：**盘后取数 → S 层 Alpha 推断 → E=W×S 穿透 + 均线过滤 → TradingAgents 辩论 → 规则层对账 → 执行卡 + 报告**。
+> 用法详见 `manu/etf_rotation/daily/README.md`；铁律见 `manu/memory/rules.md §十五`。
+
+```bash
+# ---- 服务器（huangzhe@192.168.99.40:32222）；重活一律上服务器 ----
+ssh -F /dev/null -p 32222 huangzhe@192.168.99.40
+cd /tmp/pycharm_project_658d3fc4
+
+# 1) 【默认】模式 A 日常巡检（按需）：跑完取数→计算→渲染报告，不发邮件
+#    报告落盘：manu/report/report_<YYYYMMDD>_mode<A|B>.md（工程目录下；可 env ETF_ROTATION_REPORT_DIR 改）
+#    日志：    /mnt/data/siping/runs/etf_rotation/daily/logs/daily_run_<YYYYMMDD>.log
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05
+
+# 1b) 模式 B 调仓信号日全流程（2026-12-01 收盘后；S 层 ~27min + 辩论 ~15min ⇒ 35~45 分钟）
+      #      模式 B 默认重跑 S 层 + 刷新 qlib 数据集（重活，用户当轮授权后跑）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --mode B
+
+# 1c) 模式 B 但跳过 LLM（省 API 配额）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --mode B --skip-llm
+
+# 1d) 干跑：不联网取数、不写产物（只验逻辑）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --dry-run
+
+# 1e) 报告落盘到指定路径
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 \
+    --report-md /mnt/data/siping/runs/etf_rotation/daily/report_20261105_modeB.md
+
+# 1f) 【按需】显式发邮件（默认不发；通道仍通，凭据在 0600 secrets 文件里）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-email
+
+# 1g) 【按需补发】只发已持久化的邮件草稿，不重跑任何计算
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only
+
+# 1h) 把服务器跑出来的报告【拉回 host 工程】（PyCharm 里直接看 manu/report/）
+bash manu/tools/pull_reports.sh                 # 拉全部报告 + md5 双侧比对
+bash manu/tools/pull_reports.sh --check         # 只比对 md5，不落盘
+bash manu/tools/pull_reports.sh --list          # 只列服务器上有什么
+
+# 2) 看日志与当天产物
+tail -n 100 /mnt/data/siping/runs/etf_rotation/daily/logs/daily_run_20261105.log
+ls -l /mnt/data/siping/runs/etf_rotation/daily/20261105/
+cat manu/report/report_20261105_modeB.md                                               # Markdown 报告（主交付件）
+cat /mnt/data/siping/runs/etf_rotation/daily/20261105/heartbeat_20261105.json     # 心跳
+cat /mnt/data/siping/runs/etf_rotation/daily/20261105/execution_card_20261105.json # 模式 B 执行卡
+
+# 3) 确认服务器上没有本工程的定时任务（应当只有系统默认两行）
+crontab -l
+
+# ---- host 本地：同步到服务器（本地改完必跑；判据只能 md5 双侧比对）----
+cd /media/manu/1TB-Volume/workspace/qlib
+bash manu/tools/sync_to_server.sh manu/etf_rotation/daily
+#    预演：bash manu/tools/sync_to_server.sh --dry-run manu/etf_rotation/daily
+#    只比对：bash manu/tools/sync_to_server.sh --check  manu/etf_rotation/daily
+
+# ---- host 本地：跑每日链路的单测（只跑单测，不触发任何重活）----
+cd /media/manu/1TB-Volume/workspace/qlib
+/home/manu/anaconda3/envs/uav/bin/python -m pytest manu/etf_rotation/daily/tests -q
+#    服务器侧等价（ql env 未装 pytest 时先在该 env 内 pip install pytest）：
+#    /home/huangzhe/anaconda3/envs/ql/bin/python -m pytest manu/etf_rotation/daily/tests -q
+```
+
+> 🔴 **重活开关**：`--refresh-scores`（重跑 S 层，约 **27 分钟**；`qlib_scores.py` 是**整体覆盖** `stock_scores.csv`、**不是增量**）与 `--update-qlib-bin`（刷新 qlib 数据集：滚动官方快照换库 ＋ **日历前缀一致性 fail-closed** 校验）**在模式 B 默认开启**（用户当轮授权后跑）；**模式 A 永远不跑**（无论开关怎么给）。
+> 🔴 **密钥纪律**：126 客户端授权码**只**写进服务器 `/mnt/data/siping/secrets/smtp.env`（权限 **0600**）⇒ **绝不进仓库、不进日志、不进邮件正文**；⚠️ 用**网页登录密码**会 `535 authentication failed`（126 只认客户端授权码）。
+> 退出码：**0** 成功（含非交易日静默退出）· **1** 失败 · **2** 用法错误 / 锁冲突。
+> ⚠️ **看门狗当前不部署**：`manu/tools/etf_watchdog.py` 保留在仓库（纯标准库），但它的守护对象是 cron ⇒ 取消定时后**没有守护对象**；服务器持久盘 `/mnt/data/siping/apps/etf_watchdog.py` 的旧副本保留未删（无害）。
+> 🔴 **`install_schedule.sh` 已删除**（2026-11-05）：它唯一的用途是往用户 crontab 装那 5 条定时任务 ⇒ 取消定时后即死代码 ⇒ 删除，**不要再往 crontab 装本工程任何条目**。

@@ -50,7 +50,11 @@ _TOLERANCE = 0.01
 _DERIVED_TOLERANCE = 0.02
 
 
-def load_account_snapshot(path: str | Path | None = None) -> pd.DataFrame:
+def load_account_snapshot(
+    path: str | Path | None = None,
+    cash: float | None = None,
+    total_assets: float | None = None,
+) -> pd.DataFrame:
     """加载并校验账户快照 CSV，返回归一化后的持仓表。
 
     返回列：`code, name, shares, price, market_value, pnl_pct, cost, pnl`。
@@ -70,6 +74,15 @@ def load_account_snapshot(path: str | Path | None = None) -> pd.DataFrame:
     ----
     path:
         快照 CSV 路径；缺省用模块内的 `ACCOUNT_SNAPSHOT_CSV`。
+    cash:
+        校验 2（Σ市值 + 现金 = 总资产）用的现金；缺省用模块常量 `CASH`。
+    total_assets:
+        校验 2 用的总资产；缺省用模块常量 `TOTAL_ASSETS`。
+
+    🔴 2026-11-05（每日流水线）：本模块是**研究链**的账户基准（2026-11-04 快照）。
+        每日流水线用的是**实盘基准**（2026-11-05，30,035.57 元）⇒ 通过 `cash` /
+        `total_assets` 参数**显式注入**，不污染本模块的常量
+        （改常量会让已归档交付件与指纹表假性失配）。
     """
     csv_path = Path(path) if path is not None else ACCOUNT_SNAPSHOT_CSV
     if not csv_path.exists():
@@ -101,11 +114,13 @@ def load_account_snapshot(path: str | Path | None = None) -> pd.DataFrame:
 
     # --- 校验 2：持仓市值合计 + 现金 = 总资产 --------------------------------
     total_mv = float(df["market_value"].sum())
-    total_diff = total_mv + CASH - TOTAL_ASSETS
+    _cash = CASH if cash is None else float(cash)
+    _total = TOTAL_ASSETS if total_assets is None else float(total_assets)
+    total_diff = total_mv + _cash - _total
     if abs(total_diff) >= _TOLERANCE:
         raise ValueError(
-            f"账户对账失败：持仓市值合计 {total_mv:.2f} + 现金 {CASH:.2f} = {total_mv + CASH:.2f}，"
-            f"与总资产 {TOTAL_ASSETS:.2f} 偏差 {total_diff:+.2f} 元"
+            f"账户对账失败：持仓市值合计 {total_mv:.2f} + 现金 {_cash:.2f} = {total_mv + _cash:.2f}，"
+            f"与总资产 {_total:.2f} 偏差 {total_diff:+.2f} 元"
         )
 
     # --- cost / pnl：反推，并与 CSV 对账 -------------------------------------

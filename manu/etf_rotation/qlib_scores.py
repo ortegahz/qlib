@@ -40,6 +40,7 @@ import hashlib
 import json
 import pickle
 import platform
+import re
 import sys
 import time
 from pathlib import Path
@@ -404,12 +405,25 @@ def ic_stats(scores: pd.DataFrame) -> dict[str, Any]:
     out: dict[str, Any] = {"per_day": per_day}
     for name, arr in (("ic", ics), ("rank_ic", rank_ics)):
         if not arr:
-            out[name] = {"mean": None, "std": None, "icir": None, "t": None, "n_days": 0}
+            out[name] = {
+                "mean": None,
+                "std": None,
+                "icir": None,
+                "t": None,
+                "n_days": 0,
+                "icir_annualized": None,
+            }
             continue
         mean = float(np.mean(arr))
-        std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-        icir = mean / std if std > 0 else None
-        t = mean / (std / np.sqrt(len(arr))) if std > 0 and len(arr) > 1 else None
+        # 🔴 铁律六（禁编数字）：只有 1 个有效 IC 日时 ``ddof=1`` 的标准差**不存在**
+        #   ⇒ 原来写死 ``0.0`` 是**编出来的 0**（会被误读成「IC 完全没有波动」）⇒ 改 ``None``。
+        std = float(np.std(arr, ddof=1)) if len(arr) > 1 else None
+        icir = mean / std if std is not None and std > 0 else None
+        t = (
+            mean / (std / np.sqrt(len(arr)))
+            if std is not None and std > 0 and len(arr) > 1
+            else None
+        )
         out[name] = {
             "mean": mean,
             "std": std,
@@ -426,6 +440,93 @@ def ic_stats(scores: pd.DataFrame) -> dict[str, Any]:
         "median_n": float(np.median(ns)) if ns else 0,
     }
     return out
+
+
+# ------------------------------------------------------------------ 统计量呈现
+
+#: 缺失统计量的统一占位符（铁律六「禁编数字」：算不出来就写「—」，不许填 0 / 编造）
+MISSING_STAT = "—"
+
+#: 标签表达式里向前看的交易日数（``Ref($vwap, -2)`` ⇒ 2），用于解释「为什么 IC 算不出来」
+_LABEL_REF_RE = re.compile(r"Ref\(\s*\$[A-Za-z_]\w*\s*,\s*-(\d+)\s*\)")
+
+
+def fmt_stat(value: Any, fmt: str = ".6f") -> str:
+    """渲染**可能缺失**的统计量：缺失（``None`` / ``NaN`` / ``inf``）一律输出「—」。
+
+    🔴 铁律六（禁编数字）：算不出来的统计量**不许编、不许填 0**。
+    🔴 崩溃根因（2026-11-05 实测）：只打 **1 个评分日**时 IC 系列统计量是 ``None``
+       （打分日之后没有未来收益 ⇒ 标签算不出来 ⇒ IC 算不出来），
+       旧代码直接 `f"{ic['ic']['mean']:.6f}"` ⇒ ``TypeError: unsupported format string
+       passed to NoneType.__format__`` ⇒ ``--mode infer`` **非零退出**
+       ⇒ 上游 ``daily/agents_rebalance.py`` 阶段 2 被判失败 ⇒ 六阶段流水线中断。
+    ⇒ 统一走本助手：非缺失值按 ``fmt`` 正常格式化，缺失值输出「—」
+       （``NaN`` / ``inf`` 同按缺失处理 —— 它们不是可解读的统计量）。
+    """
+    if value is None:
+        return MISSING_STAT
+    if isinstance(value, (int, float, np.integer, np.floating)) and not np.isfinite(value):
+        return MISSING_STAT
+    return format(value, fmt)
+
+
+def label_horizon_days() -> int:
+    """标签表达式向前看的交易日数（``Ref($vwap, -2)/Ref($vwap, -1)-1`` ⇒ 2 个交易日）。
+
+    从**唯一事实源** ``config.STOCK.LABEL_EXPRESSIONS`` 解析，不写死常量。
+    """
+    horizons = [
+        int(m)
+        for expr in C.STOCK.LABEL_EXPRESSIONS
+        for m in _LABEL_REF_RE.findall(expr)
+    ]
+    return max(horizons) if horizons else 0
+
+
+def ic_stat_reason(ic: dict[str, Any], dates: list[pd.Timestamp], dataset_max: str) -> str:
+    """IC 统计量缺失时的**原因说明**（铁律六：缺失必须说清为什么，不许静默填 0）。
+
+    返回空串 = 全部统计量都可算，无需说明。
+    """
+    per_day = ic.get("per_day") or []
+    n_valid = sum(1 for d in per_day if d.get("ic") is not None)
+    missing: list[str] = []
+    for key, label in (("ic", "IC"), ("rank_ic", "rankIC")):
+        node = ic.get(key) or {}
+        if node.get("mean") is None:
+            missing.append(f"{label} mean")
+        else:
+            if node.get("icir") is None:
+                missing.append(f"{label} ICIR")
+            if node.get("t") is None:
+                missing.append(f"{label} t")
+    if not missing:
+        return ""
+    ctx: list[str] = []
+    if len(dates) == 1:
+        ctx.append(f"仅 1 个评分日（{dates[0].date()}）")
+    if per_day and n_valid == 0:
+        ctx.append(
+            f"标签窗口（需打分日之后 {label_horizon_days()} 个交易日）"
+            f"超出 qlib 数据集覆盖末日 {dataset_max} ⇒ 前瞻收益全为 NaN ⇒ 有效 IC 日 n=0"
+        )
+    elif n_valid == 1:
+        ctx.append("有效 IC 日仅 1 个 ⇒ ICIR/t 不可计算（需 ≥2 日且方差 > 0）")
+    head = ("；".join(ctx) + " ⇒ ") if ctx else ""
+    return f"{head}以下统计量不可计算 ⇒ 显示「{MISSING_STAT}」：{'、'.join(missing)}"
+
+
+def format_ic_summary(ic: dict[str, Any]) -> str:
+    """收尾摘要里的 IC 一行（**缺失统计量渲染「—」**，不许编、不许填 0）。"""
+    return (
+        f"== IC: pearson mean={fmt_stat(ic['ic']['mean'])} "
+        f"ICIR={fmt_stat(ic['ic']['icir'], '.4f')} t={fmt_stat(ic['ic']['t'], '.3f')} "
+        f"| rankIC mean={fmt_stat(ic['rank_ic']['mean'])} "
+        f"ICIR={fmt_stat(ic['rank_ic']['icir'], '.4f')} "
+        # 🔴 「覆盖」= **有有效标签**的股票数（dropna 之后），不是打分了多少只
+        #   （单日末位场景下打分了 5575 只，但标签全 NaN ⇒ 这里是 0 ⇒ 别读成「一只没打」）
+        f"| 有效标签覆盖中位 {fmt_stat(ic['coverage']['median_n'], '.0f')} 只 × {ic['coverage']['n_dates']} 日"
+    )
 
 
 def main() -> int:
@@ -516,7 +617,7 @@ def main() -> int:
         assert_non_degenerate(pred, d)
         frames.append(pred[["date", "instrument", "score"]])
         print(f"[{i}/{len(dates)}] {d.date()}  打分 {len(pred)} 只  score[min,max]="
-              f"[{pred['score'].min():.4f},{pred['score'].max():.4f}]")
+              f"[{fmt_stat(pred['score'].min(), '.4f')},{fmt_stat(pred['score'].max(), '.4f')}]")
 
     scores = pd.concat(frames, ignore_index=True)
 
@@ -534,13 +635,14 @@ def main() -> int:
     if validation.get("available"):
         print(
             f"[CHECK] 与个股线 pred.pkl 交叉校验：n={validation['n_overlap']} "
-            f"({validation['n_dates']} 日) spearman={validation['spearman']:.6f} "
-            f"max|Δ|={validation['max_abs_diff']:.3e}"
+            f"({validation['n_dates']} 日) spearman={fmt_stat(validation['spearman'])} "
+            f"max|Δ|={fmt_stat(validation['max_abs_diff'], '.3e')}"
         )
     else:
         print(f"[WARN] 交叉校验不可用：{validation.get('reason')}")
 
     ic = ic_stats(scores)
+    ic_reason = ic_stat_reason(ic, dates, dataset_max)
     manifest = {
         "generated_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
         "elapsed_sec": round(time.time() - t0, 1),
@@ -564,6 +666,7 @@ def main() -> int:
         "provider_uri": C.PROVIDER_URI,
         "region": C.REGION,
         "ic": ic,
+        "ic_missing_reason": ic_reason or None,
         "validation_vs_stock_line_pred": validation,
         "outputs": {"stock_scores_csv": str(scores_csv)},
         "script_md5": md5_of(Path(__file__).resolve()),
@@ -571,11 +674,9 @@ def main() -> int:
     mpath = out_dir / "stock_scores_manifest.json"
     mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(f"[OK] 已写出 {mpath}")
-    print(
-        f"== IC: pearson mean={ic['ic']['mean']:.6f} ICIR={ic['ic']['icir']:.4f} t={ic['ic']['t']:.3f} "
-        f"| rankIC mean={ic['rank_ic']['mean']:.6f} ICIR={ic['rank_ic']['icir']:.4f} "
-        f"| 覆盖中位 {ic['coverage']['median_n']:.0f} 只 × {ic['coverage']['n_dates']} 日"
-    )
+    print(format_ic_summary(ic))
+    if ic_reason:
+        print(f"== IC 说明：{ic_reason}")
     return 0
 
 

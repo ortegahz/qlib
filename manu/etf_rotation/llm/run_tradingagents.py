@@ -139,6 +139,46 @@ def _sha1(path: Path) -> str:
     return hashlib.sha1(Path(path).read_bytes()).hexdigest()
 
 
+def _load_account_json(path: Path) -> dict:
+    """读**账户上下文 JSON**（每日流水线导出的实盘口径）。
+
+    🔴 为什么要有这条路径（2026-11-05 正确性 bug）：
+    默认口径读的是**研究链**的 `manu/etf_rotation/account.py`
+    （2026-11-04 快照：现金 15,518.87 元 / 5 只持仓）
+    ⇒ Portfolio Manager 拿一个**用户根本没持有**的组合做推理
+    ⇒ 交付件混入无源结论（历史实测编出过「目标 15%」「止损 0.804」这类假论据）。
+    ⇒ 每日流水线用 `--account-json` 把**实盘口径**喂进来。
+
+    🔴 校验不过 ⇒ **直接报错**（**不许**静默回退到研究链 CSV ⇒ 那正是 bug 的根因）。
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"账户上下文 JSON 结构不对（不是对象）：{path}")
+    missing = [k for k in ("cash", "total_assets", "positions") if k not in payload]
+    if missing:
+        raise SystemExit(f"账户上下文 JSON 缺必需字段 {missing}：{path}")
+    if not isinstance(payload.get("positions"), list):
+        raise SystemExit(f"账户上下文 JSON 的 positions 不是数组：{path}")
+    return payload
+
+
+def _account_positions(payload: dict) -> list[dict]:
+    """把账户上下文 JSON 的持仓映射成 TA ``Position`` 的入参（**纯函数** ⇒ 可离线自测）。
+
+    ``cost`` 是**总成本**（元）⇒ 每股成本 = ``cost / shares``（TA 的 ``average_price``）。
+    """
+    out: list[dict] = []
+    for pos in payload["positions"]:
+        shares = float(pos["shares"])
+        cost = float(pos.get("cost") or 0.0)
+        out.append({
+            "ticker": str(pos["code"]),
+            "quantity": shares,
+            "average_price": (cost / shares) if shares else None,
+        })
+    return out
+
+
 def _render_md(payload: dict) -> str:
     """把决策 **json** 渲染成纪要 md（**纯函数** ⇒ 可从已有 json 重渲）。
 
@@ -251,6 +291,15 @@ def main() -> int:
     ap.add_argument("--render-only", type=int, default=0,
                     help="1=**不跑 LLM**，只用已存在的 --out-json 重渲 --out-md（渲染器修复后"
                          "重出展示件用；json 是完整事实源 ⇒ 结果与重跑一遍一致，但零 API 成本）")
+    ap.add_argument("--account-json", default=None,
+                    help="🔴 账户上下文 JSON（**优先于** account.py 的默认研究链快照）："
+                         "每日流水线把实盘口径导出后传进来 ⇒ Portfolio Manager 看到的是"
+                         "用户真实持仓，而不是研究链基准")
+    ap.add_argument("--reasoning-effort", default=None,
+                    choices=["max", "high", "medium", "low"],
+                    help="reasoning_effort 覆盖（优先级：**显式 env > 命令行 > .env**）；"
+                         "🔴 effort=max 时 MiniMax 单次调用实测 185 秒 ⇒ 慢但更准，"
+                         "medium 实测 91 秒")
     args = ap.parse_args()
 
     ta_dir = Path(args.ta_dir)
@@ -277,7 +326,18 @@ def main() -> int:
     # ⚠️ 必须在 import tradingagents **之前**加载 .env：
     #    default_config 在 import 期就把 TRADINGAGENTS_* 环境变量固化进 DEFAULT_CONFIG。
     from dotenv import load_dotenv
+    # 🔴 记录 **.env 载入前** 的显式 env（优先级：显式 env > 命令行 > .env）
+    _pre_env_effort = os.environ.get("TRADINGAGENTS_REASONING_EFFORT", "").strip()
     load_dotenv(ta_dir / ".env", override=False)
+    # 🔴 reasoning_effort 优先级：**显式 env > 命令行 > .env**
+    #    （load_dotenv(override=False) ⇒ .env 只填空位 ⇒ 已有 env 不会被 .env 覆盖）
+    if args.reasoning_effort:
+        if _pre_env_effort:
+            print(f"[INFO] reasoning_effort：环境变量已有值 ⇒ "
+                  f"命令行 --reasoning-effort {args.reasoning_effort} 不生效（显式 env 优先）")
+        else:
+            os.environ["TRADINGAGENTS_REASONING_EFFORT"] = args.reasoning_effort
+            print(f"[INFO] reasoning_effort：命令行覆盖 = {args.reasoning_effort}")
     sys.path.insert(0, str(ta_dir))
 
     from tradingagents.default_config import DEFAULT_CONFIG
@@ -288,26 +348,43 @@ def main() -> int:
     #    「Portfolio context: not provided」⇒ 它在**不知道持仓与现金**的前提下
     #    编出「目标 15%」「止损 0.804」「组合拖累 1.2%」等无源数字
     #    （上游风险披露明明写着「仍没有组合级硬止损」）⇒ 交付件里混入假论据。
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    import account as _account
+    if args.account_json:
+        # 🔴 每日流水线的**实盘口径**（优先于研究链基准）—— 2026-11-05 正确性修复。
+        _acct = _load_account_json(Path(args.account_json))
+        _positions = [
+            Position(ticker=p["ticker"], quantity=p["quantity"], average_price=p["average_price"])
+            for p in _account_positions(_acct)
+        ]
+        _portfolio = PortfolioContext(
+            cash=float(_acct["cash"]),
+            currency=str(_acct.get("currency") or "CNY"),
+            positions=_positions,
+        )
+        print(f"[INFO] 账户上下文（--account-json {args.account_json}）："
+              f"总资产 {float(_acct['total_assets']):.2f} 元，"
+              f"现金 {_portfolio.cash} 元，持仓 {len(_positions)} 只 "
+              f"（{', '.join(p.ticker for p in _positions)}）")
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import account as _account
 
-    _snap = _account.load_account_snapshot()
-    _positions = []
-    for _, _r in _snap.iterrows():
-        _shares = float(_r["shares"])
-        _cost_ps = float(_r["cost"]) / _shares if _shares else None
-        _positions.append(Position(
-            ticker=str(_r["code"]),
-            quantity=_shares,
-            average_price=_cost_ps,
-        ))
-    _portfolio = PortfolioContext(
-        cash=float(_account.CASH),
-        currency="CNY",
-        positions=_positions,
-    )
-    print(f"[INFO] 账户上下文：现金 {_portfolio.cash} 元，持仓 {len(_positions)} 只 "
-          f"（{', '.join(p.ticker for p in _positions)}）")
+        _snap = _account.load_account_snapshot()
+        _positions = []
+        for _, _r in _snap.iterrows():
+            _shares = float(_r["shares"])
+            _cost_ps = float(_r["cost"]) / _shares if _shares else None
+            _positions.append(Position(
+                ticker=str(_r["code"]),
+                quantity=_shares,
+                average_price=_cost_ps,
+            ))
+        _portfolio = PortfolioContext(
+            cash=float(_account.CASH),
+            currency="CNY",
+            positions=_positions,
+        )
+        print(f"[INFO] 账户上下文：现金 {_portfolio.cash} 元，持仓 {len(_positions)} 只 "
+              f"（{', '.join(p.ticker for p in _positions)}）")
 
     if args.offline_tools:
         # 🔴 实测（2026-11-04 18:19 / 18:22 两轮）：
@@ -379,6 +456,8 @@ def main() -> int:
         "max_recur_limit": args.max_recur,
         "date": args.date,
         "analysts": list(analysts),
+        "account_json": args.account_json,
+        "reasoning_effort_arg": args.reasoning_effort,
         "provider": cfg.get("llm_provider"),
         "deep_think_llm": cfg.get("deep_think_llm"),
         "quick_think_llm": cfg.get("quick_think_llm"),

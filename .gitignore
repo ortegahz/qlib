@@ -87,3 +87,14 @@ _probe*/
 # 账户快照是**输入真值**（analyze.py / account.py 的默认账户口径），
 # 上游 .gitignore 的全局 *.csv 会把它误忽略 ⇒ 这里显式白名单放行。
 !manu/etf_rotation/data/account_snapshot.csv
+
+# ---- 报告产物（权威副本在服务器 /mnt/data/siping/runs/etf_rotation/）----
+# 🔴 按铁律 §十四.93 第 3 条：「权威产物（报告 / 决策 / 计划 / 指纹表）不入库，
+#     靠 md5 链与 memory 记录引用」⇒ 报告落盘照常，但不入版本库。
+manu/report/
+
+# ---- 每日流水线（manu/etf_rotation/daily/）的运行物 ----
+# 日志目录（*.log 已在上方覆盖；这里再钉住目录形态，防止 .gitkeep 之类的误收）
+manu/etf_rotation/daily/logs/
+# dry-run 邮件落盘件（notify_email.py --dry-run 产出）
+*.eml

@@ -33,7 +33,13 @@ _spec = importlib.util.spec_from_file_location("manu_stock_line_config", _STOCK_
 if _spec is None or _spec.loader is None:
     raise ImportError(f"无法加载个股线 config：{_STOCK_CFG_PATH}")
 STOCK = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(STOCK)
+# 🔴 必须先登记进 sys.modules 再 exec_module（见下方注释）
+sys.modules[_spec.name] = STOCK
+try:
+    _spec.loader.exec_module(STOCK)
+except Exception:
+    sys.modules.pop(_spec.name, None)
+    raise
 
 # ---------------------------------------------------------------- qlib 侧（继承个股线）
 PROVIDER_URI = STOCK.PROVIDER_URI

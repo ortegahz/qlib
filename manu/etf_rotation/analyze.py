@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import platform
@@ -428,10 +429,39 @@ def _scores_asof_missing_message(
     )
 
 
-def _load_account_snapshot(path: Path | None) -> tuple[pd.DataFrame, Path | None]:
+def _call_account_loader(
+    loader, resolved: Path, cash: float | None = None, total_assets: float | None = None
+):
+    """调用 `account.load_account_snapshot`，**按签名**决定要不要传覆盖参数。
+
+    🔴 不能靠 `try/except TypeError` 兜底 —— loader **内部**抛 TypeError 时会被误判成
+    「签名不支持」⇒ 覆盖参数被静默丢弃 ⇒ 报告用错账户口径还**不报错**。
+    ⇒ 这里先看签名，再决定传不传。
+    """
+    try:
+        params = inspect.signature(loader).parameters
+    except (TypeError, ValueError):  # pragma: no cover - 内建/C 扩展没有签名
+        params = {}
+    kwargs = {}
+    if "cash" in params:
+        kwargs["cash"] = cash
+    if "total_assets" in params:
+        kwargs["total_assets"] = total_assets
+    return loader(resolved, **kwargs)
+
+
+def _load_account_snapshot(
+    path: Path | None,
+    cash: float | None = None,
+    total_assets: float | None = None,
+) -> tuple[pd.DataFrame, Path | None]:
     """读账户快照（列：code, name, shares, price, market_value, pnl, pnl_pct）。
 
     优先用 `account.load_account_snapshot`（账户口径的**所有者**）；模块缺失时退回本地读 CSV。
+
+    🔴 2026-11-05（每日流水线）：`cash` / `total_assets` 给定时**覆盖** `account.py`
+        的模块常量，用于注入**实盘基准**（2026-11-05，30,035.57 元）。
+        缺省（None）⇒ 行为与原来**逐字节一致**（研究链口径不变）。
     """
     resolved = Path(path) if path else getattr(ACC, "ACCOUNT_SNAPSHOT_CSV", DEFAULT_ACCOUNT_SNAPSHOT_CSV)
     if not Path(resolved).exists():
@@ -442,7 +472,7 @@ def _load_account_snapshot(path: Path | None) -> tuple[pd.DataFrame, Path | None
     loader = getattr(ACC, "load_account_snapshot", None)
     if callable(loader):
         try:
-            df = loader(resolved)
+            df = _call_account_loader(loader, resolved, cash=cash, total_assets=total_assets)
         except Exception as exc:  # 账户模块自带对账守卫 ⇒ 错误必须原样透出
             raise ValueError(f"账户快照 `{resolved}` 读取/对账失败：{exc}") from exc
     else:
@@ -2733,6 +2763,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exit-ma-window", type=int, default=None, help="持仓强制退出均线（0=关）")
     p.add_argument("--nav", type=float, default=None, help="账户实际净值（配合 --nav-peak 判断回撤刹车）")
     p.add_argument("--nav-peak", type=float, default=None, help="账户历史最高净值")
+    # 🔴 2026-11-05（每日流水线）：**注入实盘账户基准**。
+    #    不给 ⇒ 用 `account.py` 的研究链常量（29,854.67 元）⇒ 行为与原来逐字节一致；
+    #    给了 ⇒ 覆盖总资产 / 现金（用于 2026-11-05 实盘基准 30,035.57 元）。
+    p.add_argument("--total-assets", type=float, default=None,
+                   help="账户总资产（元）；缺省用 account.TOTAL_ASSETS")
+    p.add_argument("--cash", type=float, default=None,
+                   help="账户现金（元）；缺省用 account.CASH")
     return p.parse_args()
 
 
@@ -2831,7 +2868,9 @@ def main() -> int:
     account_reason = None
     try:
         snapshot, snapshot_path = _load_account_snapshot(
-            Path(args.account_snapshot) if args.account_snapshot else None
+            Path(args.account_snapshot) if args.account_snapshot else None,
+            cash=args.cash,
+            total_assets=args.total_assets,
         )
     except FileNotFoundError as exc:
         # 🔴 IMPORTANT（2026-11-04 夜审）：规格要求「读不到必需输入 ⇒ 抛异常 + 中文错误」。
@@ -2843,8 +2882,16 @@ def main() -> int:
             "请先生成 manu/etf_rotation/data/account_snapshot.csv（或用 --account-snapshot 指定）"
         ) from exc
 
-    total_assets = float(getattr(ACC, "TOTAL_ASSETS", 0.0) or 0.0)
-    cash = float(getattr(ACC, "CASH", 0.0) or 0.0)
+    total_assets = (
+        float(args.total_assets)
+        if args.total_assets is not None
+        else float(getattr(ACC, "TOTAL_ASSETS", 0.0) or 0.0)
+    )
+    cash = (
+        float(args.cash)
+        if args.cash is not None
+        else float(getattr(ACC, "CASH", 0.0) or 0.0)
+    )
     if total_assets <= 0 and not snapshot.empty:
         total_assets = float(np.nansum(snapshot["market_value"].to_numpy(dtype=float)))
     current_weights: dict[str, float] = {}

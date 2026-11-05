@@ -33,12 +33,16 @@ RSYNC_RSH="ssh -F /dev/null -p $SSH_PORT"
 
 DRY_RUN=0
 CHECK_ONLY=0
+DO_DELETE=0
 PATHS=()
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --check)   CHECK_ONLY=1 ;;
+    # 🔴 --delete：把**服务器上多出来的文件**删掉（host 侧已删除的文件同步删除）。
+    #    只删「host 侧不存在、服务器侧存在」的文件；host 侧有的文件照常覆盖。
+    --delete)  DO_DELETE=1 ;;
     --*)       echo "未知参数: $arg" >&2; exit 2 ;;
     *)         PATHS+=("$arg") ;;
   esac
@@ -59,7 +63,11 @@ done
 
 # ---------- 排除项 ----------
 EXCLUDES=(--exclude='__pycache__/' --exclude='*.pyc' --exclude='.pytest_cache/'
-          --exclude='.ipynb_checkpoints/' --exclude='*.swp' --exclude='.DS_Store')
+          --exclude='.ipynb_checkpoints/' --exclude='*.swp' --exclude='.DS_Store'
+          # 🔴 manu/report/ **一律不推送**：报告的**真值在服务器**（流水线在服务器跑），
+          #    host 上的那份是用 `manu/tools/pull_reports.sh` **拉回来**的 ⇒
+          #    推送方向会把 host 的旧副本覆盖到服务器 ⇒ 丢报告。
+          --exclude='manu/report/')
 
 # ---------- md5 清单（本地侧） ----------
 md5_local() {
@@ -75,8 +83,13 @@ md5_local() {
 if [ "$CHECK_ONLY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   echo "== [1/3] rsync 推送 =="
   for p in "${PATHS[@]}"; do
-    rsync -az --rsh="$RSYNC_RSH" "${EXCLUDES[@]}" \
-      "$SRC_REPO/$p" "$SSH_HOST:$REMOTE_ROOT/$(dirname "$p")/"
+    if [ "$DO_DELETE" -eq 1 ]; then
+      rsync -az --delete --rsh="$RSYNC_RSH" "${EXCLUDES[@]}" \
+        "$SRC_REPO/$p/" "$SSH_HOST:$REMOTE_ROOT/$p/"
+    else
+      rsync -az --rsh="$RSYNC_RSH" "${EXCLUDES[@]}" \
+        "$SRC_REPO/$p" "$SSH_HOST:$REMOTE_ROOT/$(dirname "$p")/"
+    fi
   done
   echo "   推送完成"
 else
