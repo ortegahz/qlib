@@ -38,9 +38,26 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from report_fingerprint import report_content_sha1_from_file  # noqa: E402
+import config as C  # noqa: E402  （落点常量单一事实源）
 import llm_final as llm_final_mod  # noqa: E402
 
 LOT = 100  # ETF 最小交易单位：100 股（一手）
+
+
+def _ACCOUNT_SNAPSHOT_CSV_DEFAULT():
+    """账户基准 CSV 的缺省路径（**账户模块自己的口径**，不写死服务器绝对路径）。
+
+    🔴 2026-11-10：原先 CLI 缺省写死 `/tmp/pycharm_project_658d3fc4/manu/etf_rotation/
+    data/account_snapshot.csv` ⇒ 换机器 / 换目录就找不到账户基准（静默退化成空仓）。
+    ⇒ 改读 `account.ACCOUNT_SNAPSHOT_CSV`（与 `analyze.py` 同源、同口径）。
+    模块缺失时退回「脚本同目录 `data/account_snapshot.csv`」。
+    """
+    try:
+        import account  # noqa: PLC0415
+
+        return Path(account.ACCOUNT_SNAPSHOT_CSV)
+    except Exception:  # noqa: BLE001 —— 账户模块不可用时退回同目录约定路径
+        return _SCRIPT_DIR / "data" / "account_snapshot.csv"
 
 
 def _f(value, default=None):
@@ -385,6 +402,108 @@ _LLM_DIR_CELL = re.compile(
     r"Buy|Sell|Hold|Overweight|Underweight|Neutral)",
     re.IGNORECASE,
 )
+#: 🔴 2026-11-09（Mode C v2 独立审计实证）：**否定式买入**的长前缀。
+#:    实测事故：LLM 最终表写「**不作为防守仓买入**」⇒ 旧方向抽取拿到「买入」
+#:    ⇒ 目标权重 0% 与方向「买入」矛盾 ⇒ 交付件自带的「方向-权重语义自洽」守卫
+#:    必然 FAIL（买 ⇒ 目标必须 >0%）。
+#:    ⇒ 修法：方向词**前面**出现这些否定前缀 ⇒ 该方向按「**不买**」处理。
+#:    ⚠️ 只认**长前缀**，不改成「往前 N 字里有『不』就算否定」——
+#:    否则「虽然基本面不好但建议买入」会被误判成「不买」（实测反例）。
+_NEG_BUY_PREFIX = ("不作为", "不作", "不予以", "不当", "不打算", "不计划")
+#: 方向 ∈ 下列集合 ⇒ 目标权重**必然是 0%**（与 `llm_final.py` 的 `_ACTION_RULES` 同口径：
+#:    清仓类 ⇒ 卖 + 0%｜裸「卖出」⇒ 卖 + 0%｜不买/不建仓 ⇒ 0%）。
+_ZERO_DIR_WORDS = ("卖", "卖出", "卖掉", "清仓", "清掉", "清零",
+                   "不买", "不建仓", "退出")
+#: 「卖出约 2,600 股」= **部分卖出**（减），**不是**清仓 ⇒ 与 llm_final.py `_ACTION_RULES` ② 同口径
+_PARTIAL_SELL_RE = re.compile(r"卖出\s*(?:约)?\s*[\d,]+(?:\.\d+)?\s*(?:股|份)")
+#: 方向词里属「买入」语义的那些（用于否定式判定）
+_POS_DIR_WORDS = ("买", "买入", "加仓", "增持", "加", "增")
+#: 🔴 2026-11-10（服务器实跑 20261110_120420 实证）：**后置否定** ——
+#:    否定词紧跟在买入类词**后面**（「买：否」「买(否)」「买，不」…），而不是前面。
+#:    实测事故：LLM 空头表的方向格写「**买：否**」（同行目标权重 **0%**）
+#:    ⇒ 旧实现只认**前缀**否定 ⇒ 方向被判成「买」（POS）
+#:    ⇒ 与目标 0% 自相矛盾 ⇒ 交付件自带守卫「LLM 方向-权重语义自洽」报 4 条异常
+#:       （159207 / 512170 / 515450 / 515650，四条全是空头视图的 direction='买'）。
+#:    ⇒ 修法：买入类词**后面**紧跟（只隔标点/空白）否定标记 ⇒ 按「**不买**」处理
+#:       （「不买」属 ZERO 类 ⇒ 目标必须 0%，与原文一致）。
+#:    ⚠️ 判定必须**精确**：否定标记之后**不许**再出现实义内容
+#:    （否则「买入，不做波段」这种**真买入**会被误判成「不买」）。
+#:    ⚠️ 括号**可以**当分隔符（「买(否)」是本轮实测写法之一），
+#:       真正把「买入（不追高）」挡在门外的是**否定标记之后的实义残留检查**。
+_NEG_BUY_SUFFIX_RE = re.compile(
+    r"(?:买入|增持|加仓|买|加|增)"
+    r"[\s:：、,，;；/／|\-–—~～*()（）=≠]*"
+    r"(?:否|不|没|无)"
+)
+#: 否定标记之后允许出现的**收尾**字符（空白 / 标点 / markdown 强调）
+_CLOSING_ONLY_RE = re.compile(r"^[\s*~，。、；;：:（）()\[\]【】<>《》/\\|\-–—]*$")
+#: 否定标记之后的**括号备注**（「买：否（估值偏高）」）—— 备注里不许再出现方向词
+_BRACKET_TAIL_RE = re.compile(
+    r"^[（(【\[][^（()）【】\[\]]*[）)】\]]?[\s*~]*$"
+)
+
+
+def _suffix_is_closing(rest: str) -> bool:
+    """否定标记**之后**的残余文字是否只是「收尾」（标点 / 强调 / 括号备注）。
+
+    🔴 精确性闸门：「买入，不做波段」这种**真买入**句 ⇒ 残余里还有实义内容
+       ⇒ **不算**否定 ⇒ 方向仍是「买」（不许被后置否定规则误伤）。
+    """
+    text = (rest or "").strip()
+    if not text:
+        return True
+    if _CLOSING_ONLY_RE.match(text):
+        return True
+    _m = _BRACKET_TAIL_RE.match(text)
+    if _m and not _LLM_DIR_CELL.search(text):
+        return True
+    return False
+
+
+def _negated_buy_suffix(cell: str) -> bool:
+    """方向格里的**后置否定**（「买：否」「买:否」「买(否)」「买/否」「买，不」…）。
+
+    🔴 2026-11-10（服务器实跑实证）：LLM 把空头表的方向格写成「**买：否**」
+       ⇒ 旧口径只认前缀否定 ⇒ 方向 = 「买」⇒ 与目标 0% 自相矛盾 ⇒ 守卫 FAIL。
+    """
+    for _m in _NEG_BUY_SUFFIX_RE.finditer(cell or ""):
+        if _suffix_is_closing(cell[_m.end():]):
+            return True
+    return False
+
+
+def _classify_dir_cell(cell: str) -> str:
+    """从表格单元格抽方向词（**否定式优先 → 长词优先**）。
+
+    🔴 2026-11-09（Mode C v2 审计实证）修的两个真缺陷：
+      ① **否定式买入**：旧实现用 `search` 取**最左**匹配 ⇒ 「条件式小买，否则不买」
+         取到「买」（POS）⇒ 目标 0% 与方向矛盾 ⇒ 守卫 FAIL；
+         「不作为防守仓买入」取到「买入」⇒ 同样矛盾。
+         ⇒ 现在：**长否定前缀**在前 ⇒ 按「不买」；**长词优先**（不买 > 买、卖出 > 卖）。
+      ② **部分卖出**：「卖出约 2,600 股」是**减仓**不是清仓 ⇒ 不能按 ZERO 处理。
+
+    🔴 2026-11-10（服务器实跑 20261110_120420 实证）补的第三个真缺陷：
+      ③ **后置否定**：「买：否」这类写法（否定词在买入词**后面**）旧口径**不认**
+         ⇒ 方向判成「买」⇒ 与同行目标权重 0% 自相矛盾 ⇒ 守卫「方向-权重语义自洽」FAIL。
+         ⇒ 现在：**前缀否定**与**后置否定**都归「不买」；**部分卖出**仍是最高优先级。
+    """
+    hits = list(_LLM_DIR_CELL.finditer(cell))
+    if not hits:
+        return ""
+    if _PARTIAL_SELL_RE.search(cell):
+        return "减"
+    for _m in hits:
+        if _m.group(1) in _POS_DIR_WORDS and any(
+                _p in cell[:_m.start()] for _p in _NEG_BUY_PREFIX):
+            return "不买"
+    # 🔴 后置否定：「买：否」⇒ 方向按「不买」处理（ZERO 类 ⇒ 目标必须 0%）
+    if _negated_buy_suffix(cell):
+        return "不买"
+    # 长词优先；同长取最靠左
+    _best = max(hits, key=lambda _m: (len(_m.group(1)), -_m.start()))
+    return _best.group(1)
+
+
 #: 标题里的序号前缀（「一、」「1.」「第二章」）—— 剥掉它才能判断标题**属于哪个说话人**
 _LLM_HEADING_NUM = re.compile(
     r"^(?:[一二三四五六七八九十百]+、|\d+(?:\.\d+)*[.、)]?\s*|第[一二三四五六七八九十百]+[章节部分][、.．]?\s*)"
@@ -919,19 +1038,19 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
                     break
         direction = ""
         if _ai is not None and _ai < len(cells):
-            m = _LLM_DIR_CELL.search(cells[_ai])
-            if m:
-                direction = m.group(1)
+            direction = _classify_dir_cell(cells[_ai])
         if not direction:
             for c in cells:
                 if c == code:
                     continue
-                m = _LLM_DIR_CELL.search(c)
-                if m:
-                    direction = m.group(1)
+                direction = _classify_dir_cell(c)
+                if direction:
                     break
         if not direction:
             continue
+        # 🔴 2026-11-09：ZERO 方向（卖/清仓/不买…）⇒ 目标权重**必然是 0%**，
+        #    且**先于任何数字路径生效**（见下面 ④ 之前的说明）。
+        _force_zero = direction in _ZERO_DIR_WORDS
 
         # ---- 目标权重列：三条可靠路径，按优先级；**都判不出来 ⇒ 丢弃该行** ----
         # 🔴 F6（2026-11-04 21:2x E2E 实测事故）：
@@ -964,7 +1083,13 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
         #    = 账户 29,854.67 元的 10.0%）旧实现判不出百分比 ⇒ **整行被丢弃**
         #    ⇒ 多头「仅10%试仓」这类**真实分歧**永远进不了冲突表（信息丢失）。
         #    修法：表头指认的目标格里若**只有「元」没有「%」**，按 total_assets 折成百分比。
-        if target_pct is None and _ti is not None and _ti != _ri:
+        if target_pct is None and _ti is not None and _ti != _ri and not _force_zero:
+            # 🔴 2026-11-09（Mode C v2 审计实证）：**ZERO 方向下不许做「金额→百分比」折算**。
+            #    实测事故：多头表「| **159929** | **卖** | 清仓，约3,335元 | …」⇒
+            #    3,335 元是**卖出金额**（＝清掉 11.17% 的现有仓位），却被折成
+            #    **11.17% 的「目标权重」** ⇒ 方向「卖」配目标 11.17% ⇒ 语义守卫必然 FAIL。
+            #    ⇒ 修法：方向 ∈ ZERO（卖/清仓/不买…）⇒ 目标**必然是 0%**（走 ④ 兜底），
+            #      **任何金额都不许参与折算**（部分卖出「减」不受影响 ⇒ 折算照旧）。
             _yuan_pct = _yuan_cell_to_pct(cells[_ti], total_assets)
             if _yuan_pct is not None:
                 target_pct = _yuan_pct
@@ -1028,7 +1153,12 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
                     break
         if target_pct is None:
             # ④ 语义兜底：**卖出/清仓/不买 ⇒ 目标必然是 0%**（不需要百分比来证明）
-            if re.search(r"卖|清|不买|退出|清掉", direction):
+            #    🔴 2026-11-09：ZERO 词表用 `_ZERO_DIR_WORDS`（与语义守卫同口径），
+            #    旧正则漏了「不建仓 / 清零 / 卖掉」等词 ⇒ 那些行会被**丢弃**（信息丢失）。
+            #    🔴 2026-11-09：旧口径用**子串** `卖` ⇒「减持」「减仓」里都命中
+            #       ⇒ 减仓方向被兜底强制成 0%（清仓）⇒ 与「部分卖出≠清仓」冲突。
+            #       ⇒ 现在先排除「减」字后面的「卖」（(?:^|[^减])卖），减仓保持 None（不猜）。
+            if direction in _ZERO_DIR_WORDS or re.search(r"(?:^|[^减])卖|清|不买|退出|清掉", direction):
                 target_pct = 0.0
             else:
                 continue   # 判不出目标权重 ⇒ 丢弃该行，不猜
@@ -1211,7 +1341,7 @@ def _llm_targets(decision_md: str | None, total_assets: float | None = None,
 #:    **各读一次** ⇒ 决策文件在运行中被改写时，**同一份产物里三个字段会自相矛盾**
 #:    （status=ok 却 error=失败 / source_decision 有值却 status=failed）。
 #: 🔴 2026-11-04 22:5x 实测**推翻了「按 (mtime_ns, size) 失效」的设计**：
-#:    本机 /mnt/data 的 mtime 粒度约 **4ms**，且**同大小改写时 mtime 与 size 都不变**
+#:    本机持久盘（落点根所在盘）的 mtime 粒度约 **4ms**，且**同大小改写时 mtime 与 size 都不变**
 #:    （连写 3 次只得 2 个不同 mtime_ns）⇒ 该键会返回**旧判定**，比不缓存更危险。
 #: ⇒ 改成「**运行内快照**」：key = 决策件绝对路径（不跟随软链，用 `absolute()`）；
 #:    **F5 判定**（`_decision_failure_reason`）一次构建内**只读一次盘、判定恒定**；
@@ -1364,7 +1494,20 @@ def _llm_staleness(args) -> dict:
     #    ⇒ 用 `absolute()`（**不跟随软链**）⇒ 取「调用方传入路径所在的目录」。
     ctx_dir = dec.absolute().parent
     meta_path = ctx_dir / "ta_context_meta.json"
-    dec_json = ctx_dir / "tradingagents_decision.json"
+    # 🔴 2026-11-09 15:55 实测修（Mode C 带 LLM 首跑暴露）：
+    #    决策 JSON 的名字**必须跟着决策文件走**（上面那段注释自己就要求
+    #    「三件套跟着决策文件走」）⇒ 影子模式（Mode C）里决策 md/json 叫
+    #    `shadow_decision.md/.json`（为的是**不覆盖**根目录金标
+    #    `tradingagents_decision.md`）⇒ 旧代码硬编码 `tradingagents_decision.json`
+    #    ⇒ 三件套**永远缺件** ⇒ sha1 链**永远验不了**
+    #    ⇒ 明明是**本轮刚跑出来**的 LLM 第二意见，被判成「已过期 ⇒ 不可作数」
+    #    （实测：2026-11-09 15:55 的 Mode C 计划里 `llm_stale.unverifiable_reason`
+    #      = "上下文三件套**缺件** ['tradingagents_decision.json']"，
+    #      冲突表 5 条**全部**被标 stale ⇒ LLM 第二意见**整个作废**）。
+    #    ⇒ 修法：由决策 md 推出决策 json（`<stem>.json`，与
+    #      `_decision_failure_reason_uncached` 的 `path.with_suffix(".json")` 同口径）
+    #      ⇒ **生产路径逐字节不变**（`tradingagents_decision.md` → 同名 json）。
+    dec_json = dec.with_suffix(".json")
     ctx_path = ctx_dir / "ta_research_context.md"
     report_md = Path(args.report).with_suffix(".md")
     # 🔴 2026-11-04 夜实测修（M-F4；reviewer 的 I-6，本机复现）：
@@ -1386,7 +1529,7 @@ def _llm_staleness(args) -> dict:
     if not ctx_path.exists():
         _missing.append("ta_research_context.md")
     if not dec_json.exists():
-        _missing.append("tradingagents_decision.json")
+        _missing.append(dec_json.name)
     if not report_md.exists():
         _missing.append("etf_analysis_report.md")
     if _missing:
@@ -2292,12 +2435,18 @@ def render_markdown(plan: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--report", default="/mnt/data/siping/runs/etf_rotation/etf_analysis_report.json")
-    ap.add_argument("--decision", default="/mnt/data/siping/runs/etf_rotation/tradingagents_decision.md")
-    ap.add_argument("--prices", default="/mnt/data/siping/datasets/etf/etf_prices.csv")
-    ap.add_argument("--universe", default="/mnt/data/siping/datasets/etf/etf_universe.csv")
-    ap.add_argument("--account", default="/tmp/pycharm_project_658d3fc4/manu/etf_rotation/data/account_snapshot.csv")
-    ap.add_argument("--out-dir", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--report", default=str(C.ETF_RUN_ROOT / "etf_analysis_report.json"))
+    ap.add_argument("--decision", default=str(C.ETF_RUN_ROOT / "tradingagents_decision.md"))
+    ap.add_argument("--prices", default=str(C.ETF_DATA_ROOT / "etf_prices.csv"))
+    ap.add_argument("--universe", default=str(C.ETF_DATA_ROOT / "etf_universe.csv"))
+    # 🔴 2026-11-10：原先写死服务器绝对路径（换机器/换目录就找不到账户基准）
+    #    ⇒ 改用**账户模块自己的口径**（account.ACCOUNT_SNAPSHOT_CSV，与 analyze.py 同源）。
+    ap.add_argument(
+        "--account",
+        default=str(_ACCOUNT_SNAPSHOT_CSV_DEFAULT()),
+        help="账户基准 CSV（缺省 = account.ACCOUNT_SNAPSHOT_CSV）",
+    )
+    ap.add_argument("--out-dir", default=str(C.ETF_RUN_ROOT))
     args = ap.parse_args()
 
     plan = build_plan(args)

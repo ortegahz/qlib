@@ -104,13 +104,18 @@ def test_is_trading_day_beyond_calendar_raises(calendar_csv: Path) -> None:
         CG.is_trading_day("2026-12-31", calendar_csv)
 
 
-# ---------------------------------------------------------------- 2. 模式分流
-def test_resolve_mode() -> None:
-    """只有锁死的信号日 `DC.NEXT_SIGNAL_DATE`（2026-12-01）走模式 B。"""
-    assert CG.resolve_mode("2026-12-01") == CG.MODE_B
-    assert CG.resolve_mode("2026-11-06") == CG.MODE_A
-    assert CG.resolve_mode("2026-11-30") == CG.MODE_A
-    assert CG.resolve_mode("2026-12-02") == CG.MODE_A
+# ---------------------------------------------------------------- 2. 当日口径
+def test_no_mode_api() -> None:
+    """🔴 2026-11-09（需求 1）：模式分诊已下线 ⇒ 日历门**不许**再有 mode API。"""
+    for name in ("MODE_A", "MODE_B", "resolve_mode", "describe_mode"):
+        assert not hasattr(CG, name), f"calendar_gate 不许再有 {name}"
+
+
+def test_signal_date_is_the_only_signal_day() -> None:
+    """只有锁死的信号日 `DC.NEXT_SIGNAL_DATE`（2026-12-01）算信号日。"""
+    assert CG.describe_day("2026-12-01")["is_signal_date"] is True
+    for day in ("2026-11-06", "2026-11-30", "2026-12-02"):
+        assert CG.describe_day(day)["is_signal_date"] is False, day
 
 
 def test_is_silent_defense_window() -> None:
@@ -120,13 +125,13 @@ def test_is_silent_defense_window() -> None:
     assert CG.is_silent_defense_window("2026-12-01") is False
 
 
-def test_describe_mode_keys() -> None:
-    """`describe_mode` 的键固定（下游 `main.py` / 邮件模板按它取值）。"""
-    info = CG.describe_mode("2026-12-01")
+def test_describe_day_keys() -> None:
+    """`describe_day` 的键固定（下游 `main.py` / 邮件模板按它取值），且**不含 mode**。"""
+    info = CG.describe_day("2026-12-01")
     assert set(info) == {
-        "date", "mode", "is_silent_defense", "is_signal_date", "execution_date", "reason",
+        "date", "is_silent_defense", "is_signal_date", "execution_date", "reason",
     }
-    assert info["mode"] == CG.MODE_B
+    assert "mode" not in info
     assert info["is_signal_date"] is True
     assert info["execution_date"] == "2026-12-02"
     assert info["reason"]

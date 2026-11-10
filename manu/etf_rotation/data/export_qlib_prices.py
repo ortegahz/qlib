@@ -13,9 +13,9 @@
 
 【用法（服务器）】
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/data/export_qlib_prices.py \
-        --asof 2026-11-03 --out /mnt/data/siping/runs/etf_rotation/stock_prices.csv
+        --asof 2026-11-03 --out <落点根>/runs/stock_prices.csv
 
-产物落在 `/mnt/data/...`（持久盘），**不写 /tmp**。
+产物落在**唯一落点根**下（持久盘），**不写 /tmp**。
 """
 from __future__ import annotations
 
@@ -25,9 +25,18 @@ from pathlib import Path
 
 import pandas as pd
 
-# qlib 数据与打分产物（与 config.py 同源，但这里独立写死，避免 import config 触发上游依赖）
-PROVIDER_URI = "/mnt/data/siping/datasets/qlib/cn_data"
-STOCK_SCORES_CSV = "/mnt/data/siping/runs/etf_rotation/stock_scores.csv"
+#: 研究链根（`data/` 不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import config as C  # noqa: E402
+
+# qlib 数据与打分产物（**与研究链 `config.py` 同源** ⇒ 单一事实源，不会分叉）
+#: qlib provider（上游基座；与研究链 `config.PROVIDER_URI` 同源）
+PROVIDER_URI = str(C.PROVIDER_URI)
+#: 个股分数 S（上游产物；落点 `<落点根>/runs/stock_scores.csv`）
+STOCK_SCORES_CSV = str(C.ETF_RUN_ROOT / "stock_scores.csv")
 #: 多日 RankIC 的最大前瞻窗口（交易日）⇒ 往前多留一点，防止信号日附近无价
 MAX_HORIZON = 20
 #: 额外留的自然日缓冲（约 MAX_HORIZON 个交易日 ≈ 28 自然日，取 60 保险）
@@ -41,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", default=None, help="结束日（含）；默认 = --asof")
     p.add_argument("--scores", default=STOCK_SCORES_CSV, help="个股分数 CSV（取打分日范围）")
     p.add_argument("--provider-uri", default=PROVIDER_URI, help="qlib provider_uri")
-    p.add_argument("--out", default="/mnt/data/siping/runs/etf_rotation/stock_prices.csv")
+    p.add_argument("--out", default=str(C.ETF_RUN_ROOT / "stock_prices.csv"))
     p.add_argument("--instruments", default="all", help="qlib 股票池，默认 all（全市场）")
     return p.parse_args()
 

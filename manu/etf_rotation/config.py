@@ -42,6 +42,34 @@ except Exception:
     raise
 
 # ---------------------------------------------------------------- qlib 侧（继承个股线）
+# 🔴 **落点根的唯一事实源** = `manu/etf_rotation/daily/daily_config.py`
+#    （服务器 `huangzhe@192.168.99.40` 是**共享训练机** ⇒ 本项目在服务器上产生的
+#    **一切文件**只允许落在这一棵产物树下 ⇒ 研究链与每日链必须同根）。
+#    这里按**路径**加载它（而不是再写一份字面量）：两个 config.py 同名 ⇒ 不能 `import`。
+_DAILY_CFG_PATH = Path(__file__).resolve().parent / "daily" / "daily_config.py"
+_daily_spec = importlib.util.spec_from_file_location(
+    "manu_daily_line_config", _DAILY_CFG_PATH
+)
+if _daily_spec is None or _daily_spec.loader is None:
+    raise ImportError(f"无法加载每日链 config：{_DAILY_CFG_PATH}")
+DAILY = importlib.util.module_from_spec(_daily_spec)
+sys.modules[_daily_spec.name] = DAILY
+try:
+    _daily_spec.loader.exec_module(DAILY)
+except Exception:
+    sys.modules.pop(_daily_spec.name, None)
+    raise
+
+#: 🔴 **数据集落点根**（可被环境变量 `ETF_ROTATION_OUTPUT_ROOT` 覆盖 ⇒ 服务器上可整体搬家）
+#:    单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的同名常量（这里**不写第二份字面量**）。
+ETF_ROTATION_OUTPUT_ROOT = DAILY.ETF_ROTATION_OUTPUT_ROOT
+#: 🔴 **结果落点根**（可被环境变量 `ETF_ROTATION_RESULTS_ROOT` 覆盖）
+#:    产物 / 快照 / 报告 / 日志**留在服务器** ⇒ 全部落在这个根之下（不再拷回 host）。
+ETF_ROTATION_RESULTS_ROOT = DAILY.ETF_ROTATION_RESULTS_ROOT
+#: 🔴 **临时工作区**（探针 scratch / 子进程中间产物；不落 /tmp ⇒ tmpfiles 会清 /tmp）
+#:    落点 `<数据集根>/_work`（与 `daily_config.WORK_ROOT` 同源）
+WORK_ROOT = DAILY.WORK_ROOT
+
 PROVIDER_URI = STOCK.PROVIDER_URI
 REGION = STOCK.REGION
 #: 个股建模参数全部沿用个股线（单一事实源，此处只做断言，防止口径漂移）
@@ -58,7 +86,8 @@ SCORE_END_TIME = "2026-11-03"
 QLIB_EXCHANGE_BY_AK_MARKET = {"101": "SH", "102": "SZ"}
 
 # ---------------------------------------------------------------- ETF 数据（服务器持久盘）
-ETF_DATA_ROOT = Path("/mnt/data/siping/datasets/etf")
+#: 落点 `<OUTPUT_ROOT>/datasets/etf`（与每日链 `daily_config.ETF_DATA_ROOT` 同源）
+ETF_DATA_ROOT = ETF_ROTATION_OUTPUT_ROOT / "datasets" / "etf"
 ETF_SPOT_CSV = ETF_DATA_ROOT / "etf_spot.csv"
 ETF_UNIVERSE_CSV = ETF_DATA_ROOT / "etf_universe.csv"
 ETF_HOLDINGS_CSV = ETF_DATA_ROOT / "etf_holdings.csv"
@@ -67,8 +96,8 @@ ETF_HOLDINGS_MANIFEST = ETF_DATA_ROOT / "etf_holdings_manifest.json"
 ETF_PRICES_MANIFEST = ETF_DATA_ROOT / "etf_prices_manifest.json"
 
 # ---------------------------------------------------------------- 产物落盘
-ETF_RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
-ETF_RUNS_DIR = ETF_RUN_ROOT / "runs"
+#: 落点 `<RESULTS_ROOT>`（与每日链 `daily_config.RESEARCH_RUN_ROOT` 同源）
+ETF_RUN_ROOT = ETF_ROTATION_RESULTS_ROOT
 #: 个股分数（上游 S）落盘位置
 STOCK_SCORES_CSV = ETF_RUN_ROOT / "stock_scores.csv"
 #: 权重矩阵 W（ETF → 成分股 → 权重）
@@ -144,6 +173,23 @@ MOMENTUM_SCORE_WEIGHT = 0.5    # ETF 自身动量分（doc1）
 #: 个股分数的横截面归一化方式（在每个调仓日，对全市场个股打分做 z-score）
 STOCK_SCORE_NORMALIZE = "zscore"
 
+# ---------------------------------------------------------------- 穿透分时间平滑（EWMA / 滚动均值）
+#: 背景：E = W × S 是**单日截面快照** ⇒ 截面密集区（z_alpha 咬得很紧）的 ETF 排名
+#:    **逐日洗牌** ⇒ 大量「虚警」与高频换仓假象。
+#:    ⇒ 排序前先对穿透分做**时间维度滤波**，只认有持续性（persistence）的 Alpha。
+#:    注意：本组参数的**单一事实源就是本文件**；每日链不另复制一份（避免两份实现分叉）。
+ENABLE_SCORE_SMOOTHING = True
+#: 平滑方法："ewma"（指数加权移动平均）或 "rolling"（滑动窗口平均）
+SMOOTHING_METHOD = "ewma"
+#: 滚动窗口（**交易日**）—— "rolling" 模式下的硬窗口；"ewma" 模式下用于「稳定性」统计跨度
+SMOOTHING_WINDOW = 5
+#: EWMA 系数 alpha。alpha=0.35 ⇒ **半衰期约 1.61 个交易日**
+#:   （ln(0.5)/ln(0.65)=1.609；需求文档写的「3~5 个交易日」需要 alpha≈0.21 ⇒ **按实际值披露**）
+SMOOTHING_ALPHA = 0.35
+#: EWMA 预热历史跨度（**交易日**）—— 取这么多个交易日的观测做递推起点
+#:   ⇒ 保证结果与「无限历史」一致（EWMA 收敛后更早的点权重可忽略）
+SMOOTHING_HISTORY_SPAN_DAYS = 30
+
 # ---------------------------------------------------------------- 换手控制（迟滞）
 #: 已持有的标的，只要排名还在「目标只数 + 缓冲区」之内就**继续持有**（不换手）
 #:   ⇒ 把「每期全换」变成「只在明显掉出前列时才换」，是人工低频策略能落地的关键
@@ -182,6 +228,19 @@ ETF_ACCOUNT = 29_854.67         # 个人量级（小资金，人工下单）
 POOL_MODE = "e_covered"
 #: E 的最低覆盖率（低于此值 ⇒ E 不可信 ⇒ 不入池；对应 map_scores_to_etfs 的 min_coverage）
 MIN_E_COVERAGE = 0.5
+#: 🔴 **「防守资产旁路」开关（2026-11-06 新增，默认 False = 严格口径）**
+#:
+#: 背景（用户 2026-11-06 的类比：**「没参加考试的考生」不能和「按真实卷面打分」同榜排名**）：
+#:   候选池里混着**不投 A 股**的 ETF（美股 / 港股 / 黄金 / 商品 / 货币）：
+#:   它们的 A 股 coverage ≈ 0 ⇒ **E = W×S 算不出来** ⇒ 兜底逻辑改用**自身动量**打分
+#:   ⇒ 于是「严肃考试卷面总分」与「看身姿长相给的分」被放进**同一张榜单**排序。
+#:
+#: 🔴 **True（v1 旧行为）**：coverage 不足但**属防守资产**的 ETF 仍可入池（靠动量入选）。
+#: 🔴 **False（当前默认，严格口径）**：**coverage < MIN_E_COVERAGE 一律剔除**，
+#:    不论是否防守资产 ⇒ 池内**每只**标的的分数都来自真实的 E=W×S 穿透 ⇒ 口径 100% 自洽。
+#:    ⇒ 代价：候选池从 31 只缩到 ~15~20 只（商品/跨境/货币被剔）⇒ **回测与交付数字会变**
+#:    （必须重跑回测，不许沿用旧数字）。
+POOL_ALLOW_DEFENSIVE_BYPASS = False
 #: 「宏观袖套」最多占几席（无 A 股成分的 ETF：商品 / 跨境 / 货币）。
 #:   仅在 POOL_MODE="all" 时生效；0 = 不限。
 MACRO_SLEEVE_MAX_POSITIONS = 2

@@ -18,7 +18,10 @@
 set -uo pipefail
 
 PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
-RUN_ROOT="${RUN_ROOT:-/mnt/data/siping/runs/etf_rotation}"
+#: 🔴 **结果落点根**（单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
+#:    `ETF_ROTATION_RESULTS_ROOT`）⇒ 产物根 = 结果根
+RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-/mnt/data/siping/runs/etf_rotation_results}"
+RUN_ROOT="${RUN_ROOT:-$RESULTS_ROOT}"
 QL_PY="${QL_PY:-/home/huangzhe/anaconda3/envs/ql/bin/python}"
 STAMP="$(date '+%Y%m%dT%H%M%S')"
 SC="$RUN_ROOT/_probe_lock_$STAMP"

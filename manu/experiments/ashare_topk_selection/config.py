@@ -16,12 +16,20 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 # ---------------------------------------------------------------- 数据与环境
-PROVIDER_URI = "/mnt/data/siping/datasets/qlib/cn_data"   # 绝对路径，不依赖默认值
+#: 🔴 **落点根**：qlib 数据集与 ETF 轮动线共用同一棵产物树 ⇒ 用**同一个环境变量**；
+#:    单一事实源见 `manu/etf_rotation/daily/daily_config.py` 的同名常量（默认值一致）。
+OUTPUT_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_OUTPUT_ROOT", "/mnt/data/siping/datasets/manu/etf_rotation"
+    )
+).expanduser()
+PROVIDER_URI = str(OUTPUT_ROOT / "datasets" / "qlib" / "cn_data")   # 绝对路径，不依赖默认值
 REGION = "cn"
-DATASET_ROOT = Path("/mnt/data/siping/datasets/qlib")
+DATASET_ROOT = OUTPUT_ROOT / "datasets" / "qlib"
 # 数据来源清单（fetch_qlib_dataset.py 产出），用于 manifest 记录「数据版本」
 FETCH_MANIFEST = DATASET_ROOT / "fetch_manifest.json"
 

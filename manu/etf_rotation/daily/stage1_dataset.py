@@ -27,7 +27,7 @@
    （`swap_provider` 与 `run_stage1` 的 `dry_run` 默认值**都是** `True`）。
 2. **fail-closed**：日历前缀不一致 ⇒ 抛异常拒绝换库（理由写进异常消息）。
 3. **大文件不落 /tmp**：`work_root` / `backup_dir` / `dest_dir`
-   默认全在 `/mnt/data/siping/datasets/qlib/`
+   默认全在 `<落点根>/datasets/qlib/`
    （`/tmp` 会被 `systemd-tmpfiles` 清理，工程根也在根盘）。
 4. **不许静默**：任何一步失败都抛异常，异常消息必须带**原始报错**；
    校验用的 qlib 若不可用 ⇒ 抛异常，**不许**静默跳过。
@@ -85,11 +85,12 @@ _DOWNLOADER_PATH = _HERE.parents[1] / "tools" / "fetch_qlib_dataset.py"
 #: qlib provider 的三个必备子目录
 _REQUIRED_SUBDIRS = ("calendars", "features", "instruments")
 
-#: 默认落盘位置（🔴 铁律三：大文件一律落 `/mnt/data`，**不落 /tmp**）
+#: 默认落盘位置（🔴 铁律三：大文件一律落**唯一落点根**，**不落 /tmp**）
 DEFAULT_PROVIDER_DIR = DC.QLIB_CN_DATA
-DEFAULT_DEST_DIR = Path("/mnt/data/siping/datasets/qlib")
-DEFAULT_WORK_ROOT = Path("/mnt/data/siping/datasets/qlib/_stage1_work")
-DEFAULT_BACKUP_DIR = Path("/mnt/data/siping/datasets/qlib/_stage1_backup")
+#: 三个默认值**全部由 `daily_config` 派生**（单一事实源 ⇒ 不会与每日链分叉）
+DEFAULT_DEST_DIR = DC.QLIB_DATASET_ROOT
+DEFAULT_WORK_ROOT = DC.STAGE1_WORK_ROOT
+DEFAULT_BACKUP_DIR = DC.STAGE1_BACKUP_DIR
 
 #: 下载参数（对齐 `manu/tools/fetch_qlib_dataset.py` 的 CLI 默认值）
 _MIN_SPEED = 50 * 1024
@@ -664,6 +665,77 @@ def _ak_recent_trade_days(ak_python: str, limit: int = 10) -> list[str]:
     return [str(x) for x in json.loads(lines[-1])]
 
 
+# ---------------------------------------------------------------- 自建增量日兜底
+def try_increment(
+    *,
+    asof: str,
+    base_dir: str | Path,
+    live_dir: str | Path,
+    work_root: str | Path,
+    ak_python: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """自建增量日兜底：基座覆盖不到 `asof` ⇒ 补缺失交易日 ⇒ 派生 `live_dir`。
+
+    🔴 **只派生、不碰基座**（铁律〇之二：基准产物只可调用/读取/派生到新目录）：
+    基座是上游换库管理的 `cn_data` ⇒ 自建日只写 `live_dir`（硬链接派生）⇒
+    上游换库的**前缀闸门**（`compare_calendars`）不受任何影响。
+
+    🔴 **实时快照只能补当天**：`stock_zh_a_spot_em` 拿不到历史交易日 ⇒ 缺口 > 1 天时
+    这里会**明确失败并披露**，**不写脏数据**（宁可不写）。
+
+    返回 `{"ok","needed","days","entry","notes"}`；异常被吞进 notes（**不阻断换库结论**）。
+    """
+    notes: list[str] = []
+    base_path = Path(base_dir)
+    live_path = Path(live_dir)
+    out: dict = {"ok": False, "needed": False, "days": [], "entry": {}, "notes": notes}
+    try:
+        import stage1_rolling_increment as SRI  # noqa: PLC0415
+
+        base_days = _read_calendar(base_path)
+        base_max = base_days[-1] if base_days else None
+        if not base_max:
+            notes.append("⚠️ 读不到基座日历 ⇒ 跳过自建增量日")
+            return out
+        if base_max >= asof:
+            notes.append(f"ℹ️ 基座已覆盖 {asof}（末日 {base_max}）⇒ 不需要自建增量日")
+            return out
+
+        days = SRI.missing_trade_days(base_max, asof)
+        out["needed"] = True
+        out["days"] = days
+        notes.append(
+            f"🔴 基座只到 {base_max}（< {asof}）⇒ 缺失交易日 {days} ⇒ 尝试自建增量日"
+        )
+        # 🔴 **一次编排覆盖整段缺口**：当天走实时快照（1 次调用），历史日走批量源
+        #    （8 只/请求、一次请求覆盖整段区间）⇒ 缺口 > 1 天也能补齐。
+        got = SRI.fetch_missing_bars(
+            days, base_dir=base_path, out_dir=Path(work_root), ak_python=ak_python
+        )
+        bars_by_day = got["frames"]
+        for day, st in (got.get("stats") or {}).items():
+            notes.append(f"ℹ️ {day} 全市场 bar {st.get('rows')} 行（来源 {st.get('source')}）")
+        entry = SRI.build_live_dataset(
+            base_path,
+            live_path,
+            days,
+            bars_by_day,
+            dry_run=dry_run,
+            ledger_path=DC.QLIB_INCREMENT_LEDGER,
+        )
+        out["entry"] = entry
+        out["ok"] = True
+        notes.extend(entry.get("notes") or [])
+        notes.append(
+            f"{'（dry-run，未落盘）' if dry_run else ''}派生数据集：{live_path}"
+            f"（日历末日 {entry.get('live_calendar_max')}）"
+        )
+    except Exception as exc:  # noqa: BLE001 - 自建增量失败**不阻断**换库结论
+        notes.append(f"⚠️ 自建增量日失败（**不阻断换库结论**）：{type(exc).__name__}: {exc}")
+    return out
+
+
 # ---------------------------------------------------------------- 编排
 @_with_traceback
 def run_stage1(
@@ -676,23 +748,30 @@ def run_stage1(
     do_fetch: bool = True,
     do_swap: bool = True,
     dry_run: bool = True,
+    do_increment: bool = True,
+    increment_dry_run: bool = True,
+    live_dir: str | Path | None = None,
     ak_python: str | None = None,
     progress=None,
 ) -> dict:
-    """阶段 1 编排：体检 →（可选）下载 → 解压 → 比对 →（可选）换库 → 校验。
+    """阶段 1 编排：体检 →（可选）下载 → 解压 → 比对 →（可选）换库 →（可选）自建增量日 → 校验。
 
     返回 `{"asof","provider_dir","calendar_max_before","calendar_max_after","new_days",
-    "downloaded","swapped","verified","dry_run","notes"}`。
+    "downloaded","swapped","verified","dry_run","increment","notes"}`。
 
     🔴 `dry_run=True`（**默认值**）⇒ **换库阶段磁盘零改动**（活库与备份目录原封不动），
     校验对象是**新快照**；真换库后校验对象是**现役库**（两者都会在 `notes` 里标明）。
     注：解压暂存目录（`work_root/extract_*`）在两种模式下都会生成 —— 它是**比对**所必需的中间物，
     不是对活库的写操作。
+
+    🔴 `do_increment=True` 时：**基座覆盖不到 asof** ⇒ 触发「自建增量日兜底」
+    （`stage1_rolling_increment.try_increment`）——**只派生到 `live_dir`，绝不碰基座**。
     """
     provider_path = Path(provider_dir)
     work_path = Path(work_root)
     backup_path = Path(backup_dir)
     dest_path = Path(dest_dir)
+    live_path = Path(live_dir) if live_dir else DC.QLIB_CN_DATA_LIVE
     notes: list[str] = []
 
     def _emit(message: str) -> None:
@@ -769,6 +848,20 @@ def run_stage1(
     else:
         notes.append("do_swap=False：只体检 + 比对，不换库")
 
+    # ⑤之二：自建增量日兜底（上游快照滞后 ⇒ 基座覆盖不到 asof）
+    increment_info: dict = {}
+    if do_increment:
+        increment_info = try_increment(
+            asof=asof,
+            base_dir=provider_path,
+            live_dir=live_path,
+            work_root=work_path,
+            ak_python=ak_python,
+            dry_run=increment_dry_run,
+        )
+        for note in increment_info.get("notes") or []:
+            notes.append(note)
+
     # ⑥ 校验（dry-run ⇒ 校验新快照；已换库 ⇒ 校验现役库）
     effective = provider_path if swapped else new_dir
     eff_days = _read_calendar(effective)
@@ -798,12 +891,14 @@ def run_stage1(
     return {
         "asof": asof,
         "provider_dir": str(provider_path),
+        "live_dir": str(live_path),
         "calendar_max_before": before["calendar_max"],
         "calendar_max_after": eff_days[-1] if eff_days else None,
         "new_days": comparison["new_days"],
         "downloaded": downloaded,
         "swapped": swapped,
         "swap_skipped": swap_skipped,
+        "increment": increment_info,
         "verified": bool(verified.get("ok")),
         "dry_run": dry_run,
         "notes": notes,
@@ -821,6 +916,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ak-python", default=None, help="akshare 解释器（可选，仅做交易日交叉核对）")
     ap.add_argument("--no-fetch", action="store_true", help="不下载，复用 dest-dir 里已有的压缩包")
     ap.add_argument("--no-swap", action="store_true", help="只体检 + 比对，不换库")
+    ap.add_argument("--no-increment", action="store_true", help="不触发自建增量日兜底")
+    ap.add_argument(
+        "--increment-apply",
+        action="store_true",
+        help="自建增量日**真落盘**（默认 dry-run；只写派生目录，不碰基座）",
+    )
+    ap.add_argument("--live-dir", default=None, help="派生数据集目录（默认 cn_data_live）")
     ap.add_argument("--dry-run", action="store_true", help="只报告不落盘（默认行为）")
     ap.add_argument("--apply", action="store_true", help="真换库（与 --dry-run 互斥）")
     args = ap.parse_args(argv)
@@ -838,6 +940,9 @@ def main(argv: list[str] | None = None) -> int:
         do_fetch=not args.no_fetch,
         do_swap=not args.no_swap,
         dry_run=dry_run,
+        do_increment=not args.no_increment,
+        increment_dry_run=not args.increment_apply,
+        live_dir=args.live_dir,
         ak_python=args.ak_python,
         progress=print,
     )

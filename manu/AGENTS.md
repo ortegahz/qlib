@@ -3,7 +3,7 @@
 > 本文件是**本工程自研层 `manu/`** 的规约。
 > 上游 `microsoft/qlib` 的官方文档与开发规约（`docs/developer/code_standard_and_dev_guide.rst`）
 > 管上游代码风格；本文件管**本项目**的不可协商约束。
-> **完整铁律正文：`manu/memory/rules.md`（1667 行，动手前必读）。**
+> **完整铁律正文：`manu/memory/rules.md`（行数随铁律增补变化，以文件实际为准；动手前必读）。**
 > 其中 §十二 的 qlib 技术断言**全部经源码核验**（qlib v0.9.8），改动前请先读源码。
 
 ---

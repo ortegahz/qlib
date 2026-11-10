@@ -56,8 +56,13 @@ class Source:
     history: list[str] = field(default_factory=list)
 
 
-# 服务器上的数据集落盘根目录（根分区只够工程目录, 数据统一落 /mnt/data）
-DEFAULT_ROOT = "/mnt/data/siping/datasets/qlib"
+# 服务器上的数据集落盘根目录（根分区只够工程目录, 数据统一落持久盘）
+#: 🔴 **唯一落点根**：单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
+#:    `ETF_ROTATION_OUTPUT_ROOT` ⇒ 本工具按**同一个环境变量**取值（不会分叉）。
+OUTPUT_ROOT = os.environ.get(
+    "ETF_ROTATION_OUTPUT_ROOT", "/mnt/data/siping/datasets/manu/etf_rotation"
+)
+DEFAULT_ROOT = os.path.join(OUTPUT_ROOT, "datasets", "qlib")
 
 SOURCES: dict[str, dict] = {
     # 社区全量: 全 A 股日频 + 财务 + 指数, 含 csi300/csi500/all 股票池

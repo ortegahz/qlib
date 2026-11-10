@@ -32,7 +32,7 @@ G3    **打分日是相位栅格**，不是任意  ⇒ 2026-12-01 **根本不在
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \\
         manu/etf_rotation/probes/probe_signal_feasibility.py \\
-        [--run-root /mnt/data/siping/runs/etf_rotation]
+        [--run-root <落点根>/runs]
 """
 from __future__ import annotations
 
@@ -97,9 +97,18 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
             pd.read_csv(scores_csv, usecols=["date"])["date"].unique()).date})
         cal_all = SP.read_calendar_dates(QLIB_CALENDAR)
         lo = SP.parse_date(C.SCORE_START_TIME)
-        window = [d for d in cal_all if lo is None or d >= lo]
+        # 🔴 2026-11-10（闸门假红修复）：日历查询窗必须与**生产口径**同款
+        #    （`qlib_scores.py:572`：`cal_end = max(SCORE_END_TIME, requested_end)`）。
+        #    旧实现**少了这一步** ⇒ qlib 数据集被 `--full` 推进（11-03 → 11-09）后：
+        #    期望栅格按**新日历**算（末日 11-09），而断言对象是 **asof=11-03 的旧基线产物**
+        #    （末日 11-03）⇒ 两个 vintage ⇒ P1 假红 + P4 的 S1 假硬拦。
+        #    （实测：把日历截回 11-03 后旧探针 P1/P4 全 PASS ⇒ 因果链闭合。）
+        artifact_asof = real[-1] if real else str(C.STOCK.TEST[1])
+        hi = SP.parse_date(max(C.SCORE_END_TIME, artifact_asof))
+        window = [d for d in cal_all
+                  if (lo is None or d >= lo) and (hi is None or d <= hi)]
         grid_now = _grid_for(window, C.REBALANCE_EVERY_N_DAYS, str(C.STOCK.TEST[0]),
-                             str(C.STOCK.TEST[1]))
+                             artifact_asof)
         checker.add("P1", "打分日栅格与真实 stock_scores.csv 逐位一致",
                     grid_now == real,
                     f"策略算出 {len(grid_now)} 个（{grid_now[0] if grid_now else '-'} ~ "
@@ -121,7 +130,11 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
     # ---- P4：可达信号日 ⇒ 无硬拦 ----
     f4 = SP.check_signal_feasibility(
         asof="2026-11-03", score_grid=grid_now or ["2026-11-03"],
-        qlib_calendar_max_date="2026-11-03", every_n=C.REBALANCE_EVERY_N_DAYS,
+        # 🔴 2026-11-10：S2（「qlib 数据集覆盖不到信号日」）必须按**真实日历末日**判，
+        #    写死 "2026-11-03" 会把这条硬拦的牙齿一起写死（数据集回退到 11-03 之前时
+        #    仍然不报 ⇒ 守卫形同虚设）。实测：数据集回退到 2026-10-30 ⇒ S1+S2 双报 ✓。
+        qlib_calendar_max_date=SP.calendar_max_date(QLIB_CALENDAR),
+        every_n=C.REBALANCE_EVERY_N_DAYS,
         scores_max_date="2026-11-03", prices_max_date="2026-11-04",
         deployed_grid=(grid_now[::C.REBALANCE_STRIDE_MULTIPLIER] if grid_now else None),
     )
@@ -301,7 +314,7 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
 def main() -> int:
     """跑探针；退出码 0 = 全部断言通过，1 = 有断言失败。"""
     ap = argparse.ArgumentParser(description="信号日可行性 · 回归探针")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     args = ap.parse_args()
 
     items = run_checks(Path(args.run_root))

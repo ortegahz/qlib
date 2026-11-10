@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import account  # noqa: E402
+
+import config as C  # noqa: E402  （研究链根已在上面的 sys.path 里 ⇒ 落点常量单一事实源）
 from report_fingerprint import report_content_sha1  # noqa: E402
 
 
@@ -302,7 +304,7 @@ def _sha1(p: Path) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="构造 TradingAgents research_context")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     ap.add_argument("--report-md", default=None)
     ap.add_argument("--backtest-new", default=None)
     ap.add_argument("--backtest-old", default=None)

@@ -16,8 +16,14 @@
 
 | 产物 | 路径 |
 | --- | --- |
-| 4 个 CSV + 2 个 manifest | `/mnt/data/siping/datasets/etf/` |
-| 运行日志 | `/mnt/data/siping/runs/etf_rotation/` |
+| 4 个 CSV + 2 个 manifest | `<数据集根>/datasets/etf/` |
+| 运行日志 | `<结果根>/logs/` |
+
+（`<数据集根>` = `/mnt/data/siping/datasets/manu/etf_rotation`，
+可被环境变量 `ETF_ROTATION_OUTPUT_ROOT` 覆盖；
+`<结果根>` = `/mnt/data/siping/runs/etf_rotation_results`，
+可被环境变量 `ETF_ROTATION_RESULTS_ROOT` 覆盖；两者都是单一事实源
+`manu/etf_rotation/daily/daily_config.py` 派生出来的。）
 
 ## 执行环境（**硬约束**）
 

@@ -1,29 +1,23 @@
-"""agents_rebalance.py —— **双轨模式**的执行器（A 日常巡检 / B 调仓节点）。
+"""agents_rebalance.py —— **统一流水线**的执行器（单一入口，无模式分诊）。
 
-【两条轨道是什么】
-* **模式 A（日常巡检，2026-11-06 ~ 2026-11-30 静默防守）**：
-  **只**检验唯一持仓 512800 现价与 MA60 的安全垫距离。
-  正常 ⇒ 「趋势完好，守纪律躺平」；破位 ⇒ 紧急平仓指令。
-  🔴 **模式 A 绝不跑 qlib 打分、绝不跑 TradingAgents、绝不产出任何新仓位指令** ——
-  这是**构造性保证**：`run_mode_a` 的调用路径里根本没有打分 / 选股 / LLM 的入口
-  （打分与 LLM 只在 `run_mode_b` 里被调用），所以「忘了加 if」也不会漏出新仓位指令。
-* **模式 B（调仓信号日 2026-12-01 收盘出信号，2026-12-02 开盘执行）**：
-  走研究链全链（分析报告 → TradingAgents 辩论 → 调仓计划 → 节点日重算）
-  ⇒ 产出**确定性买卖执行卡片**。
+【2026-11-09 架构瘦身：Mode A / B / C ⇒ 一条流水线 + 不可变快照】
+旧形态有三个模式（A 日常巡检 / B 调仓节点 / C 影子推演）⇒ 三套分支、三套产物根、
+三套语义 ⇒「忘了加 if」就会漏出新仓位指令，也会污染生产金标（历史事故）。
+新形态：
 
-【🔴 模式 B 的 S 层口径（主 agent 2026-11-05 核验后写入）】
-1. `analyze.py --asof <信号日>` 会被 `data/signal_policy.py::check_signal_feasibility`
-   的 **S1 硬拦**挡住：**信号日必须落在打分相位栅格上**（相位 = qlib 交易日历下标
-   `i % every_n == every_n - 1`，`every_n = config.REBALANCE_EVERY_N_DAYS = 10`），
-   而栅格末日 = qlib 数据集覆盖末日 ⇒ **2026-11-04 及以后（含 12-01）都不在栅格上**。
-   ⇒ 模式 B 的分析日取「**最近一个可用的打分日**」= min(`stock_scores.csv` 的最大日期,
-   栅格里 ≤ 信号日的最后一天)，**不写死**。
-2. `qlib_scores.py` 的落盘是 `scores.to_csv(out_dir/"stock_scores.csv")`
-   ⇒ **整体覆盖**、**不是增量**（拿旧的 69 个打分日当增量会全部丢失）
-   ⇒ **默认路径绝对不跑它**（跑一次 ≈27 分钟且破坏 canonical 文件，属重活 + 破坏性）。
-   本模块只**读** `stock_scores.csv`；是否需要刷新写进返回值的 `notes`。
-   保留的 `refresh_scores=True` 开关必须满足：默认关、跑在**临时目录**、
-   **先备份**再**合并**（不是覆盖）回 canonical、且跑前明确提示「约 27 分钟，属重活」。
+* **一条流水线**：``run_pipeline()`` 走全部六个阶段，**没有模式分支**；
+* **一个快照**：每次运行落 ``<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/``
+  （自包含、只增不改 ⇒ 可以随时 diff 两份跑）；
+* **一个副作用开关**：``live_trade=False``（**缺省**）⇒ 观察态（执行卡挂单禁用、不发信）；
+  ``live_trade=True`` ⇒ 实盘态（执行卡可下单）。
+* 🔴 **不写根目录全局文件**：canonical ``stock_scores.csv`` 只在「还没有任何快照时」
+  当**一次性只读种子**用；每日链自成一链（底座 = **上一份快照**）。
+
+【S 层口径（沿用 2026-11-05 核验结论）】
+1. ``analyze.py --asof <信号日>`` 会被 ``data/signal_policy.py::check_signal_feasibility``
+   的 **S1 硬拦**挡住（信号日必须落在打分相位栅格上）⇒ 分析日取「**最近一个可用的打分日**」。
+2. ``qlib_scores.py`` 的落盘是**整体覆盖**、**不是增量** ⇒ 本模块让它跑在**临时目录**
+   + 先备份 + 再按 ``(date, instrument)`` **合并**（keep=last）回**快照目录**。
 
 【组合构造约束（研究链里没有的硬约束，本模块新增）】
 * 目标资产**等权 5 份**，单只标的**金额上限 6,000 元**；
@@ -33,8 +27,8 @@
   超出单标的 6,000 元限额 ⇒ **严禁下单**，自动归入可用现金躺平。
 
 【铁律】
-* 只读 `daily_config.py` / `account_state.py`（常量与账户基准的**单一事实源**）；
-* 所有数字**来自实际输入**，缺字段 ⇒ 该字段为 `None` 并在 `warnings` 里点名（**不编数字**）；
+* 只读 ``daily_config.py`` / ``account_state.py``（常量与账户基准的**单一事实源**）；
+* 所有数字**来自实际输入**，缺字段 ⇒ 该字段为 ``None`` 并在 ``warnings`` 里点名（**不编数字**）；
 * 每一步外部命令失败 ⇒ **把原始输出原样抛出**（不吞错误、不静默降级）。
 """
 from __future__ import annotations
@@ -45,7 +39,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +52,7 @@ if str(_HERE) not in sys.path:
 
 import account_state  # noqa: E402
 import daily_config as DC  # noqa: E402
+import snapshot as snap_mod  # noqa: E402
 import mode_router  # noqa: E402
 
 #: 研究链根目录（``manu/etf_rotation``）—— 导入研究链模块时按**绝对路径**加载
@@ -65,12 +60,17 @@ _RESEARCH_ROOT = Path(__file__).resolve().parents[1]
 if str(_RESEARCH_ROOT) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_ROOT))
 
-#: 模式 B 的执行卡固定文案
+#: 执行卡固定文案
 EXECUTION_BASIS = "信号日 T 收盘出信号 → 执行日 T+1 开盘执行"
 PRICE_BASIS_NOTE = "节点日收盘价 ≠ 执行日成交价，实际股数/金额可能不同"
 
-#: 模式 B 各步骤的名字（报错时要说清是哪一步挂了）—— 对应**六阶段全流程**
+#: 各步骤的名字（报错时要说清是哪一步挂了）—— 对应**六阶段全流程**
 STEP_SCORES = "1/8 qlib_scores.py（阶段2 S层重算）"
+#: 🆕 **观察态水印 / 免责**（**单一事实源 = `snapshot.py`** ⇒ 报告 / 执行卡 / 终端提示
+#:    共用同一句，不许各写各的）
+OBSERVATION_WATERMARK = snap_mod.OBSERVATION_WATERMARK
+OBSERVATION_DISCLAIMER = snap_mod.OBSERVATION_DISCLAIMER
+STEP_RULES = "3b/8 recommend.py（阶段3b 规则层调仓建议）"
 STEP_EXPORT_PRICES = "2/8 export_qlib_prices.py（阶段2 个股日线导出）"
 STEP_ANALYZE = "3/8 analyze.py（阶段3 E=W×S 穿透 + 均线过滤）"
 STEP_CONTEXT = "4/8 build_ta_context.py（阶段4 上下文）"
@@ -182,7 +182,7 @@ def _price_of(prices: Any, code: str) -> tuple[float | None, str | None]:
 
 
 # =============================================================================
-# A. 模式 A —— 日常巡检（只查 512800 与 MA60 的距离）
+# A. MA 安全垫计算（MA20 / MA60）
 # =============================================================================
 def compute_ma_levels(
     prices_df: pd.DataFrame,
@@ -270,7 +270,7 @@ def _load_price_frame(
     """取行情表：给了 ``prices_df`` 直接用；否则读 CSV。
 
     显式给的路径**读不到 ⇒ 抛异常**（调用方的错）；
-    缺省路径读不到 ⇒ 返回空表 + 说明（⇒ 模式 A 走 ``insufficient_data``，不编数字）。
+    缺省路径读不到 ⇒ 返回空表 + 说明（⇒ 降级为 ``insufficient_data``，不编数字）。
     """
     if prices_df is not None:
         return _normalize_prices(prices_df), None
@@ -366,65 +366,50 @@ def _primary_holding(account: dict) -> dict:
     }
 
 
-def run_mode_a(
-    *,
-    asof: object = None,
-    prices_df: pd.DataFrame | None = None,
-    prices_csv: str | Path | None = None,
-    account: Any = None,
-    run_dir: str | Path | None = None,
-    dry_run: bool = False,
-) -> dict:
-    """模式 A：日常巡检 —— **只**看 512800 现价与 MA60 的距离。
+def _check_holding_discipline(*, asof: str, prices_csv: str | Path | None,
+                              account: Any, notes: list[str]) -> dict:
+    """**持仓纪律检查**：唯一持仓的现价 vs MA60（安全垫）。
 
-    🔴 **构造性保证**：本函数**不会**调用打分 / 选股 / LLM（那些只在 `run_mode_b` 里），
-    也不存在任何开仓分支 ⇒ 物理上不可能产出新仓位指令。
+    🔴 为什么保留这一步：旧形态里这条检查住在「日常巡检」路径 ⇒ 该路径被
+    废除后它会**一起消失** ⇒ 唯一持仓的止损纪律就没人守了。
+    ⇒ 现在它是**统一流水线里的一个环节**：只**披露 + 告警**，**不自动下单**
+    （真要紧急平仓，仍需人在实盘态确认）。
 
-    返回
-    ----
-    dict，键：``mode, asof, status, holding, account, ma, action, email_kind, notes``
-    （外加 ``run_dir`` / ``artifact``）。
-
-    * ``status``：``"ok"``（趋势完好）/ ``"broken"``（破位）/ ``"insufficient_data"``；
-    * ``status == "ok"`` ⇒ ``action`` **必须**是 ``None``；
-    * ``status == "broken"`` ⇒ ``action`` 是紧急平仓指令（含股数 / 触发价 / MA60 / 跌破幅度）；
-    * ``email_kind``：``"daily_ok"`` / ``"emergency_break"``。
+    返回 ``{"status", "code", "close", "ma60", "distance_pct", "action"}``；
+    ``status`` ∈ ``ok`` / ``broken`` / ``insufficient_data``。
     """
-    day = mode_router.normalize_date(asof) or date.today().isoformat()
-    notes: list[str] = []
-
+    day = mode_router.normalize_date(asof) or str(asof)
     effective_account, acc_warnings = _resolve_account(account)
     notes.extend(acc_warnings)
-    account_block, block_warnings = _account_block(effective_account)
-    notes.extend(block_warnings)
     holding = _primary_holding(effective_account)
 
-    frame, price_note = _load_price_frame(prices_df, prices_csv)
+    frame, price_note = _load_price_frame(None, prices_csv)
     if price_note:
-        notes.append(f"⚠️ {price_note} ⇒ 无法计算均线 ⇒ 走 insufficient_data")
+        notes.append(f"⚠️ {price_note} ⇒ 持仓纪律检查走 insufficient_data")
 
     ma = compute_ma_levels(
         frame, DC.PRIMARY_HOLDING_CODE,
         ma_windows=(DC.ENTRY_MA_WINDOW, DC.EXIT_MA_WINDOW),
         asof=day, shares=holding.get("shares"),
     )
-
     close = ma["close"]
     ma60 = ma["ma60"]
     action: dict | None = None
 
     if close is None or ma60 is None:
         status = "insufficient_data"
-        email_kind = "daily_ok"
         notes.append(
             f"⚠️ **样本不足**：MA{DC.EXIT_MA_WINDOW} 需要 {DC.EXIT_MA_WINDOW} 根收盘价，"
-            f"实际只有 {ma['n_obs']} 根 ⇒ **不做破位判定**（不编数字），"
-            f"按「趋势完好」处理并如实披露"
+            f"实际只有 {ma['n_obs']} 根 ⇒ **不做破位判定**（不编数字），按「趋势完好」披露"
         )
-    elif close < ma60 * (1.0 - float(DC.BREAK_CONFIRM_RATIO)):
+        return {
+            "status": status, "code": DC.PRIMARY_HOLDING_CODE, "close": close,
+            "ma60": ma60, "distance_pct": None, "action": None,
+        }
+
+    distance = ma["distance_to_ma60_pct"]
+    if close < ma60 * (1.0 - float(DC.BREAK_CONFIRM_RATIO)):
         status = "broken"
-        email_kind = "emergency_break"
-        distance = ma["distance_to_ma60_pct"]
         action = {
             "action": "紧急平仓",
             "kind": "emergency_liquidation",
@@ -441,68 +426,32 @@ def run_mode_a(
             "instruction": (
                 f"下一交易时段清掉 {holding.get('shares')} 股 "
                 f"{holding.get('name') or DC.PRIMARY_HOLDING_NAME}"
-                f"（参考价 {close:.4f} 元/股），成交后资金归集，"
-                f"下一次敞口由 {DC.NEXT_SIGNAL_DATE} 的正式调仓决定"
+                f"（参考价 {close:.4f} 元/股）；🔴 本卡**不自动下单**，需人工确认"
             ),
         }
         notes.append(
             f"🔴 **紧急避险**：{DC.PRIMARY_HOLDING_CODE} 收盘 {close:.4f} < "
-            f"MA{DC.EXIT_MA_WINDOW} {ma60:.4f}（{distance:+.2%}）⇒ 已生成紧急平仓指令"
+            f"MA{DC.EXIT_MA_WINDOW} {ma60:.4f}（{distance:+.2%}）⇒ 已生成紧急平仓告警"
+            "（**不自动下单**）"
         )
     else:
         status = "ok"
-        email_kind = "daily_ok"
-        distance = ma["distance_to_ma60_pct"]
-        buffer_amount = ma["safety_buffer_amount"]
-        buffer_txt = (
-            f"、金额口径安全垫 {buffer_amount:,.2f} 元"
-            if buffer_amount is not None else ""
-        )
         notes.append(
-            f"✅ **趋势完好，守纪律躺平**：收盘 {close:.4f} 高于 "
-            f"MA{DC.EXIT_MA_WINDOW} {ma60:.4f}（安全垫 {distance:+.2%}{buffer_txt}）"
-            f" ⇒ 本轮不做任何仓位调整"
+            f"✅ **趋势完好**：收盘 {close:.4f} 高于 MA{DC.EXIT_MA_WINDOW} {ma60:.4f}"
+            f"（安全垫 {distance:+.2%}）"
         )
-
-    notes.append(
-        "🔴 模式 A 是**构造性保证**：本函数路径内没有打分 / 选股 / LLM 调用"
-        " ⇒ 不会产出任何新仓位指令"
-    )
-    if DC.SILENT_DEFENSE_START <= day <= DC.SILENT_DEFENSE_END:
-        notes.append(
-            f"🔴 **静默防守窗口**（{DC.SILENT_DEFENSE_START} ~ {DC.SILENT_DEFENSE_END}）："
-            f"下一个正式调仓信号日 = {DC.NEXT_SIGNAL_DATE}，此前只巡检不动手"
-        )
-
-    result: dict[str, Any] = {
-        "mode": "A",
-        "asof": day,
-        "status": status,
-        "holding": holding,
-        "account": account_block,
-        "ma": ma,
-        "action": action,
-        "email_kind": email_kind,
-        "notes": notes,
-        "generated_at": _now_iso(),
+    return {
+        "status": status, "code": DC.PRIMARY_HOLDING_CODE, "close": close,
+        "ma60": ma60, "distance_pct": distance, "action": action,
     }
-
-    if run_dir is not None:
-        out_dir = Path(run_dir)
-        artifact = out_dir / f"mode_a_{day.replace('-', '')}.json"
-        result["run_dir"] = str(out_dir)
-        result["artifact"] = str(artifact)
-        if not dry_run:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            artifact.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
-    return result
 
 
 # =============================================================================
-# B. 模式 B —— 调仓节点（研究链全链 → 确定性执行卡）
+# B. 统一流水线（六阶段全流程 → 不可变快照）
+
+
+# =============================================================================
+# B. 研究链全链 → 确定性执行卡
 # =============================================================================
 def _run_cmd(cmd: list, *, step: str, timeout: float | None = None,
              env: dict[str, str] | None = None) -> str:
@@ -523,16 +472,16 @@ def _run_cmd(cmd: list, *, step: str, timeout: float | None = None,
         )
     except FileNotFoundError as exc:
         raise FileNotFoundError(
-            f"模式 B 第 {step} 步的解释器/脚本不存在：{printable}（{exc}）⇒ 拒绝继续"
+            f"第 {step} 步的解释器/脚本不存在：{printable}（{exc}）⇒ 拒绝继续"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
-            f"模式 B 第 {step} 步超时（>{timeout} 秒）：{printable}\n"
+            f"第 {step} 步超时（>{timeout} 秒）：{printable}\n"
             f"--- 部分 stdout ---\n{exc.stdout or ''}\n--- 部分 stderr ---\n{exc.stderr or ''}"
         ) from exc
     if proc.returncode != 0:
         raise RuntimeError(
-            f"模式 B 第 {step} 步失败（退出码 {proc.returncode}）\n"
+            f"第 {step} 步失败（退出码 {proc.returncode}）\n"
             f"命令：{printable}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
         )
     return f"{proc.stdout}\n{proc.stderr}"
@@ -584,7 +533,21 @@ def _score_grid(calendar_path: str | Path | None = None) -> tuple[list[str] | No
     every_n = int(getattr(rcfg, "REBALANCE_EVERY_N_DAYS", 10))
     start = str(getattr(rcfg, "SCORE_START_TIME", "") or "")
     provider_uri = str(getattr(rcfg, "PROVIDER_URI", "") or "")
-    candidates = [Path(provider_uri) / "calendars" / "day.txt"]
+    # 🔴🔴 **先读「选定的 provider」**（2026-11-06 09:2x 修复）：阶段 1 的「自建增量日」把
+    #    派生目录 `cn_data_live` 补到了信号日之后 ⇒ 但本函数原来只读**上游基座**
+    #    `C.PROVIDER_URI` ⇒ **派生目录对它完全不可见** ⇒ 栅格的「末日例外」停在基座末日
+    #    ⇒ 分析日退到基座末日、披露也说「数据集覆盖末日 = 基座末日」⇒ **保守失真**。
+    #    ⇒ 现在与打分刷新链（`run_qlib_score.select_provider`）**同源**：谁新用谁。
+    candidates: list[Path] = []
+    try:
+        import run_qlib_score as _RS  # 同目录，避免循环导入（run_qlib_score 不依赖本模块）
+
+        provider, _reason = _RS.select_provider()
+        candidates.append(Path(provider) / "calendars" / "day.txt")
+    except Exception:  # noqa: BLE001 - 退回基座口径
+        pass
+    if provider_uri:
+        candidates.append(Path(provider_uri) / "calendars" / "day.txt")
     if calendar_path:
         candidates.append(Path(calendar_path))
     for cal_path in candidates:
@@ -640,14 +603,26 @@ def _resolve_analysis_asof(*, signal_date: str, scores_path: Path,
         notes.append("⚠️ 打分栅格里没有 ≤ 信号日的日期 ⇒ 分析日退回分数文件最大日期")
 
     if analysis_asof < signal_date:
+        data_covers = bool(dataset_max) and dataset_max >= signal_date
+        if data_covers:
+            # 🔴 数据集（派生目录）**已经覆盖到信号日** ⇒ 差的是「S 层没重跑」，不是「数据不够」
+            advice = (
+                "⇒ **数据已够**（派生目录已覆盖到信号日）⇒ **重跑阶段 2 即可**"
+                "（`qlib_scores --end <信号日> --provider-uri <派生目录>`）；"
+                "本轮**节点日只重算股数/金额**。"
+            )
+        else:
+            advice = (
+                "⇒ **信号日当天的个股 Alpha 拿不到**（数据集没覆盖到信号日 ⇒ "
+                "阶段 2 只能打到数据集末日）。本轮**节点日只重算股数/金额**。"
+                "要把打分推到信号日，必须先让**阶段 1** 把 qlib 数据集刷新到信号日之后"
+                "（滚动快照换库 ＋ **自建增量日**兜底），再重跑阶段 2。"
+            )
         notes.append(
             f"🔴 **S 层打分日 = {analysis_asof} ≠ 信号日 {signal_date}**"
             + (f"（打分栅格里 ≤ 信号日的最后一天 = {grid_last}）" if grid_last else "")
             + (f"；当前 qlib 数据集覆盖末日 = {dataset_max}" if dataset_max else "")
-            + " ⇒ **信号日当天的个股 Alpha 拿不到**（数据集没覆盖到信号日 ⇒ "
-            "阶段 2 只能打到数据集末日）。本轮**节点日只重算股数/金额**。"
-            "要把打分推到信号日，必须先让**阶段 1** 把 qlib 数据集刷新到信号日之后"
-            "（滚动快照换库），再重跑阶段 2。"
+            + " " + advice
         )
     else:
         notes.append(
@@ -664,14 +639,17 @@ def _resolve_analysis_asof(*, signal_date: str, scores_path: Path,
     }
 
 
-def _export_stock_prices(analysis_asof: str, notes: list[str]) -> Path | None:
+def _export_stock_prices(analysis_asof: str, notes: list[str],
+                         *, out_dir: str | Path) -> Path | None:
     """**阶段 2b**：导出全市场个股日线（供 ``analyze.py`` 的多日 RankIC 用）。
 
     🔴 为什么必须放在 S 层刷新**之后**：``analyze.py`` 的 N=5 / N=20 交易日 RankIC
     需要「个股前瞻收益」，价格源是 ``stock_prices.csv``；若 S 层刚重算而价格没重导，
     RankIC 会拿**旧价**去配**新分数** ⇒ 口径错配。
+
+    🔴 **只落快照目录**（``out_dir`` = 本轮快照）⇒ 每日链**不写**研究链产物根。
     """
-    out = Path(DC.RESEARCH_RUN_ROOT) / "stock_prices.csv"
+    out = Path(out_dir) / "stock_prices.csv"
     try:
         _run_cmd([
             DC.QL_PY, str(_RESEARCH_ROOT / "data" / "export_qlib_prices.py"),
@@ -688,33 +666,53 @@ def _export_stock_prices(analysis_asof: str, notes: list[str]) -> Path | None:
     return out
 
 
-def _refresh_scores(*, scores_path: Path, notes: list[str], end_date: str | None = None) -> None:
-    """重跑 S 层（**阶段 2**：全市场个股 Alpha 推断）。
+def _refresh_scores(*, scores_path: Path, notes: list[str],
+                    end_date: str | None = None) -> None:
+    """重跑 S 层（**阶段 2**：全市场个股 Alpha 推断）⇒ **只写快照目录**。
 
-    🔴 主 agent 2026-11-05 核验：``qlib_scores.py`` 的落盘是
-    ``scores.to_csv(out_dir/"stock_scores.csv")`` ⇒ **整体覆盖**、**不是增量**
-    ⇒ 拿旧的 69 个打分日当增量会把它们**全部抹掉**。
-    ⇒ 本函数必须做到四件事：① 跑在**临时目录**；② 跑之前**备份** canonical；
-    ③ 跑完**合并**（不是覆盖）回 canonical；④ 明确提示「约 27 分钟，属重活」。
+    🔴 ``qlib_scores.py`` 的落盘是 ``scores.to_csv(out_dir/"stock_scores.csv")``
+    ⇒ **整体覆盖**、**不是增量** ⇒ 必须「临时目录跑 → 与底座合并 → 写回目标」。
 
-    🔴 **2026-11-05 新增 ``end_date``**：不传 ``--end`` 时 ``qlib_scores.py`` 会用
-    ``config.SCORE_END_TIME``（数据集末日）**静默截断** ⇒ 调仓日拿到的仍是旧分数。
-    传了 ``--end <信号日>`` 才会打到信号日；脚本内部还会按**数据集真实覆盖末日**
-    封顶并在超限时**显式告警**（不静默）。
+    🔴 **底座口径（链式）**：``scores_path`` 在调用前已经放好底座
+       （**上一份快照**的分数，或 canonical 的**一次性只读种子**）
+       ⇒ ``start`` 有值 ⇒ **增量**重算 ⇒ 打分窗口与历史一致（不会每轮从 2024 重算）。
+
+    🔴 **canonical 永不被写**：本函数只**读** canonical（算 md5 前后对照做证据），
+       只写 ``scores_path``（本轮快照内）。
     """
+    import hashlib
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = scores_path.parent / f"_scores_refresh_{stamp}"
     backup = scores_path.parent / f"{scores_path.name}.bak-{stamp}"
-    start = _scores_max_date(scores_path)
+    canonical = Path(DC.STOCK_SCORES_CSV)
+    before_canonical = (
+        hashlib.md5(canonical.read_bytes()).hexdigest() if canonical.is_file() else None
+    )
+
+    start = _scores_max_date(scores_path) if scores_path.exists() else None
     print("[WARN] 🔴 即将重跑 S 层：这一步约 27 分钟，属**重活**（铁律一：需用户当轮授权）。")
     notes.append(
         "🔴 **已重跑 S 层**（阶段 2，约 27 分钟的重活）：跑在临时目录 → "
-        "备份 canonical → **合并**（不是覆盖）回 canonical"
+        "以**快照内底座**增量重算 → 合并落**本快照**"
+        "（🔴 **canonical `stock_scores.csv` 零改动**）"
         + (f"；打分截止日 = {end_date}" if end_date else "")
+        + (f"；底座最新打分日 = {start}" if start else "；**无底座 ⇒ 全量重算**")
     )
     tmp_dir.mkdir(parents=True, exist_ok=True)
     cmd = [DC.QL_PY, str(_RESEARCH_ROOT / "qlib_scores.py"), "--mode", "infer",
            "--out-dir", str(tmp_dir)]
+    # 🔴 **必须显式带 `--provider-uri`**：否则 `qlib_scores` 用**上游基座**的默认
+    #    `C.PROVIDER_URI` ⇒ 派生目录 `cn_data_live` 里已补到信号日的数据**用不上**
+    #    ⇒ S 层会停在基座末日 ⇒ 拿不到新鲜 Alpha。
+    try:
+        import run_qlib_score as _RS
+
+        _provider, _reason = _RS.select_provider(end_date)
+        cmd += ["--provider-uri", str(_provider)]
+        notes.append(f"ℹ️ S 层打分数据源（provider-uri）= {_provider}（{_reason}）")
+    except Exception as exc:  # noqa: BLE001 - 退回默认口径
+        notes.append(f"⚠️ provider-uri 解析失败（退回默认基座）：{type(exc).__name__}: {exc}")
     if start:
         cmd += ["--start", start]
     if end_date:
@@ -723,11 +721,16 @@ def _refresh_scores(*, scores_path: Path, notes: list[str], end_date: str | None
     produced = tmp_dir / "stock_scores.csv"
     if not produced.exists():
         raise FileNotFoundError(f"重跑 S 层后产物不存在：{produced}")
+    # 🔴 **合并（不是覆盖）**：`qlib_scores.py` 的落盘是**整体覆盖**
+    #    ⇒ 只含「本次新增段」的产物若直接写回，会把历史打分日**全部抹掉**。
+    #    ⇒ 统一走「旧 + 新 ⇒ 按 (date, instrument) 去重 keep=last ⇒ 写回」。
     if scores_path.exists():
         shutil.copy2(scores_path, backup)
-        notes.append(f"ℹ️ canonical 个股分数已备份到 {backup}")
-    old = (pd.read_csv(scores_path, dtype={"instrument": str})
-           if scores_path.exists() else None)
+        notes.append(f"ℹ️ 快照内底座分数已备份到 {backup}")
+    old = (
+        pd.read_csv(scores_path, dtype={"instrument": str})
+        if scores_path.exists() else None
+    )
     new = pd.read_csv(produced, dtype={"instrument": str})
     merged = pd.concat([old, new], ignore_index=True) if old is not None else new
     merged["date"] = pd.to_datetime(merged["date"])
@@ -736,11 +739,16 @@ def _refresh_scores(*, scores_path: Path, notes: list[str], end_date: str | None
     merged.to_csv(scores_path, index=False)
     shutil.rmtree(tmp_dir, ignore_errors=True)
     new_max = _scores_max_date(scores_path)
-    notes.append(
-        f"✅ S 层已合并回 canonical：最新打分日 = {new_max or '—'}"
-        f"（合并前 {start or '—'}；按 (date, instrument) 去重，keep=last）"
+    after_canonical = (
+        hashlib.md5(canonical.read_bytes()).hexdigest() if canonical.is_file() else None
     )
-
+    notes.append(
+        f"✅ S 层已合并落**本快照**：{scores_path}"
+        f"（底座 {0 if old is None else len(old)} 行 + 新增 {len(new)} 行 = {len(merged)} 行）"
+        f"｜最新打分日 = {new_max or '—'}"
+        f"｜canonical md5 {before_canonical} → {after_canonical}"
+        f"（{'**未变 ✅**' if before_canonical == after_canonical else '**变了 ❌ 污染！**'}）"
+    )
 
 def _env_with_dotenv(ta_dir: Path, overrides: dict[str, str] | None = None) -> dict[str, str]:
     """把 TradingAgents 的 ``.env`` 载入环境变量后返回环境（供子进程使用）。
@@ -785,87 +793,139 @@ def _resolve_llm_timeout(llm_timeout: float | None) -> float:
     return float(DC.LLM_TIMEOUT if llm_timeout is None else llm_timeout)
 
 
-def _stage_recommendation(run_path: Path, notes: list[str]) -> None:
-    """把研究链的 ``rebalance_recommendation.json`` **只读复制**到本次运行目录。
+def _holdings_arg(account: dict) -> str:
+    """把账户持仓归成 ``recommend.py --holdings`` 要的 ``code:weight`` 串。
 
-    为什么需要：``build_ta_context.py`` 读 ``<run-root>/rebalance_recommendation.json``
-    （规则层推荐件，由 ``recommend.py`` 产出）⇒ 每日运行目录里没有它 ⇒ 步骤 3 会失败。
-    该件是**研究链的规则层事实** ⇒ 直接复用（只读），不重跑（重跑 = 另一条重活）。
-    ⚠️ 口径披露：推荐件里的账户数字是**研究链基准**（2026-11-04），
-    不是实盘基准（2026-11-05）⇒ TA 上下文里的账户段以执行卡的 ``account`` 块为准。
+    🔴 用**实盘口径**（``account_state``）⇒ 规则层与交付层（执行卡）**同一账户**。
     """
+    total = _f(account.get("total_assets"))
+    parts: list[str] = []
+    for pos in account.get("positions") or []:
+        code = str(pos.get("code") or "").strip()
+        market_value = _f(pos.get("market_value"))
+        if not code or market_value is None or not total:
+            continue
+        parts.append(f"{code}:{market_value / total:.6f}")
+    return ",".join(parts)
+
+
+def _smoothing_args() -> list[str]:
+    """平滑参数（**单一事实源 = 研究链 config.py**）⇒ 分析链与规则层**同一组**。
+
+    🔴 少传一条 ⇒ 两链分叉 ⇒ 交付与规则选出不同的票（且**不报错**）。
+    """
+    cfg = _research_config()
+    return [
+        "--smoothing-method", str(getattr(cfg, "SMOOTHING_METHOD", "ewma")),
+        "--smoothing-window", str(getattr(cfg, "SMOOTHING_WINDOW", 5)),
+        "--smoothing-alpha", str(getattr(cfg, "SMOOTHING_ALPHA", 0.35)),
+        "--smoothing-history-days", str(getattr(cfg, "SMOOTHING_HISTORY_SPAN_DAYS", 30)),
+    ]
+
+
+def _run_rules_layer(run_path: Path, notes: list[str], *, analysis_asof: str,
+                     scores_path: Path, prices_path: Path, universe_path: Path,
+                     holdings_arg: str = "") -> Path | None:
+    """**阶段 3b · 规则层**：``recommend.py`` 在**本快照目录内**现跑。
+
+    🔴 为什么不再「从研究链产物根只读复制」：复制来的是**另一次跑**的产物
+    （可能用旧分数 / 不同 asof / 不同平滑口径）⇒ 与本轮交付层**口径不一致**
+    （历史上真出过「规则层 11-03 无平滑 vs 交付层 11-05 有平滑」的分叉）。
+    ⇒ 现在：**同 asof / 同 scores / 同 prices / 同 universe / 同账户权重 / 同平滑参数**，
+    在快照里现跑 ⇒ 规则层与交付层**同源**。
+    """
+    cmd = [
+        DC.QL_PY, str(_RESEARCH_ROOT / "recommend.py"),
+        "--asof", str(analysis_asof),
+        "--scores", str(scores_path),
+        "--prices", str(prices_path),
+        "--universe", str(universe_path),
+        "--holdings-csv", str(DC.ETF_HOLDINGS_CSV),
+        "--out-dir", str(run_path),
+        "--pool-mode", "e_covered",
+        "--entry-ma-window", str(DC.ENTRY_MA_WINDOW),
+        "--exit-ma-window", str(DC.EXIT_MA_WINDOW),
+    ] + _smoothing_args()
+    if holdings_arg:
+        cmd += ["--holdings", holdings_arg]
+    _run_cmd(cmd, step=STEP_RULES)
     target = run_path / "rebalance_recommendation.json"
-    if target.exists():
-        return
-    source = Path(DC.RESEARCH_RUN_ROOT) / "rebalance_recommendation.json"
-    if not source.exists():
-        notes.append(f"⚠️ 研究链规则层推荐件不存在（{source}）⇒ build_ta_context 可能失败")
-        return
-    shutil.copy2(source, target)
+    if not target.exists():
+        notes.append(
+            f"⚠️ 规则层推荐件缺失（{target}）⇒ TA 上下文里的规则层段可能为空"
+        )
+        return None
     notes.append(
-        f"ℹ️ 规则层推荐件从 {source} **只读复制**到 {target}（供 build_ta_context 消费）；"
-        f"⚠️ 该件的账户数字是**研究链基准**（2026-11-04），不是实盘基准（2026-11-05）"
-        f" ⇒ 辩论里的账户口径以执行卡的 account 块为准"
+        f"✅ 规则层推荐件已在本快照内产出：{target}"
+        "（**同源**：同 asof / 同 scores / 同 prices / 同账户权重 / 同平滑参数）"
     )
+    return target
 
-
-def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
-               prices_csv: str | Path | None = None, scores_csv: str | Path | None = None,
-               calendar_path: str | Path | None = None, dry_run: bool = False,
-               skip_llm: bool = False, llm_timeout: float | None = None,
-               reasoning_effort: str = "",
-               refresh_scores: bool = True) -> dict:
-    """模式 B：调仓节点 —— 研究链全链 + 确定性执行卡片。
+def run_pipeline(*, asof: object = None, snapshot: Any = None,
+                 run_dir: str | Path | None = None,
+                 prices_csv: str | Path | None = None,
+                 scores_csv: str | Path | None = None,
+                 calendar_path: str | Path | None = None, preflight_only: bool = False,
+                 skip_llm: bool = False, llm_timeout: float | None = None,
+                 reasoning_effort: str = "", refresh_scores: bool = True,
+                 live_trade: bool = False) -> dict:
+    """**统一流水线**：六阶段全流程 → 落一个**不可变快照** → 确定性执行卡片。
 
     参数
     ----
-    llm_timeout:
-        阶段 4（``run_tradingagents.py``）的墙钟超时（秒）。
-        **缺省读 `daily_config.LLM_TIMEOUT`**（默认 5400 秒）
-        ⇒ 🔴 2026-11-05 实测：``reasoning_effort=max`` 时 MiniMax 单次调用 185 秒，
-        多智能体图要调十几次 ⇒ 原 1800 秒**必然超时**（实测 15:52→16:22 被打断）。
-    reasoning_effort:
-        阶段 4 的 ``reasoning_effort`` 覆盖（``max`` / ``high`` / ``medium`` / ``low``）。
-        **缺省空串 = 不覆盖** ⇒ 沿用 ``TradingAgents/.env`` 里现役的 ``max``。
-        非空时通过子进程 env ``TRADINGAGENTS_REASONING_EFFORT`` 下发（**不改 .env**）。
+    snapshot:
+        ``daily.snapshot.Snapshot`` 实例（**本轮唯一产物根**）。
+        缺省 ⇒ 自建一个（落在 ``daily_config.SNAPSHOT_ROOT``）。
+    live_trade:
+        🔴 **唯一**实盘副作用开关。``False``（**缺省**）⇒ 观察态：
+        执行卡**挂单禁用**、**不发信**、节点日重算失败**可降级**（只披露）；
+        ``True`` ⇒ 实盘态：执行卡可下单、允许发信、节点日重算失败**整轮崩**
+        （fail-closed：拿不到节点日价就不许出节点日清单）。
+    preflight_only:
+        **前置判定**模式：不取数、不写产物、不调 LLM（只算「能不能跑」）。
+
+        🔴 2026-11-10：**故意不叫 ``dry_run``**。CLI 的 ``--dry-run`` 是另一个意思
+        （＝「显式声明观察态」，而观察态**本来就是缺省行为** ⇒ 它不改变任何行为）。
+        两个同名不同义的开关并存在一条链上 = 典型「暗门」：哪天有人把 CLI 的
+        ``--dry-run`` 接到这个参数上，CLI 承诺的「跑完落快照 ＋ 报告」会**静默变成
+        「产物为空」**。⇒ 这里改叫 ``preflight_only``，语义只此一种。
 
     执行链 = **六阶段全流程**（**每一步都能单独失败，原始报错原样抛出**）：
 
     0. （阶段 1 由 ``main.py`` 负责：AkShare 盘后取数 + qlib 数据集滚动快照换库。）
-    1. **阶段 2 · S 层新鲜度**：``refresh_scores=True``（**默认**）⇒ 跑
-       ``qlib_scores.py --mode infer --end <信号日>``（约 27 分钟）；
-       它是**整体覆盖**、不是增量 ⇒ 本函数让它跑在**临时目录** + 先备份 canonical +
-       再按 ``(date, instrument)`` **合并**（keep=last）回 canonical。
-       ``refresh_scores=False`` 时**只读** ``stock_scores.csv``（沿用旧分数，
-       并在 ``notes`` 里**显式披露**分数末日 ≠ 信号日）。
-    2. **阶段 2b · 个股日线导出**（``export_qlib_prices.py``）：``analyze.py`` 的多日
-       RankIC（N=5 / N=20）要全市场个股收盘价 ⇒ S 层刷新后**必须重导**，否则用的是旧价。
-    3. **阶段 3 · ``analyze.py``**：``E = W × S`` 穿透聚合 + MA20/MA60 均线过滤；
-       注入**实盘账户基准**（``--total-assets`` / ``--cash`` / ``--account-snapshot``），
-       分析日 = **最近可用打分日**（见 `_resolve_analysis_asof`）。
-    4. **阶段 4 · ``build_ta_context.py``** → ``ta_research_context.md`` + ``ta_context_meta.json``。
-    5. **阶段 4 · ``run_tradingagents.py``**（**llm 解释器**）：产出
-       ``tradingagents_decision.md/.json``；🔴 **json 的 ``status`` 字段才是权威**
-       （失败时 md 也会写占位件）。
-    6. **阶段 5 · ``final_rebalance_plan.py``**：产出 ``final_rebalance_plan.json``。
-    7. **阶段 5 · ``reprice_node_day.py``**：用**节点日收盘价**重算股数 ⇒
-       ``node_reprice_<日期>.json``。
-    8. **阶段 6 · 组装执行卡片**（见 `build_execution_card`）。
+    1. **阶段 1b · 有效行情**：canonical ETF 日线 ＋ 当日新抓日线 ⇒ 快照内有效行情。
+    2. **阶段 2 · S 层新鲜度**（``refresh_scores=True``）：跑 ``qlib_scores.py --mode infer
+       --end <信号日>``（约 27 分钟）⇒ 跑在临时目录 → 与**快照内底座**合并 → 只落快照。
+    3. **阶段 2b · 个股日线导出**（``export_qlib_prices.py``）：多日 RankIC 要全市场个股收盘价。
+    4. **阶段 3 · ``analyze.py``**：``E = W × S`` 穿透聚合 + MA20/MA60 均线过滤。
+    5. **阶段 3b · 规则层 ``recommend.py``**：**在本快照内现跑**（同源）。
+    6. **阶段 4 · ``build_ta_context.py``** → ``ta_research_context.md`` + ``ta_context_meta.json``。
+    7. **阶段 4 · ``run_tradingagents.py``**：产出 ``tradingagents_decision.md/.json``。
+    8. **阶段 5 · ``final_rebalance_plan.py``** → ``final_rebalance_plan.json``。
+    9. **阶段 5 · ``reprice_node_day.py``** → ``node_reprice_<日期>.json``。
+    10. **阶段 6 · 组装执行卡片**（见 ``build_execution_card``）。
 
     返回
     ----
-    dict，键：``mode, asof, execution_date, run_dir, report_json, plan_json, node_json,
-    card, email_kind, notes``（外加 ``analysis_asof`` / ``scores_max_date`` /
-    ``score_grid_last`` / ``qlib_dataset_max_date`` / ``llm_decision_status`` /
-    ``execution_lag_days`` 等审计键）。
+    dict，键见模块契约（``mode="unified"`` / ``live_trade`` / ``snapshot`` / …）。
     """
     signal_date = mode_router.normalize_date(asof) or DC.NEXT_SIGNAL_DATE
     notes: list[str] = []
-    run_path = Path(run_dir) if run_dir is not None else (
-        Path(DC.RUN_ROOT) / signal_date.replace("-", "")
-    )
+
+    # ---- 快照（本轮唯一产物根）--------------------------------------------
+    if snapshot is None:
+        snapshot = snap_mod.create_snapshot(
+            DC.SNAPSHOT_ROOT, asof=signal_date, live_trade=live_trade)
+    run_path = Path(snapshot.path)
+    # 🔴 2026-11-09（独立审计 P1-6）：原先这几处写死「daily_config 里的默认快照根常量」
+    #    ⇒ CLI 的 ``--snapshot-root PATH`` 被**忽略** ⇒ 自定义根下
+    #    「底座链」断裂（退回 canonical 一次性种子）、``--skip-llm`` 复用不到上一轮决策。
+    #    ⇒ 统一用**本轮快照自己的根**。
+    snap_root = Path(snapshot.root)
     prices_path = Path(prices_csv) if prices_csv is not None else Path(DC.ETF_PRICES_CSV)
-    scores_path = Path(scores_csv) if scores_csv is not None else Path(DC.STOCK_SCORES_CSV)
+    scores_path = (
+        Path(scores_csv) if scores_csv is not None else (run_path / "stock_scores.csv")
+    )
     universe_path = Path(DC.ETF_UNIVERSE_CSV)
     snapshot_path = run_path / "account_snapshot.csv"
     account_json_path = run_path / "account_context.json"
@@ -875,54 +935,106 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
     decision_json = run_path / "tradingagents_decision.json"
     decision_md = run_path / "tradingagents_decision.md"
     execution_date = DC.NEXT_EXECUTION_DATE if signal_date == DC.NEXT_SIGNAL_DATE else None
-    # 🔴 阶段 4 超时缺省读 `daily_config.LLM_TIMEOUT`（默认 5400 秒）
-    #    ⇒ 不再写死 1800（2026-11-05 实测：effort=max 时单次调用 185 秒 ⇒ 1800 必超时）
     llm_timeout = _resolve_llm_timeout(llm_timeout)
-    # 🔴 阶段 4 的 reasoning_effort 覆盖：空串 = **不覆盖**（沿用 .env 现役值）
     llm_env_overrides: dict[str, str] = {}
     if reasoning_effort:
         llm_env_overrides["TRADINGAGENTS_REASONING_EFFORT"] = str(reasoning_effort)
 
-    if dry_run:
+    # ---- 前置判定（preflight_only）：只判定「能不能跑」------------------------
+    if preflight_only:
+        base_path, base_note = snap_mod.resolve_scores_base(
+            snap_root, DC.STOCK_SCORES_CSV, exclude=run_path, asof=signal_date)
+        notes.append(f"ℹ️ S 层底座（只读）：{base_note}")
         analysis = _resolve_analysis_asof(
-            signal_date=signal_date, scores_path=scores_path, calendar_path=calendar_path)
+            signal_date=signal_date,
+            scores_path=Path(base_path) if base_path is not None else scores_path,
+            calendar_path=calendar_path,
+        )
         notes.extend(analysis["notes"])
-        notes.append("🧪 **dry-run**：未执行任何外部命令、未写入任何产物（仅做前置判定）")
+        notes.append(
+            "🧪 **前置判定（preflight_only）**：未取数、未写任何产物、未调 LLM"
+            "（快照目录已建但**空**）⇒ 仅做前置判定"
+        )
         return {
-            "mode": "B",
+            "mode": "unified",
+            "live_trade": bool(live_trade),
             "asof": signal_date,
             "execution_date": execution_date,
             "run_dir": str(run_path),
+            "snapshot": {
+                "root": str(snapshot.root),
+                "path": str(run_path),
+                "run_id": str(snapshot.run_id),
+            },
             "report_json": None,
             "plan_json": None,
             "node_json": None,
+            "card_json": None,
             "card": None,
+            "decision_json": str(decision_json),
+            "decision_md": str(decision_md),
+            "scores_path": str(scores_path),
+            "prices_path": str(prices_path),
             "email_kind": "rebalance_card",
             "notes": notes,
+            "holding_discipline": None,
             "analysis_asof": analysis["analysis_asof"],
             "scores_max_date": analysis["scores_max_date"],
             "score_grid_last": analysis["grid_last"],
             "qlib_dataset_max_date": analysis["dataset_max_date"],
-            "dry_run": True,
+            # 🔴 前置判定分支**不出卡** ⇒ 这 5 个键仍要占位（值 = 「本轮未跑」）
+            #    ⇒ 调用方（`report.py` / `main.py`）读键不会 KeyError。
+            "llm_decision_status": "not_run",
+            "execution_lag_days": int(DC.EXECUTION_LAG_DAYS),
+            "node_reprice_ok": None,
+            "node_reprice_error": "",
+            "generated_at": _now_iso(),
+            "preflight_only": True,
         }
 
     run_path.mkdir(parents=True, exist_ok=True)
+    notes.append(f"📦 本轮快照目录：{run_path}（live_trade={live_trade}）")
+    if live_trade:
+        notes.append("🔴 **实盘态（--live-trade）**：执行卡**可下单**、允许发信")
+    else:
+        notes.append(f"🧪 **观察态**（未开 --live-trade）：{snap_mod.OBSERVATION_DISCLAIMER}")
+
+    # ---- 账户快照 + 阶段 4 账户上下文 --------------------------------------
     account_state.write_snapshot_csv(snapshot_path)
     notes.append(
         f"ℹ️ 实盘账户快照已生成：{snapshot_path}"
         f"（口径 = {DC.ACCOUNT_SNAPSHOT_DATE} 用户基准：总资产 {DC.TOTAL_ASSETS} 元 / "
         f"现金 {DC.CASH} 元）"
     )
-    # 🔴 阶段 4 的账户口径（**实盘**）：导出成 JSON 传给 `run_tradingagents.py --account-json`
-    #    ⇒ 修「Portfolio Manager 拿研究链的 5 只持仓组合做推理」这个正确性 bug。
-    #    🔴 研究链的 `data/account_snapshot.csv` **不动**（那是研究链的输入真值）。
     account_state.write_account_json(account_json_path)
     notes.append(
         f"✅ 阶段 4 账户上下文（实盘口径）已导出：{account_json_path}"
         f"（总资产 {DC.TOTAL_ASSETS} 元 / 现金 {DC.CASH} 元 / "
         f"唯一底仓 {DC.PRIMARY_HOLDING_CODE} {DC.PRIMARY_HOLDING_SHARES} 股）"
     )
+    account_summary = account_state.account_summary()
+    holdings_arg = _holdings_arg(account_summary)
 
+    # ---- 持仓纪律检查（唯一持仓 vs MA60）-----------------------------------
+    # 🔴 这里必须传**原始** ``prices_csv``（可能是 None），不能传 ``prices_path``：
+    #    ``_load_price_frame`` 用「None ⇒ 缺省路径读不到就降级 + 披露」、
+    #    「显式路径读不到 ⇒ 抛异常（拒绝编造数据）」区分两种语义；
+    #    传 ``prices_path``（永远是个具体 Path）会把「缺省」误判成「显式」
+    #    ⇒ 没有该行情文件的机器直接崩（2026-11-09 回归）。
+    discipline = _check_holding_discipline(
+        asof=signal_date, prices_csv=prices_csv, account=account_summary, notes=notes)
+
+    # ---- 阶段 2：S 层（底座链式 ⇒ 增量重算 ⇒ 只落快照）---------------------
+    if not scores_path.exists():
+        base_path, base_note = snap_mod.resolve_scores_base(
+            snap_root, DC.STOCK_SCORES_CSV, exclude=run_path, asof=signal_date)
+        notes.append(f"ℹ️ S 层底座：{base_note}")
+        if base_path is not None:
+            scores_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(base_path, scores_path)
+            notes.append(
+                f"✅ S 层底座已**只读拷贝**进本快照：{scores_path}（源文件零改动）"
+            )
     refreshed = bool(refresh_scores)
     if refreshed:
         _refresh_scores(scores_path=scores_path, notes=notes, end_date=signal_date)
@@ -933,12 +1045,12 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
     analysis_asof = analysis["analysis_asof"]
     if not refreshed:
         notes.append(
-            f"⚠️ 本轮**未重跑 S 层**（refresh_scores=False）⇒ 沿用 canonical 里的旧分数"
+            f"⚠️ 本轮**未重跑 S 层**（refresh_scores=False）⇒ 沿用快照底座里的旧分数"
             f"（最新打分日 {analysis.get('scores_max_date') or '—'}）"
         )
 
-    # ---- 2b. export_qlib_prices.py（阶段 2b：个股日线，供 analyze.py 的多日 RankIC）----
-    stock_prices_path = _export_stock_prices(analysis_asof, notes)
+    # ---- 2b. export_qlib_prices.py（个股日线，供 analyze.py 的多日 RankIC）----
+    stock_prices_path = _export_stock_prices(analysis_asof, notes, out_dir=run_path)
 
     # ---- 3. analyze.py（阶段 3：E=W×S 穿透 + MA20/MA60 过滤）----
     _run_cmd([
@@ -951,12 +1063,49 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
         "--universe", str(universe_path),
         "--scores", str(scores_path),
         "--out-dir", str(run_path),
-    ] + (["--stock-prices", str(stock_prices_path)] if stock_prices_path else []), step=STEP_ANALYZE)
+    ] + (["--stock-prices", str(stock_prices_path)] if stock_prices_path else [])
+        + _smoothing_args(), step=STEP_ANALYZE)
     notes.append(f"✅ 分析报告已产出：{report_json}（分析日 = {analysis_asof}）")
+    # 🔴 穿透分平滑口径披露：每日链**不复制**平滑参数（单一事实源在研究链 `config.py`），
+    #    但日报必须把**实际生效**的排序口径写出来 ⇒ 读分析报告里的 `score_smoothing` 段。
+    smoothing_note = ""
+    _smoothing: dict = {}
+    try:
+        _smoothing = json.loads(report_json.read_text(encoding="utf-8")).get("score_smoothing") or {}
+    except Exception:
+        _smoothing = {}
+    if _smoothing:
+        smoothing_note = (
+            f"🆕 **穿透分时间平滑**：{_smoothing.get('ranking_basis')}"
+            f"｜排序依据 = 平滑分（原始分同时披露）"
+            f"｜观测日 {len(_smoothing.get('observation_dates') or [])} 个"
+            f"（{', '.join(_smoothing.get('observation_dates') or []) or '无'}）"
+            f"｜退化成瞬态分 {_smoothing.get('n_codes_fallback_transient')} 只"
+        )
+        notes.append(smoothing_note)
+
+    # ---- 3b. recommend.py（规则层：**在本快照内现跑** ⇒ 与交付层同源）----
+    _run_rules_layer(
+        run_path, notes,
+        analysis_asof=analysis_asof,
+        scores_path=scores_path,
+        prices_path=prices_path,
+        universe_path=universe_path,
+        holdings_arg=holdings_arg,
+    )
 
     # ---- 3/4. TradingAgents 阶段 ----
     llm_status = "skipped"
     if skip_llm:
+        reused_from = None
+        if not decision_json.exists():
+            # 🔴 2026-11-10：按 **asof** 挑底座（不是按目录名＝墙钟创建序）
+            #    ⇒ 复用别个信号日的 LLM 决策件 ⇒ 交付件里嵌的是**另一个信号日**的意见
+            prev = snap_mod.latest_snapshot(snap_root, exclude=run_path, asof=signal_date)
+            prev_json = prev / "tradingagents_decision.json" if prev is not None else None
+            if prev_json is not None and prev_json.is_file():
+                shutil.copy2(prev_json, decision_json)
+                reused_from = prev_json
         if decision_json.exists():
             _run_cmd([
                 DC.LLM_PY, str(_RESEARCH_ROOT / "llm" / "run_tradingagents.py"),
@@ -968,15 +1117,16 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
             ], step=STEP_TRADINGAGENTS)
             llm_status = "reused"
             notes.append(
-                "ℹ️ skip_llm=True：复用既有决策件（--render-only 重渲 md，零 API 成本）"
+                "ℹ️ skip_llm=True：复用**既有决策件**"
+                + (f"（{reused_from} ⇒ 复制进本快照）" if reused_from else "")
+                + "（--render-only 重渲 md，零 API 成本）"
             )
         else:
             llm_status = "absent"
             notes.append(
-                "ℹ️ skip_llm=True 且**没有**既有决策件 ⇒ 本轮无 LLM 第二意见（只有规则层）"
+                "ℹ️ skip_llm=True 且**没有**可复用的决策件 ⇒ 本轮无 LLM 第二意见（只有规则层）"
             )
     else:
-        _stage_recommendation(run_path, notes)
         _run_cmd([
             DC.QL_PY, str(_RESEARCH_ROOT / "llm" / "build_ta_context.py"),
             "--run-root", str(run_path),
@@ -1003,7 +1153,7 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
         llm_status = str(payload.get("status") or "")
         if llm_status != "ok":
             raise RuntimeError(
-                f"模式 B 第 {STEP_TRADINGAGENTS} 步失败：决策 json 的 status = {llm_status!r}"
+                f"阶段 4 第 {STEP_TRADINGAGENTS} 步失败：决策 json 的 status = {llm_status!r}"
                 f"（**权威字段**；md 在失败时也会写占位件，不能只看 md）\n"
                 f"错误：{payload.get('error')}\n文件：{decision_json}"
             )
@@ -1022,33 +1172,60 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
     notes.append(f"✅ 调仓计划已产出：{plan_json}")
 
     # ---- 6. reprice_node_day.py（节点日收盘价重算股数） ----
-    _run_cmd([
-        DC.QL_PY, str(_RESEARCH_ROOT / "reprice_node_day.py"),
-        "--node-date", signal_date,
-        "--plan", str(plan_json),
-        "--prices", str(prices_path),
-        "--account", str(snapshot_path),
-        "--cash", f"{DC.CASH}",
-        "--total-assets", f"{DC.TOTAL_ASSETS}",
-        "--total-assets-basis", "plan",
-        "--out-dir", str(run_path),
-    ], step=STEP_REPRICE)
-    notes.append(f"✅ 节点日重算已产出：{node_json}")
+    # 🔴 **实盘态 fail-closed**：节点日重算失败 ⇒ 整轮崩（拿不到节点日价就不许出节点日清单）；
+    #    **观察态可降级**：只披露「本轮不给节点日股数/金额」，绝不静默降级、
+    #    也不用信号日旧价冒充节点日价。
+    node_reprice_error: str | None = None
+    try:
+        _run_cmd([
+            DC.QL_PY, str(_RESEARCH_ROOT / "reprice_node_day.py"),
+            "--node-date", signal_date,
+            "--plan", str(plan_json),
+            "--prices", str(prices_path),
+            "--account", str(snapshot_path),
+            "--cash", f"{DC.CASH}",
+            "--total-assets", f"{DC.TOTAL_ASSETS}",
+            "--total-assets-basis", "plan",
+            "--out-dir", str(run_path),
+        ], step=STEP_REPRICE)
+        notes.append(f"✅ 节点日重算已产出：{node_json}")
+    except Exception as exc:
+        if live_trade:
+            raise
+        node_reprice_error = f"{type(exc).__name__}: {exc}"
+        _head = str(exc).strip().splitlines()[0] if str(exc).strip() else node_reprice_error
+        notes.append(
+            "🔴 **节点日重算未完成（观察态降级继续）**："
+            f"{_head}"
+            " ⇒ 本轮**不给节点日股数/金额**（🔴 不用信号日旧价冒充节点日价）"
+            " ⇒ 执行卡退化为**只有方向、无数值**的观察卡（**不可下单**）。"
+        )
 
     # ---- 7. 执行卡片 ----
-    node_payload = json.loads(node_json.read_text(encoding="utf-8"))
     plan_payload = json.loads(plan_json.read_text(encoding="utf-8"))
+    node_payload: dict = {}
+    if node_reprice_error is None:
+        node_payload = json.loads(node_json.read_text(encoding="utf-8"))
+        _actions = node_payload.get("actions") or []
+        _exec_date = node_payload.get("meta", {}).get("execution_date") or execution_date
+    else:
+        _actions = plan_payload.get("actions") or []
+        _exec_date = execution_date
     card = build_execution_card(
-        actions=node_payload.get("actions") or [],
+        actions=_actions,
         account=account_state.account_summary(),
         asof=signal_date,
-        execution_date=(node_payload.get("meta", {}).get("execution_date") or execution_date),
-        node_json=node_payload,
+        execution_date=_exec_date,
+        node_json=node_payload or None,
         plan_json=plan_payload,
+        live_trade=live_trade,
+        node_reprice_ok=(node_reprice_error is None),
+        node_reprice_error=node_reprice_error or "",
     )
     notes.append(
         f"✅ 执行卡片已组装：{len(card.get('orders') or [])} 条动作"
         f"｜{PRICE_BASIS_NOTE}"
+        + ("｜🔴 **实盘卡（可下单）**" if live_trade else "｜🧪 **观察卡（挂单禁用）**")
     )
 
     # ---- 执行卡落盘（🔴 审计用：信号日决策必须留一份**可复查**的执行卡） ----
@@ -1056,24 +1233,42 @@ def run_mode_b(*, asof: object = None, run_dir: str | Path | None = None,
     notes.append(f"✅ 执行卡片已落盘：{card_path}")
 
     return {
-        "mode": "B",
+        "mode": "unified",
+        "live_trade": bool(live_trade),
         "asof": signal_date,
         "execution_date": card.get("execution_date"),
         "run_dir": str(run_path),
+        "snapshot": {
+            "root": str(snapshot.root),
+            "path": str(run_path),
+            "run_id": str(snapshot.run_id),
+        },
         "report_json": str(report_json),
         "plan_json": str(plan_json),
         "node_json": str(node_json),
         "card_json": str(card_path),
         "card": card,
+        "decision_json": str(decision_json),
+        "decision_md": str(decision_md),
+        "scores_path": str(scores_path),
+        "prices_path": str(prices_path),
         "email_kind": "rebalance_card",
         "notes": notes,
+        # 🔴 2026-11-10：把**实际生效的排序口径**透传给交付面报告
+        #    ⇒ `daily/report.py::_ranking_basis()` 才不会渲染成「—」
+        #    （口径事实源 = 分析报告里的 `score_smoothing` 段，**不复制参数**）。
+        "score_smoothing": _smoothing,
+        "holding_discipline": discipline,
         "analysis_asof": analysis_asof,
         "scores_max_date": analysis["scores_max_date"],
         "score_grid_last": analysis["grid_last"],
         "qlib_dataset_max_date": analysis["dataset_max_date"],
         "llm_decision_status": llm_status,
         "execution_lag_days": int(DC.EXECUTION_LAG_DAYS),
+        "node_reprice_ok": node_reprice_error is None,
+        "node_reprice_error": node_reprice_error or "",
         "generated_at": _now_iso(),
+        "preflight_only": False,
     }
 
 
@@ -1136,7 +1331,10 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
                          plan_json: dict | None = None, target_positions: int | None = None,
                          max_amount: float | None = None, lot_size: int | None = None,
                          cash_buffer_min: float | None = None,
-                         cash_buffer_max: float | None = None) -> dict:
+                         cash_buffer_max: float | None = None,
+                         live_trade: bool = False,
+                         node_reprice_ok: bool = True,
+                         node_reprice_error: str = "") -> dict:
     """把研究链的动作表折算成**可下单的执行卡片**（含研究链没有的硬约束）。
 
     硬约束（全部来自 ``daily_config``）：
@@ -1154,6 +1352,10 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
     actions : 动作表（``node_reprice`` 优先，其次 ``final_rebalance_plan`` 的 ``actions[]``）；
         给 ``None`` ⇒ 从 ``node_json`` / ``plan_json`` 里取。
     account : 账户（总资产 / 现金 / 持仓）；缺字段 ⇒ 该字段为 ``None`` 并在 warnings 点名。
+    node_reprice_ok :
+        **节点日重算是否成功**。``False`` ⇒ 节点日收盘价拿不到（收盘前 / 当日行情未落库）
+        ⇒ 本卡**不给节点日股数/金额**（🔴 绝不用信号日旧价冒充节点日价）
+        ⇒ 卡片退化为「**只有方向、无数值**」的观察卡 + 显式告警。
 
     返回
     ----
@@ -1434,7 +1636,7 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
                     warnings.append(text)
 
     cash_end_value = _f(cash_flow.get("cash_end"))
-    return {
+    card = {
         "asof": mode_router.normalize_date(asof),
         "execution_date": mode_router.normalize_date(execution_date),
         "execution_lag_days": int(DC.EXECUTION_LAG_DAYS),
@@ -1472,3 +1674,52 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             "slippage_rate": float(DC.SLIPPAGE_RATE),
         },
     }
+    # 🔴 **副作用开关**：``live_trade=False``（缺省）⇒ 观察卡（**挂单禁用**）
+    card["live_trade"] = bool(live_trade)
+    card["order_enabled"] = bool(live_trade)
+    if not live_trade:
+        # 🆕 **观察卡**：打上水印 + 禁用标记 ⇒ 任何下游/人工都不会误当实盘挂单
+        card["observation_only"] = True
+        card["disabled"] = True
+        card["watermark"] = snap_mod.OBSERVATION_WATERMARK
+        card["notice"] = (
+            f"{snap_mod.OBSERVATION_WATERMARK}"
+            "本卡仅用于观察当日 Alpha 与 ETF 排序演化，**不可下单**。"
+        )
+        for _o in card.get("orders") or []:
+            _o["disabled"] = True
+            _o["order_enabled"] = False
+    if not node_reprice_ok:
+        # 🔴 **节点日重算未完成 ⇒ 卡片不许带节点日股数/金额**。
+        #    节点日重算的作用是「用节点日收盘价把股数与金额重算一遍」；
+        #    拿不到节点日价时，剩下的只有**信号日口径**的数字
+        #    ⇒ 那些数字**不是节点日数字** ⇒ 留在卡上就会被误读成节点日清单。
+        #    ⇒ 处置：**数值全部抹成 None**（只留方向/目标权重），并显著告警。
+        card["node_reprice_ok"] = False
+        card["node_reprice_error"] = str(node_reprice_error or "")
+        card["execution_basis"] = "plan_only（节点日重算未完成）"
+        for _o in card.get("orders") or []:
+            _o["node_reprice"] = "未完成"
+            # 🔴 2026-11-09 补：`price` / `price_date`（**信号日**口径的参考价）一并抹成 None
+            #    —— 探针 C11 的口径是「降级卡上**没有任何数字**」⇒ 留着参考价会让读者
+            #    把「信号日价格」当成「节点日价格」⇒ 与降级的初衷（不冒充节点日）矛盾。
+            for _k in ("target_shares", "delta_shares", "target_amount",
+                       "est_amount", "est_fee", "est_slippage",
+                       "price", "price_date"):
+                _o[_k] = None
+        _pt = card.get("post_trade")
+        if isinstance(_pt, dict):
+            for _k in list(_pt.keys()):
+                _pt[_k] = None
+        _cf = card.get("cash_flow")
+        if isinstance(_cf, dict):
+            for _k in list(_cf.keys()):
+                _cf[_k] = None
+        card["warnings"] = list(card.get("warnings") or []) + [
+            "🔴 **节点日重算未完成** ⇒ 本卡**不含节点日股数/金额**"
+            "（只剩方向与目标权重；**参考价与价日也一并置空** —— "
+            "信号日价格**不是**节点日价格，留着会被误读成节点日清单）"
+            + (f"｜原因：{node_reprice_error}" if node_reprice_error else "")
+            + " ⇒ **不可下单**、**不得**当作节点日清单使用。"
+        ]
+    return card

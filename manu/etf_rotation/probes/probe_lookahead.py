@@ -29,8 +29,16 @@ M-L 把「无未来函数」从**口头承诺**变成**可复算的台账**：
     PYTHONHASHSEED=0 /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_lookahead.py
 
+    # 断言对象 = 本轮快照内那一份（**数据根目录也跟着切到快照** ⇒ 快照自包含）
+    ... probe_lookahead.py --snapshot-root <落点根>/runs/snapshots
+
+🔴 **数据根目录口径（2026-11-10）**：``stock_scores.csv`` / ``stock_prices.csv``
+从**同一个**目录读 —— 基线口径 = canonical ``RUN_ROOT``（根目录），
+快照口径 = 快照目录（**不许**回落 canonical：断言对象与数据不同源 = 假绿）。
+快照里缺这两个件 ⇒ 退出码 **2「不适用」**（≠ 通过）。
+
 【副作用】除 **MD 级真负例**外**零写入**（只读官方产物与原始 CSV）。
-MD 级真负例（§十四.68）会把报告 md 复制一份到 ``/mnt/data/siping/runs/`` 下的临时目录、
+MD 级真负例（§十四.68）会把报告 md 复制一份到 ``<落点根>/runs/`` 下的临时目录、
 **真的改坏披露**后用子进程跑一遍本探针（必须非零退出），**跑完立刻删掉临时目录**
 ⇒ 全程**不写 /tmp**。
 """
@@ -45,43 +53,67 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
 
+from pathlib import Path
 import numpy as np
 import pandas as pd
+#: 研究链根（探针目录不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ETF_ROOT = Path(__file__).resolve().parents[1]
+if str(_ETF_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ETF_ROOT))
 
-RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
-ETF_DATA = Path("/mnt/data/siping/datasets/etf")
-QLIB_DATA = Path("/mnt/data/siping/datasets/qlib/cn_data")
+import config as C  # noqa: E402  （落点常量单一事实源）
+
+
+RUN_ROOT = C.ETF_RUN_ROOT
+ETF_DATA = C.ETF_DATA_ROOT
+QLIB_DATA = Path(C.PROVIDER_URI)
+
+#: 🔴 **数据根目录**里必须**真实存在**的两个件（个股分数 / 个股日线）。
+#:    快照自包含契约（`probe_snapshot_contract.CONTRACT_ARTIFACTS` 16 件）里就有这两个
+#:    ⇒ 快照口径下**必须**从快照目录读（快照自包含），
+#:    **不许**回落根目录 canonical 再报「通过」。
+DATA_ROOT_FILES = ("stock_scores.csv", "stock_prices.csv")
 
 #: E 上界复算容差（绝对值）
 TOL_E = 1e-6
 #: 「小权重成分」的权重上限（%），必须与报告里 small_weight_cap 一致
 SMALL_WEIGHT_CAP = 5.0
-#: 决策前视项的**期望条数**（实测：恰好 1 项 —— W 成分快照）
-EXPECTED_N_LOOKAHEAD = 1
+#: 🔴 2026-11-10：决策前视项的**期望条数**不再写死（原 `EXPECTED_N_LOOKAHEAD = 1`
+#:    是 asof=2026-11-03 那轮的形态）⇒ 改成**事实源派生**
+#:    （W 快照日 > asof ⇒ 1 项，否则 0 项）⇒ 见 `expected_lookahead_count()`。
 #: 唯一允许的决策前视项（名字必须含它）
 EXPECTED_LOOKAHEAD_KEY = "etf_holdings.csv"
 #: 「口径① 最终分差最近（|final_gap| 最小 ⇒ 最容易翻）」在 MD 里的标记词
 CALIBER_CLOSEST_MARK = "最终分差最近"
 #: 🔴 **绝对不许**用来称呼某一对的措辞（把「极端档余量最大」叫成「最接近/最紧」＝旧披露 bug）
 FORBIDDEN_CLOSE_WORDS = ("最接近", "最紧")
-#: asof=2026-11-03 的**实测**金标（2026-11-05 实测；来源 lookahead.rank_flip_robustness
-#: 的 same_theme_closest_by_gap 第一名，与 reviewer 实测一致）：
-#: |final_gap| 最小的一对 = 512800 ↔ 512820，分差 +0.006126 / 现实档翻转阈值 0.254515
-#: / 现实档余量 −0.248389（**最容易翻** ⇒ 不许被写成别的对）。
+#: asof=2026-11-03 的**实测**金标（**2026-11-09 第二次重新实测**；来源
+#: ``lookahead_audit.flip_test.same_theme_closest_by_gap`` 第一名）：
+#: |final_gap| 最小的一对 = 512800 ↔ 512820，分差 +0.024434 / 现实档翻转阈值 0.177043
+#: / 现实档余量 −0.152609（**最容易翻** ⇒ 不许被写成别的对）。
+#: 🔴 2026-11-09 **金标换值**（不是断言增删）：上一版金标是 159547 ↔ 512890
+#:    （gap −0.023897 / thr 0.404878 / margin −0.428775，同日**平滑前**实测）。
+#:    换值根因 = **排序口径变了**（2026-11-09 新增「穿透分时间平滑」：
+#:    排序改用 **5 交易日 EWMA 平滑分**（α=0.35）⇒ 入选名单与名次跟着变
+#:    ⇒ 同一 asof 下「同主题最近的一对」跟着变），
+#:    **不是**报告算错了 —— 复核证据：① 5 条目按 |final_gap| 升序排列且首条即最小
+#:    （0.024434 < 0.062584 < 0.065616 < 0.262260 < 0.564080）；
+#:    ② 5 条目全部满足恒等式 `margin_realistic = final_gap − swap_threshold_realistic`；
+#:    ③ 报告 md「八之四」段落独立写着同一对与同一组数字（交叉印证，非自说自话）。
+#:    ⇒ 旧值**保留在下面注释里作证据**（不许无声改掉 ⇒ 下次漂移能对比）。
 GOLD_ASOF = "2026-11-03"
 GOLD_CLOSEST = {
     "selected": "512800",
     "challenger": "512820",
-    "final_gap": 0.006126,
-    "swap_threshold_realistic": 0.254515,
-    "margin_realistic": -0.248389,
+    "final_gap": 0.024434,
+    "swap_threshold_realistic": 0.177043,
+    "margin_realistic": -0.152609,
 }
 #: 数值比对容差（绝对值；报告里的数字都是 6 位小数的 round() 结果）
 TOL_NUM = 1e-9
-#: MD 负例用的临时目录**必须**在 /mnt/data 下（rules.md §〇之二：cache/产物不落 /tmp）
-NEG_TMP_PARENT = Path("/mnt/data/siping/runs")
+#: MD 负例用的临时目录**必须**在持久盘上（rules.md §〇之二：cache/产物不落 /tmp）
+NEG_TMP_PARENT = C.WORK_ROOT
 #: 子进程跑 MD 负例时的环境变量守卫（防递归：子进程不再做 MD 负例）
 ENV_SKIP_MD_NEG = "ETF_PROBE_LOOKAHEAD_SKIP_MD_NEG"
 
@@ -163,12 +195,18 @@ def _instrument(stock_code: str, exchange: str | None) -> str | None:
     return None
 
 
-def independent_e_bounds(asof: pd.Timestamp, codes: list[str] | None = None) -> dict:
+def independent_e_bounds(asof: pd.Timestamp, codes: list[str] | None = None,
+                         data_root: Path | None = None) -> dict:
     """独立重算 E 与「单只成分股进出」的 E 误差上界（两档）。
 
     返回 ``{code: {e_score, n_scored, delta_e_extreme, delta_e_small_weight}}``。
+
+    🔴 ``data_root``：**个股分数**（``stock_scores.csv``）所在目录。
+       缺省 = ``RUN_ROOT``（canonical ⇒ 基线行为逐字节不变）；
+       快照口径 = 快照目录（快照自包含 ⇒ 断言对象与数据同源）。
     """
     asof = pd.Timestamp(asof).normalize()
+    root = Path(data_root) if data_root is not None else RUN_ROOT
     h = pd.read_csv(ETF_DATA / "etf_holdings.csv",
                     dtype={"etf_code": str, "stock_code": str})
     h["etf_code"] = h["etf_code"].astype(str).str.zfill(6)
@@ -176,7 +214,7 @@ def independent_e_bounds(asof: pd.Timestamp, codes: list[str] | None = None) -> 
     h["instrument"] = [_instrument(c, e) for c, e in
                        zip(h["stock_code"].to_numpy(), h["stock_exchange"].to_numpy())]
 
-    sc = pd.read_csv(RUN_ROOT / "stock_scores.csv", dtype={"instrument": str})
+    sc = pd.read_csv(root / "stock_scores.csv", dtype={"instrument": str})
     sc["date"] = pd.to_datetime(sc["date"])
     sc = sc[sc["date"] == asof].copy()
     if sc.empty:
@@ -219,12 +257,20 @@ def independent_e_bounds(asof: pd.Timestamp, codes: list[str] | None = None) -> 
     return out
 
 
-def independent_ledger(asof: pd.Timestamp) -> dict:
+def independent_ledger(asof: pd.Timestamp, data_root: Path | None = None) -> dict:
     """独立重算「决策前视」项：逐个带日期输入按**各自实际消费规则**取有效日期。
 
     🔴 这是「独立于 lookahead.py」的第二份实现 ⇒ 两边一致 ⇒ 台账可信。
+
+    🔴 ``data_root``：**个股分数 / 个股日线**所在目录。
+       缺省 = ``RUN_ROOT``（canonical ⇒ 基线行为逐字节不变）；
+       快照口径 = 快照目录（快照自包含 ⇒ 断言对象与数据同源）。
+       🔴 注意：``etf_holdings.csv`` / ``etf_prices.csv`` / ``etf_universe.csv``
+          / ``trade_calendar.csv`` 属于**数据集**（``ETF_DATA``），
+          **不在**快照契约 16 件里 ⇒ 仍读 canonical 数据集目录（口径不变）。
     """
     asof = pd.Timestamp(asof).normalize()
+    root = Path(data_root) if data_root is not None else RUN_ROOT
     asof_str = asof.strftime("%Y-%m-%d")
     items: list[dict] = []
     non_decision: list[dict] = []
@@ -246,8 +292,8 @@ def independent_ledger(asof: pd.Timestamp) -> dict:
         items.append({"name": "etf_prices.csv", "effective_date": peff})
 
     # (3) 个股分数 / 个股日线：直接按 asof 消费
-    for name, path in (("stock_scores.csv", RUN_ROOT / "stock_scores.csv"),
-                       ("stock_prices.csv", RUN_ROOT / "stock_prices.csv")):
+    for name, path in (("stock_scores.csv", root / "stock_scores.csv"),
+                       ("stock_prices.csv", root / "stock_prices.csv")):
         if not path.exists():
             continue
         d = pd.read_csv(path, usecols=["date"], dtype=str)
@@ -285,6 +331,20 @@ def independent_ledger(asof: pd.Timestamp) -> dict:
 # 断言
 # --------------------------------------------------------------------------- #
 
+def expected_lookahead_count(indep: dict, asof: str) -> int:
+    """**事实源派生**的期望决策前视条数：W 快照日 > asof ⇒ 1 项，否则 0 项。
+
+    🔴 2026-11-10（实测红灯）：旧实现把期望值**写死**成 1（`EXPECTED_N_LOOKAHEAD`），
+       那是 **asof=2026-11-03** 那轮的形态（W 快照 2026-11-04 > asof ⇒ 1 项）。
+       本轮 asof=2026-11-09、W 成分快照只有 **2026-11-04**（早于 asof 5 天）
+       ⇒ 决策前视**合法地变成 0 项**（报告 `n_look_ahead=0` / `blocking=[]`，
+       探针自己的独立重算也是 0 ⇒ L9 PASS）⇒ 事实源没坏，是断言写死了旧形态。
+    ⇒ 期望值改成**从事实源派生**（不许放宽成永真）：W 快照日 > asof ⇒ 1，否则 0。
+    """
+    w_eff = str(indep.get("w_snapshot_date") or "")
+    return 1 if (w_eff and w_eff > str(asof or "")) else 0
+
+
 def evaluate(report: dict, md_text: str, indep: dict) -> list[tuple[str, bool, str]]:
     """对给定报告跑**全部**断言，返回 [(名称, 是否通过, 详情), ...]。
 
@@ -314,24 +374,38 @@ def evaluate(report: dict, md_text: str, indep: dict) -> list[tuple[str, bool, s
         "八之四、前视审计" in md_text,
         "命中" if "八之四、前视审计" in md_text else "未命中")
 
-    # ---- L3 台账条数：决策前视**恰 1 项** ----
+    # ---- L3 台账条数：必须等于**事实源派生**的期望值 ----
     n_la = inputs.get("n_look_ahead")
-    add("L3 输入日期台账：决策前视**恰 1 项**（多一项 ⇒ 链路有未披露的前视）",
-        n_la == EXPECTED_N_LOOKAHEAD,
-        f"报告 n_look_ahead={n_la}｜期望={EXPECTED_N_LOOKAHEAD}｜"
+    _w_eff = str(indep.get("w_snapshot_date") or "")
+    _asof = str(inputs.get("asof") or "")
+    _expect = expected_lookahead_count(indep, _asof)
+    add("L3 输入日期台账：决策前视条数必须等于**事实源派生**的期望值"
+        "（W 快照日 > asof ⇒ 1 项，否则 0 项；多一项 ⇒ 链路有未披露的前视）",
+        n_la == _expect,
+        f"报告 n_look_ahead={n_la}｜期望={_expect}｜"
+        f"W 快照日={_w_eff or '无'} vs asof={_asof}｜"
         f"独立重算={indep.get('n_decision_lookahead')}")
 
-    # ---- L4 唯一的前视项必须是 W 成分快照，且真的晚于 asof ----
+    # ---- L4 决策前视项：期望 1 项时必须是**唯一的** W 成分快照；期望 0 项时 blocking 必须为空 ----
     blocking = inputs.get("blocking") or []
-    ok4 = (
-        len(blocking) == 1
-        and EXPECTED_LOOKAHEAD_KEY in str(blocking[0].get("name", ""))
-        and str(blocking[0].get("effective_date", "")) > str(inputs.get("asof", ""))
-    )
-    add("L4 唯一的决策前视项**必须**是 W 成分快照（etf_holdings.csv）且有效日 > asof",
-        ok4,
-        f"blocking={[(b.get('name'), b.get('effective_date')) for b in blocking]}｜"
-        f"asof={inputs.get('asof')}")
+    if _expect == 1:
+        ok4 = (
+            len(blocking) == 1
+            and EXPECTED_LOOKAHEAD_KEY in str(blocking[0].get("name", ""))
+            and str(blocking[0].get("effective_date", "")) > str(inputs.get("asof", ""))
+        )
+        detail4 = (f"期望 1 项｜blocking={[(b.get('name'), b.get('effective_date')) for b in blocking]}"
+                   f"｜asof={inputs.get('asof')}")
+    else:
+        #: 期望 0 项时：**多报一项同样是误披露** ⇒ `blocking` 必须**恰好为空**
+        #: （不许写成「随便」/「不为空也行」）。
+        ok4 = (len(blocking) == 0)
+        detail4 = (f"期望 0 项（W 快照日={_w_eff or '无'} ≤ asof={inputs.get('asof')}）"
+                   f"｜blocking={[(b.get('name'), b.get('effective_date')) for b in blocking]}"
+                   f"（必须为空）")
+    add("L4 决策前视项：期望 1 项时必须是**唯一的** W 成分快照（etf_holdings.csv）"
+        "且有效日 > asof；期望 0 项时 blocking 必须为空",
+        ok4, detail4)
 
     # ---- L5 台账里**没有第二条**被标成前视 ----
     n_flag = sum(1 for e in entries if e.get("look_ahead") is True)
@@ -368,18 +442,27 @@ def evaluate(report: dict, md_text: str, indep: dict) -> list[tuple[str, bool, s
         f"n_need_fallback_pass_liq={fb.get('n_need_fallback_pass_liq')}｜"
         f"inert={fb.get('inert')}")
 
-    # ---- L8 W 快照：晚于 asof、只有 1 个快照日、**不可修**、不可观测理由非空 ----
+    # ---- L8 W 快照：只有 1 个快照日、**不可修**、不可观测理由非空 ----
+    # 🔴 2026-11-10（实测红灯）：旧实现把「`snapshot_date > asof`」也写进了合取
+    #    ⇒ 本轮（W 快照 2026-11-04 **早于** asof 2026-11-09）合法地**不成立**
+    #    ⇒ L8 假红。事实源没坏：W 快照只有 1 个快照日、不可修、给了不可观测理由
+    #    —— 这些**才是**「结构性不可修」的判据。
+    # ⇒ 修法：**删掉**「snapshot_date > asof」这一条合取，
+    #   其余（`n_snapshot_dates == 1`、`fixable is False`、`unobservable_reason` 非空）
+    #   **全部保留**；detail 里显式打出「是否晚于 asof」，避免再误判。
+    _wsnap_date = str(wsnap.get("snapshot_date") or "")
+    _wsnap_late = bool(_wsnap_date) and _wsnap_date > str(inputs.get("asof", ""))
     ok8 = (
         wsnap.get("snapshot_date") is not None
-        and str(wsnap.get("snapshot_date")) > str(inputs.get("asof", ""))
         and wsnap.get("n_snapshot_dates") == 1
         and wsnap.get("fixable") is False
         and bool(str(wsnap.get("unobservable_reason") or "").strip())
     )
-    add("L8 W 快照前视必须被标成**结构性不可修**（快照日 > asof、只有 1 个快照日、给了不可观测理由）",
+    add("L8 W 快照必须被标成**结构性不可修**（只有 1 个快照日、不可修、给了不可观测理由）",
         ok8,
         f"snapshot_date={wsnap.get('snapshot_date')}｜asof={inputs.get('asof')}｜"
-        f"gap_days={wsnap.get('gap_days')}｜n_snapshot_dates={wsnap.get('n_snapshot_dates')}｜"
+        f"晚于 asof={_wsnap_late}｜gap_days={wsnap.get('gap_days')}｜"
+        f"n_snapshot_dates={wsnap.get('n_snapshot_dates')}｜"
         f"fixable={wsnap.get('fixable')}")
 
     # ---- L9 独立重算：台账条数与身份一致 ----
@@ -500,8 +583,17 @@ def evaluate(report: dict, md_text: str, indep: dict) -> list[tuple[str, bool, s
         vals = [float(v) for v in mrs if v is not None]
         if vals != sorted(vals, reverse=True):
             l17_problems.append(f"tightest_realistic 未按 margin_realistic 降序：{vals}")
-        if mrs and mrs[-1] is not None and any(v is None for v in mrs[:-1]):
-            l17_problems.append("tightest_realistic 的 None 没排在最后")
+        # 🔴 2026-11-10：旧写法 `mrs[-1] is not None and any(v is None for v in mrs[:-1])`
+        #    **只在末位非 None 时才判** ⇒ 全表皆 None 时反而**不报** ⇒ 漏检。
+        #    ⇒ 改成「**任何 None 都不许出现在非 None 行之前**」（全表皆 None 也不算违规：
+        #    没有非 None 行 ⇒ 没有「None 排在非 None 之前」的情形）。
+        _seen_none = False
+        for _v in mrs:
+            if _v is None:
+                _seen_none = True
+            elif _seen_none:
+                l17_problems.append("tightest_realistic 的 None 没排在最后")
+                break
     if ext_tbl:
         mes = [float(r.get("margin_extreme")) for r in ext_tbl if r.get("margin_extreme") is not None]
         if mes != sorted(mes, reverse=True):
@@ -673,21 +765,93 @@ def corrupt_md(md_text: str, closest: dict, ext: dict) -> str:
 # 主流程
 # --------------------------------------------------------------------------- #
 
+def _find_snapshot(root: Path) -> Path | None:
+    """根目录下**最新**一个「有 manifest **且**有报告」的快照目录（没有 ⇒ None）。
+
+    🔴 与 `probe_snapshot_lookahead.find_snapshot` **同口径**：
+    必须同时要 manifest 与报告 —— 只看 manifest 会把「最新的一次 dry-run」
+    当成断言对象（dry-run 快照有 manifest、无报告）⇒ 明明有真快照却判「不适用」。
+    """
+    if not root.is_dir():
+        return None
+    candidates = [
+        p for p in sorted(root.iterdir())
+        if p.is_dir()
+        and (p / "snapshot_manifest.json").is_file()
+        and (p / "etf_analysis_report.json").is_file()
+    ]
+    return candidates[-1] if candidates else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="前视审计闸门（只读）")
     ap.add_argument("--report", default=str(RUN_ROOT / "etf_analysis_report.json"))
     ap.add_argument("--md", default=str(RUN_ROOT / "etf_analysis_report.md"))
+    # 🔴 2026-11-09（正本 §三第 2 条 / 独立审计 P1-8）：断言对象必须能指向
+    #    **本轮快照内的那一份报告**（快照制的意义就在这儿）。
+    #    ⇒ 给了 `--snapshot-root` / `--snapshot` ⇒ 优先断言快照内那一份；
+    #      找不到真快照 ⇒ **退出码 2「不适用」**（≠ 通过），
+    #      **不许**悄悄回落成根目录那份还报「通过」。
+    #    ⇒ 不给这两个参数 ⇒ 仍断言根目录那份（**基线一致性护栏**，保留不动）。
+    ap.add_argument("--snapshot-root", default="",
+                    help="快照根目录（给了就优先断言快照内那一份；无真快照 ⇒ rc2 不适用）")
+    ap.add_argument("--snapshot", default="", help="直接指定快照目录")
+    # 🔴 2026-11-10：**数据根目录**（个股分数 / 个股日线）显式化。
+    #    缺省 = canonical ``RUN_ROOT``（基线路径逐字节不变）；
+    #    快照口径下由本探针**自动**切到快照目录（快照自包含），
+    #    本参数只给「子进程复跑同口径」用（例如 N10 MD 级真负例）。
+    ap.add_argument("--data-root", default="",
+                    help="个股分数/个股日线所在目录（缺省 = canonical RUN_ROOT）")
     args = ap.parse_args()
 
-    report = json.loads(Path(args.report).read_text(encoding="utf-8"))
-    md_text = Path(args.md).read_text(encoding="utf-8")
+    report_path = Path(args.report)
+    md_path = Path(args.md)
+    #: **数据根目录**（个股分数 / 个股日线）：缺省 canonical；快照口径 ⇒ 快照目录
+    data_root = RUN_ROOT
+    if args.snapshot or args.snapshot_root:
+        snap = (Path(args.snapshot) if args.snapshot
+                else _find_snapshot(Path(args.snapshot_root)))
+        if snap is None or not snap.is_dir():
+            print(f"[不适用] 找不到真实快照（root={args.snapshot_root}）"
+                  "⇒ **本阶段不适用**（≠ 通过）")
+            return 2
+        cand_json = snap / "etf_analysis_report.json"
+        cand_md = snap / "etf_analysis_report.md"
+        if not (cand_json.is_file() and cand_md.is_file()):
+            print(f"[不适用] 快照 {snap} 里没有报告（json/md 缺一）"
+                  "⇒ **本阶段不适用**（≠ 通过）")
+            return 2
+        report_path, md_path = cand_json, cand_md
+        print(f"[快照口径] 断言对象 = 本轮快照内那一份：{snap}")
+        # 🔴 2026-11-10：数据根目录**跟着断言对象一起切到快照**（快照自包含）。
+        #    🔴 缺件 ⇒ 判「不适用」（rc2，≠ 通过），
+        #       **不许**回落 canonical 再报「通过」（回落 = 断言对象与数据不同源 = 假绿）。
+        missing = [n for n in DATA_ROOT_FILES if not (snap / n).is_file()]
+        if missing:
+            print(f"[不适用] 快照 {snap} 里缺 {'、'.join(missing)}"
+                  " ⇒ **本阶段不适用**（≠ 通过）；"
+                  "**不许**回落根目录 canonical 再报「通过」")
+            return 2
+        data_root = snap
+        print(f"[快照口径] 数据根目录 = 同一快照（个股分数/个股日线自包含）：{data_root}")
+    elif args.data_root:
+        # 🔴 显式数据根目录（**只在不给快照参数时**生效 ⇒ 快照优先级更高）
+        data_root = Path(args.data_root)
+        missing = [n for n in DATA_ROOT_FILES if not (data_root / n).is_file()]
+        if missing:
+            print(f"[不适用] 数据根目录 {data_root} 里缺 {'、'.join(missing)}"
+                  " ⇒ **本阶段不适用**（≠ 通过）")
+            return 2
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    md_text = md_path.read_text(encoding="utf-8")
 
     asof = pd.Timestamp((report.get("meta") or {}).get("asof") or
                         ((report.get("lookahead_audit") or {}).get("inputs") or {}).get("asof"))
-    indep = independent_ledger(asof)
+    indep = independent_ledger(asof, data_root=data_root)
     la = report.get("lookahead_audit") or {}
     codes = [str(r.get("code")) for r in ((la.get("e_bound") or {}).get("per_etf") or [])]
-    indep["e_bounds"] = independent_e_bounds(asof, codes)
+    indep["e_bounds"] = independent_e_bounds(asof, codes, data_root=data_root)
 
     results = evaluate(report, md_text, indep)
     n_fail = sum(1 for _, ok, _ in results if not ok)
@@ -731,9 +895,18 @@ def main() -> int:
             raise AssertionError("报告里没有三口径表（负例无法生效）")
         tbl[0] = copy.deepcopy(ext)
 
+    #: 🔴 2026-11-10：L3 的期望值改成**事实源派生**（W 快照日 > asof ⇒ 1，否则 0）
+    #:    ⇒ 负例 N1 **不能**再写死「改成 0」（快照口径下期望本来就是 0 ⇒ 改了等于没改
+    #:    ⇒ 负例空转）。⇒ 负例改成「改成 **≠ 期望值** 的另一个值」
+    #:    ⇒ 基线口径（期望 1 ⇒ 改成 2）与快照口径（期望 0 ⇒ 改成 1）**都必然改坏**。
+    _rep_inputs = ((report.get("lookahead_audit") or {}).get("inputs") or {})
+    _expect_base = expected_lookahead_count(indep, str(_rep_inputs.get("asof") or ""))
+    _n_la_bad = _expect_base + 1
+
     negs = [
-        ("N1 台账把决策前视改成 0 项 ⇒ L3/L5 必须 FAIL",
-         lambda d: _set_path(d, ["lookahead_audit", "inputs", "n_look_ahead"], 0), "L3"),
+        (f"N1 台账把决策前视条数改成 {_n_la_bad}（≠ 事实源派生的期望 {_expect_base}）"
+         f" ⇒ L3/L5 必须 FAIL",
+         lambda d: _set_path(d, ["lookahead_audit", "inputs", "n_look_ahead"], _n_la_bad), "L3"),
         ("N2 台账把前视项换成 etf_prices.csv ⇒ L4 必须 FAIL",
          lambda d: _set_path(d, ["lookahead_audit", "inputs", "blocking"],
                              [{"name": "etf_prices.csv", "effective_date": "2026-11-04"}]), "L4"),
@@ -774,7 +947,7 @@ def main() -> int:
     n_negs = len(negs)
     n_negs_ok = len(negs) - neg_fail
 
-    # ---- N10 真负例（**MD 级**）：复制 md 到 /mnt/data 临时目录 + 真的改坏 ⇒ 探针必须非零退出 ----
+    # ---- N10 真负例（**MD 级**）：复制 md 到持久盘临时目录 + 真的改坏 ⇒ 探针必须非零退出 ----
     # 🔴 §十四.68：负例必须**真的改到被断言的对象**上 ⇒ 这里改的是 **MD 正文**（披露本体），
     #    不是改一个旁路副本；改完**用子进程真跑一遍本探针**，必须非零退出。
     md_neg_pass = True
@@ -804,9 +977,15 @@ def main() -> int:
                 # (b) 子进程：真跑一遍本探针 ⇒ 必须非零退出
                 env = dict(os.environ)
                 env[ENV_SKIP_MD_NEG] = "1"
+                # 🔴 子进程必须与本进程**同源**：断言对象 = 本次的 report_path
+                #    （快照口径下 = 快照内那一份，**不是** canonical），
+                #    数据根目录 = 同一个 data_root。
+                cmd = [sys.executable, str(Path(__file__).resolve()),
+                       "--report", str(report_path), "--md", str(bad_md)]
+                if Path(data_root) != RUN_ROOT:
+                    cmd += ["--data-root", str(data_root)]
                 proc = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve()),
-                     "--report", str(args.report), "--md", str(bad_md)],
+                    cmd,
                     capture_output=True, text=True, env=env,
                 )
                 sub_ok = proc.returncode != 0

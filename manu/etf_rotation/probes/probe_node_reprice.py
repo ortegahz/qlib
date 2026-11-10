@@ -21,7 +21,7 @@ M-S3 交付件 `reprice_node_day.py` 是「12-01 那天按当日收盘价重算�
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \\
         manu/etf_rotation/probes/probe_node_reprice.py \\
-        [--run-root /mnt/data/siping/runs/etf_rotation]
+        [--run-root <落点根>/runs]
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ if str(ROOT) not in sys.path:
 
 import config as C  # noqa: E402
 
-#: 临时目录（跑完即删；写在 /mnt/data，不写 /tmp）
-TMP_DIR = Path("/mnt/data/siping/runs/_probe_node_reprice_tmp")
+#: 临时目录（跑完即删；写在持久盘，不写 /tmp）
+TMP_DIR = C.WORK_ROOT / "_probe_node_reprice_tmp"
 
 
 class Checker:
@@ -78,6 +78,49 @@ def _snapshot(root: Path) -> dict[str, str]:
     return out
 
 
+#: 整手口径（LOT）的**唯一真源** = `final_rebalance_plan.LOT`（工具也从那儿 import）。
+#: 🔴 2026-11-09 修：旧代码写 `getattr(C, "LOT_SIZE", 100)` ⇒ `config.py` **根本没有** LOT_SIZE
+#:    ⇒ 恒为 fallback 100 ⇒ 上游一旦改 LOT，探针与工具口径**静默分叉**。
+_LOT_CACHE: int | None = None
+
+
+def _resolve_lot() -> int:
+    """取整手份数：config.LOT_SIZE → final_rebalance_plan.LOT → 100。
+
+    🔴 2026-11-09 修（critic 复核轮）：旧签名带一个**死参数** `ns_map`（**没有任何调用点传值**）
+    ⇒ 「工具命名空间里的 LOT 优先」这条分支永远走不到 ⇒ 白留一个会误导人的入口。
+    ⇒ 修法：删掉死参数与对应分支；整手真源仍是 `final_rebalance_plan.LOT`。
+    """
+    global _LOT_CACHE
+    if _LOT_CACHE is not None:
+        return _LOT_CACHE
+    _cfg = getattr(C, "LOT_SIZE", None)
+    if _cfg:
+        _LOT_CACHE = int(_cfg)
+        return _LOT_CACHE
+    try:
+        from final_rebalance_plan import LOT as _plan_lot  # noqa: PLC0415
+
+        _LOT_CACHE = int(_plan_lot)
+    except Exception:  # noqa: BLE001
+        _LOT_CACHE = 100
+    return _LOT_CACHE
+
+
+def _is_unbuildable_slot(a: dict, lot: int) -> bool:
+    """「一手买不起」的**唯一判定口径**（与被测工具 `reprice_node_day.py` 同口径）。
+
+    口径：目标金额 > 0 ＋ 当前 0 股 ＋ 价格 > 0 ＋ 目标金额 < 一手金额。
+    （工具侧还要求 `delta_shares == 0`，但那是上述条件的推论 ⇒ 不重复写。）
+    """
+    amt = float(a.get("target_amount") or 0.0)
+    price = float(a.get("price") or 0.0)
+    cur = int(a.get("current_shares") or 0)
+    if amt <= 0 or price <= 0 or cur != 0:
+        return False
+    return amt < price * lot
+
+
 def _unbuildable_violations(payload: dict) -> list[str]:
     """不可建仓不变量（M-S4 审计补测）。
 
@@ -88,15 +131,10 @@ def _unbuildable_violations(payload: dict) -> list[str]:
     这是 2026-11-04「看着像满仓、实际 40%」事故的回归网：
     没有它，删掉「权重归现金」三行后探针仍全绿。
     """
-    lot = int(getattr(C, "LOT_SIZE", 100) or 100)
+    lot = _resolve_lot()
     bad: list[str] = []
     for a in payload.get("actions") or []:
-        amt = float(a.get("target_amount") or 0.0)
-        price = float(a.get("price") or 0.0)
-        cur = int(a.get("current_shares") or 0)
-        if amt <= 0 or price <= 0 or cur != 0:
-            continue
-        if amt >= price * lot:
+        if not _is_unbuildable_slot(a, lot):
             continue
         prob: list[str] = []
         if a.get("action") != "不可建仓":
@@ -195,6 +233,83 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
     if node_date is None:
         checker.add("P1", "重算工具正例跑通（节点日 = 行情最新日）", False, "读不到行情最新日")
         return checker.items
+
+    # ============================================================ 合成夹具工装
+    # 🔴 2026-11-09（Mode C v2 独立审计）修：**P10 原本是「空过」**——
+    #    它直接拿生产计划当夹具，而本轮生产计划里**一个不可建仓席位都没有**
+    #    （P10 明文输出「0 个不可建仓席位全部合规」）⇒ 断言覆盖 = 0 ⇒ 闸门名存实亡。
+    #    ⇒ 这里造**合成夹具**：挑一个「0 股 + 正目标权重」的席位，把目标权重压到
+    #      「一手买不起」⇒ **保证**存在不可建仓席位 ⇒ P10 / D4 都能在确定的
+    #      不可建仓席位上验证守卫（**断言条数不变**，只加强判定与披露）。
+    def _make_unbuildable_fixture(plan_obj: dict) -> tuple[dict, str | None]:
+        """造出「不可建仓席位」⇒ (改写后的计划件, 夹具代码)。
+
+        ⚠️ **会就地改写 plan_obj**（改的是 `target_weight`）。
+
+        优先用计划里现成的「0 股 + 正目标权重」席位，把目标权重压到 1e-5
+        ⇒ 目标金额 = 1e-5 × total_assets，只要 total_assets < price×LOT×1e5 就必然买不起；
+        计划里**没有**这种席位时（例如纯减仓轮）**追加一个合成席位**（价格 1.0）
+        ⇒ 夹具**不依赖生产计划恰好有新建仓** ⇒ 不会在无新建仓的轮次变成假警报。
+        """
+        _acts = plan_obj.setdefault("actions", [])
+        for _a in _acts:
+            if int(_a.get("current_shares") or 0) != 0:
+                continue
+            if float(_a.get("target_weight") or 0.0) <= 0:
+                continue
+            _a["target_weight"] = 0.00001
+            return plan_obj, str(_a.get("code") or "")
+        _acts.append({
+            "code": "999998",
+            "name": "SYNTH_UNBUILDABLE",
+            "action": "买入",
+            "target_weight": 0.00001,
+            "current_shares": 0,
+            "target_shares": 0,
+            "price": 1.0,
+            "price_date": node_date,
+            "final_score": 1.0,
+            "reason": "probe 合成夹具：不可建仓席位",
+        })
+        return plan_obj, "999998"
+
+    def _count_unbuildable(payload: dict) -> int:
+        """不可建仓席位计数（与 `_unbuildable_violations` **同一判定口径**）。"""
+        _lot = _resolve_lot()
+        return sum(1 for _a in payload.get("actions") or [] if _is_unbuildable_slot(_a, _lot))
+
+    def _exec_tool(src_text: str, mod_name: str) -> dict:
+        """把工具源码在内存里 exec 成一个命名空间（不落盘、不改任何文件）。"""
+        _ns: dict = {"__name__": mod_name, "__file__": str(tool)}
+        exec(compile(src_text, str(tool), "exec"), _ns)  # noqa: S102
+        return _ns
+
+    def _run_fixture(ns_map: dict) -> tuple[dict, str | None, list[str]]:
+        """用给定源码命名空间跑一次合成夹具 ⇒ (结果, 夹具代码, 违例)。"""
+        _p = ns_map["_load_plan"](plan_path)
+        _p, _code = _make_unbuildable_fixture(_p)
+        _prices = ns_map["load_prices"](str(prices_path), node_date)
+        _meta = _p.get("meta") or {}
+        _shares = {
+            str(a.get("code") or "").zfill(6): int(a.get("current_shares") or 0)
+            for a in (_p.get("actions") or [])
+        }
+        _res = ns_map["_recompute"](
+            _p, _prices, node_date,
+            float(_meta.get("total_assets") or 0.0),
+            float(_meta.get("cash") or 0.0),
+            _shares, ns_map["_fee_rate"](_p),
+        )
+        return _res, _code, _unbuildable_violations(_res)
+
+    #: 原版源码命名空间（P10 与 D4 共用；exec 失败 ⇒ P10 明确判红，不静默跳过）
+    orig_ns: dict | None = None
+    orig_ns_err = ""
+    try:
+        orig_ns = _exec_tool(src, "_orig")
+    except Exception as exc:  # noqa: BLE001
+        orig_ns_err = f"原版源码 exec 异常：{exc!r}"
+
     if TMP_DIR.exists():
         shutil.rmtree(TMP_DIR, ignore_errors=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -301,18 +416,39 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
 
     # ---- P10：不可建仓席位必须「权重归现金」（M-S4 审计补测）----
     bad_unbuild = _unbuildable_violations(payload)
-    n_unbuild = sum(
-        1 for a in (payload.get("actions") or [])
-        if float(a.get("target_amount") or 0.0) > 0
-        and int(a.get("current_shares") or 0) == 0
-        and float(a.get("price") or 0.0) > 0
-        and float(a.get("target_amount") or 0.0)
-        < float(a.get("price") or 0.0) * int(getattr(C, "LOT_SIZE", 100) or 100)
+    n_unbuild = _count_unbuildable(payload)
+    # 🔴 2026-11-09 加固：生产侧「0 个不可建仓席位」⇒ P10 覆盖为 0 ⇒ **空过**。
+    #    ⇒ 判定改成两段同时成立：① 生产计划零违例 ② **合成夹具**在原版源码下零违例
+    #      （夹具保证真的存在一个不可建仓席位 ⇒ 这条断言**有牙**）。
+    fixture_ok = False
+    fixture_detail = orig_ns_err or "合成夹具未执行"
+    if orig_ns is not None:
+        try:
+            f_res, f_code, f_bad = _run_fixture(orig_ns)
+            f_n = _count_unbuildable(f_res)
+            if f_code is None or f_n < 1:
+                # 🔴 夹具**没造出来** ≠ 守卫失效 ⇒ 文案必须分开（否则值班人会去查被测代码）
+                fixture_ok = False
+                fixture_detail = (
+                    f"夹具**未构造成功**（代码={f_code}，不可建仓席位 {f_n} 个）"
+                    "⇒ 覆盖=0，**这不是守卫结论**（计划里既无「0 股 + 正目标权重」席位，"
+                    "合成席位也未生效）"
+                )
+            else:
+                fixture_ok = bool(not f_bad)
+                fixture_detail = (
+                    f"合成夹具 {f_code}：不可建仓席位 {f_n} 个｜原版源码违例 {len(f_bad)} 条（期望 0）"
+                )
+        except Exception as exc:  # noqa: BLE001
+            fixture_ok = False
+            fixture_detail = f"合成夹具执行异常：{exc!r}"
+    prod_detail = (
+        f"生产计划 {n_unbuild} 个不可建仓席位，违例 {len(bad_unbuild)}：{bad_unbuild}"
+        if bad_unbuild else f"生产计划 {n_unbuild} 个不可建仓席位，违例 0 条"
     )
     checker.add("P10", "不可建仓席位：0 股 + 一手买不起 => 必须判不可建仓且权重归现金",
-                not bad_unbuild,
-                f"本轮 {n_unbuild} 个不可建仓席位，违例 {len(bad_unbuild)}：{bad_unbuild}"
-                if bad_unbuild else f"{n_unbuild} 个不可建仓席位全部合规")
+                (not bad_unbuild) and fixture_ok,
+                f"{prod_detail}｜{fixture_detail}")
 
     # ---- P11：权重恒等式（计划权益 / 计划现金 / 落地权益）----
     bad_weight = _weight_identity_violation(payload)
@@ -388,6 +524,15 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
     #    M-S4 审计订正：原来的 16 项断言对「不可建仓 / 权重归现金」**零覆盖**
     #    （实测：删掉那三行，探针仍 16/16 PASS）。
     #    => 这里做**变异测试**：在内存里改坏源码再跑一遍，断言新检查会抓住它。
+    # 🔴 2026-11-09 修（Mode C v2 独立审计后补）：旧实现**直接拿生产计划当夹具** ⇒
+    #    本轮生产计划里**一个不可建仓席位都没有**（P10 实测「0 个不可建仓席位全部合规」）
+    #    ⇒ 变异删掉的那两行**从未被触发** ⇒ 变异等价于**空操作**
+    #    ⇒ P10 自然抓不到违例 ⇒ 负例**无牙**（探针把「守卫生效」误报成 FAIL）。
+    #    ⇒ 修法（**加强**，断言条数不变）：
+    #      ① **合成夹具**：从生产计划里挑一个「0 股 + 正目标权重」的席位，
+    #         把目标权重压到「一手买不起」⇒ **保证**存在不可建仓席位；
+    #      ② **成对对照**：原版源码跑同一夹具必须**零违例**、变异版必须**有违例**
+    #         （一正一反 ⇒ 比原来单向变异更强，且**不再依赖生产计划恰好有**不可建仓席位）。
     mut_lines = [
         '            a["target_weight_effective"] = 0.0\n',
         '            a["weight_to_cash"] = a["target_weight"]\n',
@@ -401,32 +546,43 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
     if not mut_applied:
         d4_detail = "变异没生效：源码里找不到待删的两行（=> 探针该跟着升级）"
     else:
+        # ---- 对照组：原版源码 + 同一夹具 ⇒ 必须零违例（夹具本身合规）----
         try:
-            ns: dict = {"__name__": "_mutant", "__file__": str(tool)}
-            exec(compile(mut_src, str(tool), "exec"), ns)  # noqa: S102
-            m_plan = ns["_load_plan"](plan_path)
-            m_prices = ns["load_prices"](str(prices_path), node_date)
-            m_meta = m_plan.get("meta") or {}
-            m_shares = {
-                str(a.get("code") or "").zfill(6): int(a.get("current_shares") or 0)
-                for a in (m_plan.get("actions") or [])
-            }
-            m_res = ns["_recompute"](
-                m_plan, m_prices, node_date,
-                float(m_meta.get("total_assets") or 0.0),
-                float(m_meta.get("cash") or 0.0),
-                m_shares, ns["_fee_rate"](m_plan),
-            )
-            m_bad = _unbuildable_violations(m_res)
-            m_planned = (m_res.get("landing") or {}).get("planned_equity_weight")
-            ok_d4 = bool(m_bad)
-            d4_detail = (
-                f"变异后 planned_equity_weight={m_planned}｜"
-                f"P10 抓到 {len(m_bad)} 条违例：{m_bad[:3]}"
-            )
+            ns0 = orig_ns if orig_ns is not None else _exec_tool(src, "_orig")
+            o_res, o_code, o_bad = _run_fixture(ns0)
+            o_n = _count_unbuildable(o_res)
         except Exception as exc:  # noqa: BLE001
             ok_d4 = False
-            d4_detail = f"变异体执行异常：{exc!r}"
+            d4_detail = f"对照组（原版源码）执行异常：{exc!r}"
+            ns0 = None
+        if ns0 is not None:
+            if o_code is None or o_n < 1:
+                # 🔴 夹具没造出来 ⇒ **不是**守卫结论（文案必须与「守卫失效」分开）
+                ok_d4 = False
+                d4_detail = (
+                    f"夹具**未构造成功**（代码={o_code}，原版不可建仓席位 {o_n} 个）"
+                    "⇒ 覆盖=0，**这不是守卫结论**"
+                )
+            else:
+                try:
+                    # ---- 变异组：删掉「权重归现金」两行 ⇒ 必须有违例 ----
+                    ns = _exec_tool(mut_src, "_mutant")
+                    m_res, m_code, m_bad = _run_fixture(ns)
+                    m_n = _count_unbuildable(m_res)
+                    m_planned = (m_res.get("landing") or {}).get("planned_equity_weight")
+                    ok_d4 = bool(
+                        o_n >= 1 and not o_bad      # 夹具确实造出了不可建仓席位，且原版合规
+                        and m_n >= 1 and m_bad      # 变异版同样有该席位，且 P10 抓到违例
+                    )
+                    d4_detail = (
+                        f"夹具代码 {o_code}（不可建仓席位：原版 {o_n} 个 / 变异版 {m_n} 个）｜"
+                        f"原版违例 {len(o_bad)} 条（期望 0）｜"
+                        f"变异后 planned_equity_weight={m_planned}｜"
+                        f"P10 抓到 {len(m_bad)} 条违例（期望 ≥1）：{m_bad[:3]}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    ok_d4 = False
+                    d4_detail = f"变异组（变异源码）执行异常：{exc!r}"
     checker.add("D4", "真负例（变异）：删掉「权重归现金」=> P10 必须报错（闸门不许是摆设）",
                 ok_d4, d4_detail)
 
@@ -436,7 +592,7 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
 def main() -> int:
     """跑探针；退出码 0 = 全部断言通过，1 = 有断言失败。"""
     ap = argparse.ArgumentParser(description="节点日股数重算工具 · 回归探针")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     args = ap.parse_args()
 
     items = run_checks(Path(args.run_root))

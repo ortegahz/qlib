@@ -26,6 +26,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config as C  # noqa: E402
+import score_smoothing as SS  # noqa: E402
 from engine.filters import (  # noqa: E402
     apply_liquidity_filter,
     apply_theme_cap,
@@ -120,6 +121,8 @@ def build_portfolio(
     entry_ma_window: int | None = None,
     exit_ma_window: int | None = None,
     prefer_held_in_theme: bool | None = None,
+    alpha_override: pd.DataFrame | None = None,
+    smoothing_config: SS.SmoothingConfig | None = None,
 ) -> dict:
     """算出 asof 截面的持仓建议。返回 dict（含明细、打分、过滤统计、交易指令）。
 
@@ -132,6 +135,17 @@ def build_portfolio(
     nav_state : dict | None
         组合级风控刹车状态：``{"nav": float, "peak": float, "in_brake": bool,
         "cooldown_left": int}``。``in_brake=True`` ⇒ **整个组合切防守资产**。
+    alpha_override : pd.DataFrame | None
+        **平滑后的穿透分覆盖表**（列含 ``etf_code`` / ``smoothed_score`` / ``score_stability``），由
+        ``manu/etf_rotation/score_smoothing.py`` 产出。给了 ⇒ 排序用**平滑分**；
+        没给 ⇒ 排序用**原始分**（旧行为）。🔴 原始分永远保留在 ``alpha_score``
+        只作对外披露用；本参数只影响**参与排序**的那一份。
+    smoothing_config : SS.SmoothingConfig | None
+        穿透分时间平滑参数。🔴 **``alpha_override`` 没给、但本参数给了且开启**
+        ⇒ 引擎**自己**算平滑表（走 :func:`score_smoothing.build_alpha_override`
+        ⇒ 与 ``analyze.py`` / ``recommend.py`` **同一个函数、同一份输入**
+        ⇒ 规则层与交付层必然同源）。
+        两者都没给 ⇒ 排序用**原始分**（旧行为；回测链走这条，基线不漂）。
     """
     asof = pd.Timestamp(asof)
     current_holdings = current_holdings or {}
@@ -155,6 +169,18 @@ def build_portfolio(
     alpha_cols = ["etf_code", "alpha_score", "coverage", "coverage_ok", "n_stocks_scored"]
     cand = cand.merge(alpha[alpha_cols].rename(columns={"etf_code": "code"}), on="code", how="left")
     cand["alpha_score"] = cand["alpha_score"].astype(float)
+    # ---- 时间平滑（可选）=====
+    # 🔴 引擎是平滑的**唯一所有者**：``alpha_override`` 没给但平滑开着 ⇒ 这里自己算
+    #    （2026-11-09 闸门 A2 判红的真凶：规则层 recommend.py 漏传平滑表，
+    #     交付层 analyze.py 用了平滑分 ⇒ 两条链选出不同的票）。
+    smoothing_diag: dict = {}
+    if alpha_override is None and smoothing_config is not None and smoothing_config.enabled:
+        alpha_override, smoothing_diag = SS.build_alpha_override(
+            holdings, scores, prices, asof, smoothing_config, C.MIN_E_COVERAGE
+        )
+    # 🔴 与 `analyze.py` 共用 `score_smoothing.apply_alpha_override` 这一份实现
+    #    ⇒ 分析侧重放与引擎决策**不会漂移**（漂移 ⇒ 报告直接拒绝出报告）。
+    cand = SS.apply_alpha_override(cand, alpha_override)
     # 🔴 没有 A 股成分的 ETF（美股 / 港股通 / 黄金）⇒ E = W×S **算不出来**，
     #    coverage=0 ⇒ alpha_score 留空 ⇒ z_alpha 取截面均值（=0，中性），
     #    它们只能靠**自身动量**入选。coverage_ok 明确标出来，便于披露。
@@ -170,7 +196,12 @@ def build_portfolio(
     mode = pool_mode or C.POOL_MODE
     n_before_pool = int(len(cand))
     if mode == "e_covered":
-        keep_mask = cand["coverage_ok"].eq(True) | cand["is_defensive"].eq(True)
+        # 🔴 **严格口径（2026-11-06）**：与 `analyze.py` 同口径 ⇒ coverage 不达标一律剔除
+        #    （含防守资产）⇒ 回测与实盘**口径一致** ⇒ 旧数字（含旁路）已作废，必须重跑。
+        if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False):
+            keep_mask = cand["coverage_ok"].eq(True) | cand["is_defensive"].eq(True)
+        else:
+            keep_mask = cand["coverage_ok"].eq(True)
         cand = cand[keep_mask].copy()
     cand = cand.reset_index(drop=True)
     stats["pool_mode"] = mode
@@ -225,7 +256,9 @@ def build_portfolio(
         pool = pool[~pool["code"].astype(str).isin(exit_codes)].copy().reset_index(drop=True)
 
     # ---- 分数合成 ----
-    pool["z_alpha"] = _z(pool["alpha_score"].fillna(pool["alpha_score"].mean()))
+    # 🔴 与 `analyze.py` 同口径：穿透为 0 的 ETF 用**池内均值**补 ⇒ 标准化后 z_alpha = 0
+    #    （中性分，不奖不惩）⇒ 只能靠自身动量入选。**不许**改成 fillna(0)。
+    pool["z_alpha"] = _z(pool["alpha_score_used"].fillna(pool["alpha_score_used"].mean()))
     pool["z_mom"] = _z(pool["momentum_score_trend_adj"])
     w_alpha = C.ALPHA_SCORE_WEIGHT if alpha_weight is None else float(alpha_weight)
     w_mom = C.MOMENTUM_SCORE_WEIGHT if momentum_weight is None else float(momentum_weight)
@@ -301,6 +334,11 @@ def build_portfolio(
                 "target_weight": round(float(target.get(str(r["code"]), 0.0)), 6),
                 "final_score": round(float(r["final_score"]), 4),
                 "alpha_score": None if not np.isfinite(r["alpha_score"]) else round(float(r["alpha_score"]), 4),
+                # 实际参与排序的那一份（平滑开启 = 平滑分）⇒ 与原始分对照披露
+                "alpha_score_used": (
+                    None if not np.isfinite(r.get("alpha_score_used", np.nan))
+                    else round(float(r["alpha_score_used"]), 4)
+                ),
                 "coverage": None if not np.isfinite(r.get("coverage", np.nan)) else round(float(r["coverage"]), 4),
                 "coverage_ok": bool(r.get("coverage_ok", False)),
                 "mom20": round(float(r["mom20"]), 4) if np.isfinite(r["mom20"]) else None,
@@ -318,6 +356,16 @@ def build_portfolio(
         "asof": asof.date().isoformat(),
         "brake_mode": brake_mode,
         "pool_mode": mode,
+        # 🔴 平滑口径审计信息（谁算的、开了没、回退没）⇒ 交付件可自证口径
+        "score_smoothing": (
+            smoothing_diag
+            if smoothing_diag
+            else (
+                {"enabled": True, "source": "caller_supplied"}
+                if alpha_override is not None
+                else {"enabled": False, "source": "disabled"}
+            )
+        ),
         "defensive_mode": defensive_mode,
         "relaxed_absolute_momentum_filter": relaxed,
         "n_selected": n,
@@ -333,6 +381,11 @@ def build_portfolio(
                 "name": str(r["name"]),
                 "final_score": round(float(r["final_score"]), 4),
                 "alpha_score": None if not np.isfinite(r["alpha_score"]) else round(float(r["alpha_score"]), 4),
+                # 实际参与排序的那一份（平滑开启 = 平滑分）⇒ 与原始分对照披露
+                "alpha_score_used": (
+                    None if not np.isfinite(r.get("alpha_score_used", np.nan))
+                    else round(float(r["alpha_score_used"]), 4)
+                ),
                 "momentum_score": round(float(r["momentum_score_trend_adj"]), 4),
                 "mom120": round(float(r["mom120"]), 4) if np.isfinite(r["mom120"]) else None,
                 "coverage": None if not np.isfinite(r.get("coverage", np.nan)) else round(float(r["coverage"]), 4),

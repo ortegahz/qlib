@@ -5,9 +5,21 @@
 #   → TradingAgents 多智能体决策 → 最终调仓计划（下一节点）
 #
 # 用法（服务器）：
+#
+#   --reuse-decision：🔴 复用**本轮已落盘**的 TradingAgents 决策（**不重跑 LLM**）。
+#     只在「LLM 已跑完、后续步骤 FAIL」时用；前置校验「决策件不早于报告/上下文」
+#     ⇒ 保证三环同代（rules.md §15.4）；sha1 链仍由 8/16 `verify_artifacts` 复核。
 #   bash manu/etf_rotation/run_pipeline.sh [--asof 2026-11-03] [--out-dir DIR]
 #                                          [--skip-scores] [--skip-prices] [--skip-ta]
+#                                          [--reuse-decision]
 #                                          [--rebalance-every N] [--start YYYY-MM-DD]
+#                                          [--provider-uri DIR]
+#
+#   --provider-uri：🔴 2026-11-09 新增 —— 指定本次打分用的 **qlib provider 目录**
+#     （研究链默认只有上游基座 `cn_data`；阶段 1 自建的增量日在 `cn_data_live`）。
+#     **默认空 = 上游基座（零回归，当前基线不漂）**；显式指定 ⇒ 研究链与每日链
+#     吃**同一个**数据集（口径不分叉）⇒ 12-01 重建时不会静默停在 11-03 的旧分数。
+#     等价环境变量：`ETF_ROTATION_QLIB_PROVIDER_URI`（脚本显式参数优先）。
 #
 # 口径（manu/memory/rules.md §十四）：
 #   * 个股层不可跳过（E = W × S）；
@@ -20,16 +32,40 @@
 set -uo pipefail
 
 ASOF=""
-OUT_DIR="/mnt/data/siping/runs/etf_rotation"
+#: 🔴 **结果落点根**（可被环境变量 `ETF_ROTATION_RESULTS_ROOT` 覆盖 ⇒ 整棵树可搬家）
+#:    单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的同名常量。
+#:    🔴 `RESULTS_ROOT_DEFAULT` 必须与 `rebuild_baseline.sh` 里的**同名变量逐字相同**
+#:       （两份脚本靠它做「备份目录 == 重建目录」的交叉校验）。
+RESULTS_ROOT_DEFAULT="/mnt/data/siping/runs/etf_rotation_results"
+RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-$RESULTS_ROOT_DEFAULT}"
+OUT_DIR="$RESULTS_ROOT"
 SKIP_SCORES=0
 SKIP_PRICES=0
 SKIP_TA=0
+#: 🔴 2026-11-09 新增：**复用本轮已生成的 TradingAgents 决策**（不重跑 LLM）。
+#:    用途：LLM 已跑完、但后续步骤（如 8/16 回归自检）FAIL ⇒ 只重跑 7~16 步，
+#:    **不许重跑 25 分钟的 LLM**（决策件已落盘，重跑会换一代意见）。
+#:    铁律：① 前置校验「决策件比报告/上下文新」⇒ 保证**三环同代**（rules.md §15.4）；
+#:          ② sha1 链仍由 8/16 `verify_artifacts` 复核，链断照样 die。
+REUSE_DECISION=0
 #: 🔴 M-S4（2026-11-05 08:0x）：打分相位步长 / 起点 —— **同一个值同时传给打分器与预检**
 #:    （否则守卫算 10 日栅格、打分器算 20 日栅格 ⇒ 守卫可能放行一个打不出分的日子）
 REBALANCE_EVERY=""
 GRID_START=""
 #: 最终计划要嵌入的 LLM 决策文件；没有可信决策时指向不存在的路径（⇒ 不嵌 LLM 意见）
 DECISION_ARG="$OUT_DIR/.no_llm_decision.md"
+#: 🔴 2026-11-09 新增：qlib **provider 覆盖**（研究链 ↔ 每日链口径不分叉）。
+#:    默认 **空** ⇒ `qlib_scores.py` 用 `C.PROVIDER_URI`（上游基座）⇒ **零回归**；
+#:    显式指定（`--provider-uri DIR` 或 env `ETF_ROTATION_QLIB_PROVIDER_URI`）⇒ 用该目录。
+PROVIDER_URI="${ETF_ROTATION_QLIB_PROVIDER_URI:-}"
+#: 🔴 2026-11-09 新增：穿透分时间平滑。
+#:    🔴 **分析链（analyze.py）与规则层（recommend.py）必须拿同一组参数**
+#:    ⇒ 否则两条链的平滑分不同 ⇒ 选出不同的票 ⇒ 交付与规则不同源。
+NO_SMOOTHING=0
+SMOOTHING_METHOD_ARG=""
+SMOOTHING_WINDOW_ARG=""
+SMOOTHING_ALPHA_ARG=""
+SMOOTHING_HISTORY_ARG=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,8 +74,15 @@ while [ $# -gt 0 ]; do
     --skip-scores)  SKIP_SCORES=1; shift ;;
     --skip-prices)  SKIP_PRICES=1; shift ;;
     --skip-ta)      SKIP_TA=1; shift ;;
+    --reuse-decision) REUSE_DECISION=1; shift ;;
     --rebalance-every) REBALANCE_EVERY="$2"; shift 2 ;;
     --start)        GRID_START="$2"; shift 2 ;;
+    --provider-uri) PROVIDER_URI="$2"; shift 2 ;;
+    --no-smoothing)   NO_SMOOTHING=1; shift ;;
+    --smoothing-method)   SMOOTHING_METHOD_ARG="$2"; shift 2 ;;
+    --smoothing-window)   SMOOTHING_WINDOW_ARG="$2"; shift 2 ;;
+    --smoothing-alpha)    SMOOTHING_ALPHA_ARG="$2"; shift 2 ;;
+    --smoothing-history-days) SMOOTHING_HISTORY_ARG="$2"; shift 2 ;;
     -h|--help)      sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -51,6 +94,14 @@ LLM_PY="${LLM_PY:-/home/huangzhe/anaconda3/envs/llm/bin/python}"
 TA_DIR="$PROJ/TradingAgents"
 LOG="$OUT_DIR/pipeline.log"
 mkdir -p "$OUT_DIR"
+
+#: 🔴 平滑参数组：**同时**传给 analyze.py 与 recommend.py
+SMOOTH_ARGS=()
+[ "$NO_SMOOTHING" -eq 1 ] && SMOOTH_ARGS+=(--no-smoothing)
+[ -n "$SMOOTHING_METHOD_ARG" ]   && SMOOTH_ARGS+=(--smoothing-method "$SMOOTHING_METHOD_ARG")
+[ -n "$SMOOTHING_WINDOW_ARG" ]   && SMOOTH_ARGS+=(--smoothing-window "$SMOOTHING_WINDOW_ARG")
+[ -n "$SMOOTHING_ALPHA_ARG" ]    && SMOOTH_ARGS+=(--smoothing-alpha "$SMOOTHING_ALPHA_ARG")
+[ -n "$SMOOTHING_HISTORY_ARG" ]  && SMOOTH_ARGS+=(--smoothing-history-days "$SMOOTHING_HISTORY_ARG")
 
 say() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
 die() { say "FATAL: $*"; exit 1; }
@@ -113,6 +164,15 @@ if [ "$SKIP_SCORES" -eq 0 ]; then
   SCORE_ARGS=()
   [ -n "$REBALANCE_EVERY" ] && SCORE_ARGS+=(--rebalance-every "$REBALANCE_EVERY")
   [ -n "$GRID_START" ] && SCORE_ARGS+=(--start "$GRID_START")
+  # 🔴 provider 覆盖 + **披露**（数据集覆盖末日 / 未覆盖目标日告警）
+  #    ⇒ 12-01 重建时能一眼看出「这次打的分是不是真的到 12-01 之前」。
+  PROV_ARGS=(--asof "${ASOF:-}")
+  if [ -n "$PROVIDER_URI" ]; then
+    SCORE_ARGS+=(--provider-uri "$PROVIDER_URI")
+    PROV_ARGS+=(--provider-uri "$PROVIDER_URI")
+  fi
+  PROV_LINE="$("$QL_PY" manu/etf_rotation/qlib_provider.py "${PROV_ARGS[@]}" 2>&1 | tail -1)"
+  say "   provider：$PROV_LINE"
   if [ -n "$ASOF" ]; then
     "$QL_PY" manu/etf_rotation/qlib_scores.py --mode infer --out-dir "$OUT_DIR" --end "$ASOF" "${SCORE_ARGS[@]}" 2>&1 | tail -20 | tee -a "$LOG"
   else
@@ -132,10 +192,23 @@ else
   say "2/16 跳过个股日线导出（已存在或 --skip-prices）"
 fi
 
+# ---- 2.5) 账户事实源导出（交付目录自带口径 ⇒ 8/16 回归自检 / H1 有据可查）----
+#    🔴 2026-11-10 真缺陷：verify_artifacts.py 的「账户对账」与「持仓诊断逐只齐全」
+#    已改成「期望值只认**交付件同目录**的 account_context.json（回落 account_snapshot.csv），
+#    都没有 ⇒ FAIL（不许真空 PASS）」⇒ 研究链的交付目录**必须自带**账户事实源，
+#    否则这两项必然红、8/16 直接 die（实测 24 项 FAIL 2 ⇒ 整链 rc=1）。
+#    口径 = 研究链自己的基准（manu/etf_rotation/account.py，2026-11-04），
+#    绝不串到每日链的实盘基准（daily/account_state.py，2026-11-05）去。
+say "2.5/16 导出账户事实源（account_context.json + account_snapshot.csv）"
+"$QL_PY" manu/etf_rotation/emit_account_context.py --out-dir "$OUT_DIR" 2>&1 | tail -5 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -eq 0 ] || die "账户事实源导出失败（交付件将无账户口径 ⇒ 闸门必红）"
+
 # ---- 3) ETF 分析报告 ------------------------------------------------------
 say "3/16 生成 ETF 分析报告"
 ANALYZE_ARGS=(--out-dir "$OUT_DIR" --stock-prices "$OUT_DIR/stock_prices.csv")
 [ -n "$ASOF" ] && ANALYZE_ARGS+=(--asof "$ASOF")
+#: 🔴 平滑参数**两链同组**（分析链 + 规则层）
+ANALYZE_ARGS+=("${SMOOTH_ARGS[@]+"${SMOOTH_ARGS[@]}"}")
 "$QL_PY" manu/etf_rotation/analyze.py "${ANALYZE_ARGS[@]}" 2>&1 | tail -20 | tee -a "$LOG"
 [ "${PIPESTATUS[0]}" -eq 0 ] || die "analyze.py 失败（报告不可生成 ⇒ 不产出假计划）"
 [ -f "$OUT_DIR/etf_analysis_report.json" ] || die "缺 etf_analysis_report.json"
@@ -148,6 +221,8 @@ if [ -z "$HOLDINGS_ARG" ]; then
   say "WARN: 账户快照读不到持仓权重 ⇒ recommend.py 按空持仓跑（不编造）"
 fi
 RECOMMEND_ARGS=(--out-dir "$OUT_DIR" --pool-mode e_covered --entry-ma-window 20 --exit-ma-window 60)
+#: 🔴 与 analyze.py **同一组**（不同组 ⇒ 两链分叉 ⇒ 交付与规则不同源）
+RECOMMEND_ARGS+=("${SMOOTH_ARGS[@]+"${SMOOTH_ARGS[@]}"}")
 [ -n "$ASOF" ] && RECOMMEND_ARGS+=(--asof "$ASOF")
 [ -n "$HOLDINGS_ARG" ] && RECOMMEND_ARGS+=(--holdings "$HOLDINGS_ARG")
 "$QL_PY" manu/etf_rotation/recommend.py "${RECOMMEND_ARGS[@]}" 2>&1 | tail -10 | tee -a "$LOG"
@@ -161,7 +236,41 @@ RECOMMEND_ARGS=(--out-dir "$OUT_DIR" --pool-mode e_covered --entry-ma-window 20 
 #         （yfinance 被 Yahoo 限流 ⇒ 退避 2+4+8s 空转；alpha_vantage 无 key ⇒ 掀翻整张图）；
 #       · 递归上限 60（调小会被 analyst 的工具轮耗尽 ⇒ GraphRecursionError）；
 #       · effort=max ⇒ max_tokens 必须是 32768（否则思考 token 吃光正文）。
-if [ "$SKIP_TA" -eq 0 ]; then
+if [ "$SKIP_TA" -eq 0 ] && [ "$REUSE_DECISION" -eq 1 ]; then
+  # ---- 复用本轮决策（不重跑 LLM）：**前置三件套 + 同代校验** ------------------
+  say "5/16~6/16 复用本轮 TradingAgents 决策（--reuse-decision；**不重跑 LLM**）"
+  [ -f "$OUT_DIR/tradingagents_decision.md" ] \
+    || die "没有 $OUT_DIR/tradingagents_decision.md ⇒ 无可复用决策"
+  [ -f "$OUT_DIR/tradingagents_decision.json" ] \
+    || die "没有 $OUT_DIR/tradingagents_decision.json ⇒ 无可复用决策"
+  _dec_status="$("$QL_PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get('status',''))" \
+      "$OUT_DIR/tradingagents_decision.json" 2>/dev/null)"
+  [ "$_dec_status" = "ok" ] \
+    || die "复用的决策 status=${_dec_status:-无} ⇒ 不是成功轮（不许凑数）"
+  # ---- 同代校验（**内容指纹**，不靠 mtime）------------------------------
+  # 🔴 2026-11-09 实测踩坑：先用「决策件比报告新」当同代判据 ⇒ **必然误判** ——
+  #    步骤 3 每次都重写报告（内容逐字节一致）⇒ 重跑时报告 mtime 必然比决策新。
+  #    ⇒ 改用**内容指纹**：决策件必须比上下文新（决策出自这份上下文），
+  #      且报告内容指纹必须 == ta_context_meta.json 登记值（报告仍是同一代）。
+  [ -f "$OUT_DIR/ta_context_meta.json" ] \
+    || die "同代校验失败：缺 ta_context_meta.json（没有上下文登记 ⇒ 无法证明同代）"
+  if [ "$OUT_DIR/tradingagents_decision.md" -ot "$OUT_DIR/ta_context_meta.json" ]; then
+    die "同代校验失败：决策件比上下文旧 ⇒ 那是**上一代**意见（规则 §15.4：基线必须三环同代）"
+  fi
+  _chain_ok="$("$QL_PY" -c "
+import json, sys
+sys.path.insert(0, 'manu/etf_rotation')
+from report_fingerprint import report_content_sha1_from_file
+_meta = json.load(open(sys.argv[1], encoding='utf-8'))
+_now = report_content_sha1_from_file(sys.argv[2])
+_ref = _meta.get('report_content_sha1')
+print('OK' if (_ref and _now and _ref == _now) else 'MISMATCH')
+" "$OUT_DIR/ta_context_meta.json" "$OUT_DIR/etf_analysis_report.json" 2>/dev/null)"
+  [ "$_chain_ok" = "OK" ] \
+    || die "同代校验失败：报告内容指纹与 ta_context_meta.json 登记值不一致（$_chain_ok）⇒ 决策件是**上一代**意见"
+  say "     ⇒ 同代校验通过（决策比上下文新 + 报告内容指纹与登记一致）｜sha1 链由 8/16 复核"
+  DECISION_ARG="$OUT_DIR/tradingagents_decision.md"
+elif [ "$SKIP_TA" -eq 0 ]; then
   say "5/16 构造 TradingAgents 上下文（压缩版 research_context）"
   "$QL_PY" manu/etf_rotation/llm/build_ta_context.py --run-root "$OUT_DIR" 2>&1 | tail -5 | tee -a "$LOG"
   [ "${PIPESTATUS[0]}" -eq 0 ] || die "build_ta_context.py 失败（上下文没生成 ⇒ 不许拿旧上下文做 TA）"

@@ -51,7 +51,27 @@ _FINAL_HEADINGS = ("最终交易决定", "最终交易决策", "final trade deci
                    "final_trade_decision", "最终裁决")
 
 #: 评级行：**Rating**: Underweight
-_RATING_RE = re.compile(r"\*\*Rating\*\*\s*[:：]\s*(?P<v>[^\n*]{1,40})")
+#: 🔴 2026-11-09（Mode C v2 审计实证）：**粗体可有可无** ——
+#:    实测 2026-11-09 这一轮 LLM 写的是**裸**「Rating: Underweight」（无粗体）
+#:    ⇒ 旧正则要求 `**Rating**` ⇒ 评级**整条漏抽**（计划里 rating=null）
+#:    ⇒ 交付件少了一个权威字段。
+#: 🔴 2026-11-09 补 **左词边界**：旧正则没有左边界 ⇒ md 里若出现
+#:    「RiskRating:」「CreditRating:」这类**更长词**里的 Rating 子串，
+#:    `search` 会从**全文第一个匹配处**抽出**错误的值**
+#:    ⇒ 评级被污染（把风险评级 / 信用评级当成 Trader 的最终评级）。
+#:    ⇒ 修法：`Rating` 前加 `(?<![A-Za-z])` ⇒ 裸写 `Rating:` 与 `**Rating**:` 都认，
+#:      而 `RiskRating:` / `CreditRating:` 抽不到（它们是**别的词**，不是评级行）。
+_RATING_RE = re.compile(r"\*{0,2}(?<![A-Za-z])Rating\*{0,2}\s*[:：]\s*(?P<v>[^\n*]{1,40})")
+
+#: 🔴 2026-11-09（Mode C v2 审计实证）修：「**已触发**」是**既成事实**，不是条件。
+#:    实测事故：LLM 最终表写
+#:      「| **159929** | **卖出** | 0% | 已触发持仓MA60强制退出，继续持有会使已有浮盈重新暴露 |」
+#:    ⇒ `_is_conditional` 看首子句里有「**触发**」⇒ 判成条件句 ⇒ **整行被跳过**
+#:    ⇒ 159929 / 513330 / 513770 三条**真裁决**（清仓）整条漏抽，落进 unparsed_codes
+#:    ⇒ 交付件的「最终裁决层」少了三条清仓指令。
+#:    ⇒ 修法：判条件前先抹掉「已/已经/均/皆/都 + 触发」这类**既成事实**；
+#:      「触发后 / 触发则 / 触发时 / 触发条件」仍按条件句处理。
+_FACT_TRIGGER_RE = re.compile(r"(?:已|已经|均|皆|都|全部)?触发(?![后则时条])")
 
 #: Executive Summary（多行）—— 取到空行为止
 #: 🔴 2026-11-05 10:0x（M-Q 修）：**冒号是可选的**。
@@ -165,11 +185,46 @@ _POST_CASH_PCT_RE = re.compile(
 #:    （减仓至约 15%）被覆盖 ⇒ **必须做否定式保护**。
 _NEG_MARKERS = ("不是", "非", "不", "无需", "避免", "杜绝", "不予", "排除", "拒绝", "免于")
 
+#: 🔴 否定**作用域**的断点词：出现这些词 ⇒ 之前的否定**管不到**后面的动作词。
+#:   「不卖却要清仓」⇒ 否定管不到「清仓」；「不是清仓而是减仓」⇒ 管得到「清仓」、管不到「减仓」。
+_SCOPE_BREAKERS = ("但", "不过", "然而", "却", "反而", "而是", "改为", "转而")
 
-def _negated(text: str, pos: int) -> bool:
-    """`pos` 处的动作词是否被否定（「不清零」「不是清零」「避免清仓」…）。"""
-    window = text[max(0, pos - 4):pos]
-    return any(marker in window for marker in _NEG_MARKERS)
+#: md 的强调/代码标记（LLM 常写「卖出约 **2,600份**」⇒ 动词与数量之间夹着 `**`）。
+#:    动作词与数量之间允许夹这些标记 ⇒ 否则「部分卖出」会被漏判成「清仓」。
+_MD_NOISE = r"[\s*`_~]*"
+
+
+def _negated(text: str, pos: int, matched: str = "") -> bool:
+    """`pos` 处的动作词是否被否定（「不清零」「不是清零」「避免清仓」…）。
+
+    🔴 2026-11-10 实测事故（通宵实跑 A20⑥ 红灯）：LLM 写
+       「采纳本轮**战术性卖出、降低权益敞口**，但不把 `512800` 一次清仓」
+       ⇒ 旧口径只看动作词**前 4 个字**（这里是「一次」）⇒ 否定词「不」落在窗口外
+       ⇒ 「清仓」被当成**清仓指令** ⇒ 512800 方向变「卖」、目标权重被写成 0%
+       ⇒ 真实裁决（减至约 15%）被整条覆盖。
+       ⇒ 改成**子句级否定作用域**：
+          ① 动作词**之前**必须有否定标记（取**最近**的那个）；没有 ⇒ 不算被否定；
+          ② 否定标记与动作词之间若有**转折/并列词**（但/不过/却/而是…）⇒ 否定**管不到**；
+          ③ 否定标记与动作词之间若出现**别的代码**、且子句里还有**否定标记之前**的代码
+             ⇒ 否定只绑定它后面那个标的 ⇒ 管不到本动作词；
+          ④ 动作词**自带否定**（「不买」「不建仓」）⇒ 它本身就是零方向指令，不算被否定。
+    """
+    if matched and any(matched.startswith(m) for m in ("不", "非")):
+        return False
+    scope = text[:pos]
+    last = -1
+    for marker in _NEG_MARKERS:
+        idx = scope.rfind(marker)
+        if idx > last:
+            last = idx
+    if last < 0:
+        return False
+    if any(b in scope[last:] for b in _SCOPE_BREAKERS):
+        return False
+    codes = list(_CODE_RE.finditer(scope))
+    if any(c.start() > last for c in codes) and any(c.start() < last for c in codes):
+        return False
+    return True
 
 
 #: 子句里的动作词 → (方向, 目标权重, 说明)
@@ -189,12 +244,27 @@ _ACTION_RULES: tuple[tuple[re.Pattern, str, float, str], ...] = (
     #    「不清零 / 不是清零」由 `_negated()` 排除。
     (re.compile(r"(?:全部卖出|卖出全部|清仓|清掉|清零)"), "卖", 0.0, "原文写明清仓"),
     # ② 带数量的卖出 ⇒ **部分卖出**（减仓），目标权重留给「权重/目标」类规则
-    (re.compile(r"(?:卖出|卖掉|减掉)\s*(?:约)?\s*[\d,]+(?:\.\d+)?\s*(?:股|份)"),
-     "减", None, "原文写明卖出 N 份（部分卖出，非清仓）"),
+    #    🔴 2026-11-09 实测事故（Mode B 通宵实跑 A20⑥ 红灯）：LLM 写
+    #       「512800减持约2,600份，保留约5,100份」⇒ 旧口径**不认「减持/减仓 + 数量」**
+    #       ⇒ 走不到本规则 ⇒ 方向被后面的裸「卖出」规则抢走 ⇒ 512800 目标写成 0%。
+    #    🔴 2026-11-10 实测事故：LLM 写「卖出约 **2,600份**」⇒ 动词与数字之间夹着
+    #       markdown 强调标记 `**` ⇒ 旧正则 `\s*` 吃不掉 ⇒ 本规则又漏判
+    #       ⇒ 方向被裸「卖出」规则抢走 ⇒ 「减仓」又被写成「清仓/0%」。
+    #       ⇒ 修法：动词与数量之间允许夹 **强调/代码标记**（`_MD_NOISE`）。
+    (re.compile(r"(?:卖出|卖掉|减掉|减持|减仓)" + _MD_NOISE + r"(?:约)?" + _MD_NOISE
+                + r"[\d,]+(?:\.\d+)?" + _MD_NOISE + r"(?:股|份)"),
+     "减", None, "原文写明卖出/减持 N 份（部分卖出，非清仓）"),
     # ③ 明确减仓
     (re.compile(r"减至|减到|减仓|减持|压缩至|压到|下调至|下调到"), "减", None, "原文写明减仓"),
     # ④ 裸「卖出」⇒ 整仓卖出（0%）
-    (re.compile(r"卖出|卖掉"), "卖", 0.0, "原文写明卖出"),
+    #    🔴 2026-11-09 实测事故：LLM 写「卖出512800**预计回笼**约2,272.40元」
+    #       ⇒ 这是**收益预估句**（描述减仓回笼多少现金），**不是卖出指令**
+    #       ⇒ 旧口径裸「卖出」命中 ⇒ 512800 被当成「卖 + 目标 0%」（真实裁决「减至约15%」）。
+    #       ⇒ 修法：若「卖出」后面同一子句里出现**回笼/回款/折现/变现**这类**收益预估词**
+    #          ⇒ 本规则**不生效**（宁可留 None，也不把预估句当指令）。
+    #       ⚠️ 「全部卖出/清仓」由规则①先判，不受此护栏影响（真清仓仍判 0%）。
+    (re.compile(r"(?:卖出|卖掉)(?![^。；\n]{0,40}?(?:回笼|回款|折现|变现))"),
+     "卖", 0.0, "原文写明卖出"),
     (re.compile(r"不建仓"), "不建仓", 0.0, "原文写明不建仓"),
     (re.compile(r"不买"), "不买", 0.0, "原文写明不买"),
     # 🔴 2026-11-05 09:3x（M-Q 修）：「条件买入」是**带条件的建仓**（不是不买，也不是
@@ -278,6 +348,8 @@ def _is_conditional(sentence: str) -> bool:
     # 🔴 2026-11-05 10:3x（M-Q 修）：「降级条件：…⇒ 残仓一次性清零」是**触发器**，
     #    不是本轮裁决 ⇒ 但「条件买入/条件建仓」是**动作** ⇒ 判条件前先抹掉它。
     probe = _COND_BUY_SPAN.sub("", head)
+    # 🔴 2026-11-09：「已触发 MA60 强制退出」是**既成事实**，不是条件 ⇒ 先抹掉
+    probe = _FACT_TRIGGER_RE.sub("", probe)
     first_clause = re.split(r"[，,；;：:]", probe)[0]
     if any(word in first_clause for word in ("若", "如果", "假如", "倘若", "一旦", "除非",
                                             "条件", "触发")):
@@ -285,17 +357,42 @@ def _is_conditional(sentence: str) -> bool:
     return False
 
 
+#: 🔴 2026-11-10：文档级章节的**编号模式**（中文序数 / 阿拉伯数字 ＋ 顿号）。
+#:   例：「六、最终交易决定（原始输出）」「七、附录」「3. 复盘」⇒ 命中。
+#:   例：「Executive Summary」「Investment Thesis」⇒ **不命中**（LLM 自己写的内嵌小标题）。
+_SECTION_NUM_RE = re.compile(
+    r"^(?:第\s*[一二三四五六七八九十百千]+|[一二三四五六七八九十百千]+|\d+)\s*[、.．]"
+)
+
+
 def extract_section(text: str) -> str | None:
     """截出「最终交易决定」章节的正文；找不到返回 None。
 
     🔴 章节层级用 `##` 的井号数判定 ⇒ 正文里出现更高级标题（`#`）即结束；
     同级或更低级标题（`##`/`###`）也结束 ⇒ 不会把后面的章节吃进来。
+
+    🔴 2026-11-10（真实缺陷，服务器实跑暴露）：**LLM 会在最终裁决章节里自己写同级小标题**。
+       实测（2026-11-10 10:36 那轮 LLM 原文）：
+
+           ## 六、最终交易决定（原始输出）
+           **Rating**: Underweight
+           ## Executive Summary          ← 🔴 LLM 自己写的 **H2**
+           - `512800`：… 目标权重定在 **15%** …
+           ## Investment Thesis          ← 🔴 又一个 **H2**
+
+       ⇒ 旧口径「遇到同级标题就截断」⇒ 章节正文只剩「**Rating**: Underweight」一行
+       ⇒ **最终裁决 0 个代码** ⇒ 冲突表为空 ⇒ `divergences` 为空
+       ⇒ `make_decision_scenarios.py` 直接抛 RuntimeError ⇒ **基线重建整轮失败**。
+    ⇒ 现在：**编号章节**（如「六、…」）的**同级且无编号**标题一律视为 **LLM 内嵌小标题**
+       ⇒ 继续往下吃；只有「编号同级标题」或「更高级标题（`#`）」才是下一节。
+       起始标题**本身无编号**时 ⇒ **保持旧口径**（同级标题即结束）⇒ 旧夹具行为零变化。
     """
     if not text:
         return None
     lines = text.splitlines()
     start: int | None = None
     level = 0
+    numbered_start = False
     for idx, line in enumerate(lines):
         if not line.startswith("#"):
             continue
@@ -303,6 +400,7 @@ def extract_section(text: str) -> str | None:
         if any(key in body for key in _FINAL_HEADINGS):
             start = idx
             level = len(line) - len(line.lstrip("#"))
+            numbered_start = bool(_SECTION_NUM_RE.match(line.lstrip("#").strip()))
             break
     if start is None:
         return None
@@ -310,8 +408,13 @@ def extract_section(text: str) -> str | None:
     for line in lines[start + 1:]:
         if line.startswith("#"):
             lvl = len(line) - len(line.lstrip("#"))
-            if lvl <= level:
+            if lvl < level:
                 break
+            if lvl == level:
+                # 🔴 编号章节里 LLM 自写的**同级无编号**小标题 ⇒ 属章节内部 ⇒ 继续吃
+                if not (numbered_start
+                        and not _SECTION_NUM_RE.match(line.lstrip("#").strip())):
+                    break
         body_lines.append(line)
     return "\n".join(body_lines)
 
@@ -460,7 +563,7 @@ def extract_final_decision(text: str) -> dict:
                 continue
             for pattern, direction, target_pct, note in _ACTION_RULES:
                 hits = [mm for mm in pattern.finditer(clause)
-                        if not _negated(clause, mm.start())]
+                        if not _negated(clause, mm.start(), mm.group(0))]
                 if not hits:
                     continue
                 for code in codes:
@@ -471,6 +574,12 @@ def extract_final_decision(text: str) -> dict:
                         if target_pct is not None:
                             _set(code, "target_pct", target_pct, clause.strip(),
                                  "动作词（%s）" % note)
+                        elif not slot.get("evidence"):
+                            # 🔴 2026-11-10 修：**只给方向、不给目标权重**的档
+                            #    （②带数量的卖出 / ③明确减仓）也必须**记下证据句**
+                            #    ⇒ 否则方向对了但 `evidence` 是空的
+                            #    ⇒ 交付件的「可回放」断链（探针 A20④ 会红）。
+                            slot["evidence"] = clause.strip()[:_EVIDENCE_MAX]
                     if direction in ("买", "条件买入"):
                         lm = _BUY_LOTS_RE.search(clause)
                         if lm:

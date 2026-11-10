@@ -79,7 +79,7 @@ cd /tmp/pycharm_project_658d3fc4
 
 # 0) 数据体检（校准区间/股票池/字段，产出 JSON 报告）
 python manu/experiments/ashare_topk_selection/inspect_dataset.py \
-  --provider-uri /mnt/data/siping/datasets/qlib/cn_data
+  --provider-uri /mnt/data/siping/datasets/manu/etf_rotation/datasets/qlib/cn_data
 
 # 1) 训练 + 打分 + 回测（一步产出 label/model/pred + manifest.json）
 python manu/experiments/ashare_topk_selection/run_pipeline.py
@@ -125,7 +125,7 @@ python manu/experiments/ashare_topk_selection/valid_stability.py \
 
 ```bash
 # 服务器上执行；GitHub release 的 302 链会挂死 ⇒ 走 api.github.com 取签名直链 + aria2c 多连接
-python manu/tools/fetch_qlib_dataset.py --root /mnt/data/siping/datasets/qlib
+python manu/tools/fetch_qlib_dataset.py --root /mnt/data/siping/datasets/manu/etf_rotation/datasets/qlib
 ```
 
 > 来源与 md5 留痕在 `<root>/fetch_manifest.json`。
@@ -152,11 +152,11 @@ $AK manu/etf_rotation/data/fetch_etf_universe.py --stage finalize
 $AK manu/etf_rotation/data/fetch_etf_holdings.py --resume
 
 # 2) 全市场个股打分 S（上游；~35 min，产物 stock_scores.csv）
-$PY manu/etf_rotation/qlib_scores.py --mode infer --out-dir /mnt/data/siping/runs/etf_rotation
+$PY manu/etf_rotation/qlib_scores.py --mode infer --out-dir /mnt/data/siping/runs/etf_rotation_results
 
 # 3) 当期调仓建议（中文清单 + 金额）
 $PY manu/etf_rotation/recommend.py --asof 2026-11-03 \
-    --out-dir /mnt/data/siping/runs/etf_rotation
+    --out-dir /mnt/data/siping/runs/etf_rotation_results
 
 # 4) 回测：主口径 / 压力成本 / 消融
 $PY manu/etf_rotation/backtest.py --tag base \
@@ -167,7 +167,7 @@ $PY manu/etf_rotation/backtest.py --tag stress \
 # 消融：--alpha-weight 0.0（纯动量）/ 1.0（纯 E）；--rebalance-every 1（双周）/ 4（季频）
 ```
 
-产物：`/mnt/data/siping/runs/etf_rotation/`
+产物：`/mnt/data/siping/runs/etf_rotation_results/`
 - `stock_scores.csv`（全市场个股分数，374,793 行 / 69 个信号日）
 - `etf_rotation_backtest_<tag>.json`（含 `segment_report` / `n_failed_rebalances` / 偏差披露）
 - `etf_rotation_nav_<tag>.csv`（日频 NAV：portfolio / benchmark / excess）
@@ -180,18 +180,32 @@ $PY manu/etf_rotation/backtest.py --tag stress \
 # 服务器（重活一律上服务器；host 18:30 关机 ⇒ 夜间链在服务器自主跑）
 cd /tmp/pycharm_project_658d3fc4
 
-# 1) 全市场个股打分 S（上游；产物 /mnt/data/siping/runs/etf_rotation/stock_scores.csv）
+# 1) 全市场个股打分 S（上游；产物 /mnt/data/siping/runs/etf_rotation_results/stock_scores.csv）
 export PYTHONHASHSEED=0
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/qlib_scores.py --mode infer
 
 # 2) ETF 分析报告（= 喂给 TradingAgents 的正文；JSON + MD）
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/analyze.py \
-    --asof 2026-11-03 --out-dir /mnt/data/siping/runs/etf_rotation
+    --asof 2026-11-03 --out-dir /mnt/data/siping/runs/etf_rotation_results
 
 # 3) 当期调仓建议（真实持仓口径；--holdings 权重 = account.py::current_weights()）
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/recommend.py --asof 2026-11-03 \
     --pool-mode e_covered --entry-ma-window 20 --exit-ma-window 60 \
     --holdings "512800:0.2254,159929:0.1117,513330:0.0760,513770:0.0373,512690:0.0298"
+
+# 3b) 穿透分时间平滑（2026-11-09 新增；**默认已开启**，一般不用显式传）
+#     🔴 analyze.py 与 recommend.py 的开关**同名同默认**；两条链必须同组透传，
+#        否则规则层与交付层会选出不同的票（2026-11-09 闸门抓到的真缺陷）。
+#     · --no-smoothing              关闭平滑（排序退回单日瞬态分）
+#     · --smoothing-method ewma|rolling   平滑方法（默认 ewma）
+#     · --smoothing-window 5        滚动窗口（**交易日**）
+#     · --smoothing-alpha 0.35      EWMA 系数（半衰期 ≈ 1.61 个交易日）
+#     · --smoothing-history-days 30 EWMA 预热历史跨度（交易日）
+#     例：两条链一起关平滑（仅调试用）：
+#     analyze.py ... --no-smoothing ; recommend.py ... --no-smoothing
+#     例：换成 10 日滚动均值（两条链必须同时改）：
+#     analyze.py ... --smoothing-method rolling --smoothing-window 10
+#     recommend.py ... --smoothing-method rolling --smoothing-window 10
 
 # 4) 真实账户口径自检（改数必须抛异常）
 cd manu/etf_rotation && /home/huangzhe/anaconda3/envs/ql/bin/python account.py
@@ -210,11 +224,11 @@ cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/run_pipeline.sh --aso
 #    日常调仓（复用已有个股分数，不跑重活）：
 #    bash manu/etf_rotation/run_pipeline.sh --skip-scores --skip-prices
 #    分步：
-#      /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/qlib_scores.py --mode infer --out-dir /mnt/data/siping/runs/etf_rotation
+#      /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/qlib_scores.py --mode infer --out-dir /mnt/data/siping/runs/etf_rotation_results
 #      /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/analyze.py --asof 2026-11-03 \
-#          --out-dir /mnt/data/siping/runs/etf_rotation --stock-prices /mnt/data/siping/runs/etf_rotation/stock_prices.csv
+#          --out-dir /mnt/data/siping/runs/etf_rotation_results --stock-prices /mnt/data/siping/runs/etf_rotation_results/stock_prices.csv
 #      /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/final_rebalance_plan.py \
-#          --out-dir /mnt/data/siping/runs/etf_rotation
+#          --out-dir /mnt/data/siping/runs/etf_rotation_results
 #    产物：etf_analysis_report.{json,md} / tradingagents_decision.md / final_rebalance_plan.{json,md}
 
 ## 仓库整理与版本控制（host 本地，2026-11-05 新增）
@@ -242,8 +256,35 @@ git cat-file blob :manu/etf_rotation/data/account_snapshot.csv | cmp - manu/etf_
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/check_memory_tables.py
 
 # 5) 全量闸门（改了 memory / CMDS.md 必跑：它们在指纹表 35 条登记项里）
-#    服务器跑；日志：/mnt/data/siping/runs/etf_rotation/_mq3_final4.log
+#    服务器跑；日志：/mnt/data/siping/runs/etf_rotation_results/_mq3_final4.log
 cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/run_gates.sh
+
+# 6) 生产基线「向前重建」（交付件处于「半更新态」时：先备份 → 重生成 → 只许改值不许增删）
+#    ⚠️ 会真调 LLM（TradingAgents 辩论，上轮实测 1525 秒）⇒ 必须用户当轮明确授权
+#    ⚠️ 跑完产物根进入「新基线」⇒ 指纹表必须随后重生成（见第 7 条）
+cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/rebuild_baseline.sh --asof 2026-11-03 --label 20261105
+
+# 7) 指纹表安全重生成（改了 memory / CMDS.md / 任何在 35 条登记项里的文件后必跑）
+#    先 --dry-run 看漂移，再实跑；口径：先备份 → 从当前良好版重建 → 断言登记项集合不变 → 逐条复验
+python3 manu/tools/regen_fingerprint_table.py --artifact-root /mnt/data/siping/runs/etf_rotation_results --dry-run
+python3 manu/tools/regen_fingerprint_table.py --artifact-root /mnt/data/siping/runs/etf_rotation_results
+
+# 8) 「不在指纹表 35 条登记项里」的闸门脚本（2026-11-09 新增，见 rules.md §十四.92 第 8 条）
+#    ⇒ 它们的漂移不靠指纹表，靠 ① 挂进 run_gates.sh 阶段表（全量闸门每次实跑）② 自带产物级自检
+cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/probes/probe_rolling_increment.py
+cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/probes/probe_snapshot_contract.py
+cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/probes/probe_qlib_provider.py
+
+# 9) qlib provider 单一事实源（2026-11-09 新增；研究链 ↔ 每日链**不分叉**）
+#    打印「本次该用哪个 provider + 数据集覆盖末日」（末日 < asof 时告警）；只读、不联网。
+cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/qlib_provider.py --asof 2026-12-01
+#    显式覆盖（与 daily/run_qlib_score.py 同一套 env 名）：
+cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/qlib_provider.py \
+    --provider-uri /mnt/data/siping/datasets/manu/etf_rotation/datasets/qlib/cn_data_live --asof 2026-12-01
+#    研究链显式吃**派生**数据集（阶段 1 自建增量日 ⇒ 覆盖到 2026-11-05）：
+#    ⚠️ 会**改变 S 层产物**（stock_scores.csv）⇒ 需用户当轮授权；默认不传 = 上游基座（零回归）
+cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/run_pipeline.sh --asof 2026-11-03 \
+    --provider-uri /mnt/data/siping/datasets/manu/etf_rotation/datasets/qlib/cn_data_live
 ```
 
 > 🔴 **`.gitignore` 顺序陷阱**：上游 `.gitignore:15` 有 `*.csv`（为 qlib 自身大数据文件设的）⇒
@@ -252,57 +293,85 @@ cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/run_gates.sh
 > 🔴 **`.gitattributes` 陷阱**：该 csv 带 **BOM + CRLF**，没有 `-text` 时 git 会归一化行尾 ⇒
 > checkout 后文件字节变了 ⇒ md5 双侧比对**假漂移** ⇒ 已用 `manu/etf_rotation/data/account_snapshot.csv -text` 钉住；
 > 改完 `.gitattributes` 若 index 仍是旧版，须 `git rm --cached` 再 `git add`。
-> 🔴 **指纹表**：`CMDS.md` 与 memory 四件套在 `/mnt/data/siping/runs/etf_rotation/_ms5_md5.txt` 的 35 条登记项里
+> 🔴 **指纹表**：`CMDS.md` 与 memory 四件套在 `/mnt/data/siping/runs/etf_rotation_results/_ms5_md5.txt` 的 35 条登记项里
 > ⇒ 改动它们**必然**让闸门 P2 变红 ⇒ 按 `rules.md §十四.92` 第 7 条重生成（先备份 → 从当前良好版重建 → 断言登记项集合不变）。
 
-## 每日 ETF 轮动流水线（2026-11-05 新增；服务器侧；**按需分析**）
+## 每日 ETF 轮动流水线（2026-11-05 新增；2026-11-09 改单一流水线 + 快照制；服务器侧；**按需分析**）
 
 > 🔴 **交付形态（2026-11-05 用户改口，当前唯一形态）**：**按需分析** —— 用户在窗口喊「分析」⇒ 主 agent 在服务器跑流程 ⇒ **Markdown 报告直接回窗口**。
 > ❌ **服务器 crontab 已无本工程任何条目**（5 条定时任务已全部卸载）；❌ **邮件不再是默认动作**（保留为显式 `--send-email` 的 opt-in）。
+> 🔴 **架构形态（2026-11-09 架构瘦身）**：**单一流水线 + 快照制** —— **没有**「模式 A / B / C」分诊；
+> **每次运行落一个不可变快照目录** `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/`；**副作用只由 `--live-trade` 决定**。
 > 六阶段全流程：**盘后取数 → S 层 Alpha 推断 → E=W×S 穿透 + 均线过滤 → TradingAgents 辩论 → 规则层对账 → 执行卡 + 报告**。
-> 用法详见 `manu/etf_rotation/daily/README.md`；铁律见 `manu/memory/rules.md §十五`。
+> 用法详见 `manu/etf_rotation/daily/README.md`；架构说明见 `manu/docs/snapshot_architecture.md`；铁律见 `manu/memory/rules.md §十五`。
 
 ```bash
 # ---- 服务器（huangzhe@192.168.99.40:32222）；重活一律上服务器 ----
 ssh -F /dev/null -p 32222 huangzhe@192.168.99.40
 cd /tmp/pycharm_project_658d3fc4
 
-# 1) 【默认】模式 A 日常巡检（按需）：跑完取数→计算→渲染报告，不发邮件
-#    报告落盘：manu/report/report_<YYYYMMDD>_mode<A|B>.md（工程目录下；可 env ETF_ROTATION_REPORT_DIR 改）
-#    日志：    /mnt/data/siping/runs/etf_rotation/daily/logs/daily_run_<YYYYMMDD>.log
+# 1) 【默认 · 观察态】完整跑一趟：现场拉数 → 内存计算 → 落一个快照目录
+#    副作用：无（执行卡挂单禁用、不发信）
+#    产物：<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/（自包含、跑完冻结、含 snapshot_manifest.json）
+#    报告：快照目录内一份 ＋ manu/report/report_<YYYYMMDD>.md 一份副本（同时打印到 stdout）
+#    日志：/mnt/data/siping/runs/etf_rotation_results/logs/daily_run_<YYYYMMDD>.log
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05
 
-# 1b) 模式 B 调仓信号日全流程（2026-12-01 收盘后；S 层 ~27min + 辩论 ~15min ⇒ 35~45 分钟）
-      #      模式 B 默认重跑 S 层 + 刷新 qlib 数据集（重活，用户当轮授权后跑）
-/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --mode B
+# 1b) 【强制全流程】--full：取数 / S 层刷新 / qlib 数据集刷新 / LLM 辩论 四段全开
+      #      ⚠️ 含重活（S 层 ~27min + 辩论 ~15min ⇒ 35~45 分钟）⇒ 用户当轮授权后跑
+      #      🟢 阶段 1 还会**真落盘**「自建增量日」（只写派生目录 cn_data_live，基座零改动）
+      #      ⇒ S 层因此能打到信号日；只想看计划：--increment-dry-run；不想补：--no-increment
+      #      🔴 --full 与任何 skip 开关冲突时**以 --full 为准**；被覆盖的 skip 登记进 manifest 并在报告披露
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --full
 
-# 1c) 模式 B 但跳过 LLM（省 API 配额）
-/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --mode B --skip-llm
+# 1c) 跳过 LLM 辩论（省 API 配额）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --skip-llm
 
-# 1d) 干跑：不联网取数、不写产物（只验逻辑）
+# 1d) 【显式观察态】--dry-run（与 --live-trade 互斥 ⇒ 同时给 ⇒ 退出码 2）
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --dry-run
 
-# 1e) 报告落盘到指定路径
-/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 \
-    --report-md /mnt/data/siping/runs/etf_rotation/daily/report_20261105_modeB.md
+# 1e) 【实盘态】--live-trade：执行卡可下单、可发信（🔴 唯一实盘副作用开关）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 --full --live-trade
 
-# 1f) 【按需】显式发邮件（默认不发；通道仍通，凭据在 0600 secrets 文件里）
+# 1f) 指定快照根（缺省 daily_config.SNAPSHOT_ROOT；env ETF_ROTATION_SNAPSHOT_ROOT）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-12-01 \
+    --snapshot-root /mnt/data/siping/runs/etf_rotation_results/snapshots
+
+# 1g) 报告落盘到指定路径（默认 manu/report/report_<YYYYMMDD>.md）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 \
+    --report-md /mnt/data/siping/runs/etf_rotation_results/daily/report_20261105.md
+
+# 1h) 【按需】显式发邮件（默认不发；通道仍通，凭据在 0600 secrets 文件里）
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-email
 
-# 1g) 【按需补发】只发已持久化的邮件草稿，不重跑任何计算
+# 1i) 【按需补发】只发已持久化的邮件草稿，不重跑任何计算
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only
 
-# 1h) 把服务器跑出来的报告【拉回 host 工程】（PyCharm 里直接看 manu/report/）
+# 1j) 把服务器跑出来的报告【拉回 host 工程】（PyCharm 里直接看 manu/report/）
 bash manu/tools/pull_reports.sh                 # 拉全部报告 + md5 双侧比对
 bash manu/tools/pull_reports.sh --check         # 只比对 md5，不落盘
 bash manu/tools/pull_reports.sh --list          # 只列服务器上有什么
 
-# 2) 看日志与当天产物
-tail -n 100 /mnt/data/siping/runs/etf_rotation/daily/logs/daily_run_20261105.log
-ls -l /mnt/data/siping/runs/etf_rotation/daily/20261105/
-cat manu/report/report_20261105_modeB.md                                               # Markdown 报告（主交付件）
-cat /mnt/data/siping/runs/etf_rotation/daily/20261105/heartbeat_20261105.json     # 心跳
-cat /mnt/data/siping/runs/etf_rotation/daily/20261105/execution_card_20261105.json # 模式 B 执行卡
+# 1k) 【阶段 1 兜底】自建增量日：上游快照覆盖不到信号日时，把**派生目录**补到信号日
+#     🔴 只写 cn_data_live（基座 cn_data 零改动）；默认 dry-run（真写要 --apply）
+#     🔴 快照接口**只能补当天** ⇒ 缺口 > 1 个交易日 ⇒ fail-closed（不写脏数据）
+cd /tmp/pycharm_project_658d3fc4
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/stage1_rolling_increment.py \
+    --day 2026-12-01                                   # dry-run：只出计划与统计（磁盘零改动）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/stage1_rolling_increment.py \
+    --day 2026-12-01 --apply                           # 真写派生目录（重活，需当轮授权）
+
+# 1l) 【实机口径核对】用本配方重算真实数据集已存在的交易日，与上游存值逐位比（只读）
+/home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/probes/_probe_inc_recipe.py
+
+# 2) 看日志与产物（🔴 快照目录才是真值）
+tail -n 100 /mnt/data/siping/runs/etf_rotation_results/logs/daily_run_20261105.log
+ls -l /mnt/data/siping/runs/etf_rotation_results/snapshots/                       # 快照根（可 env 改）
+ls -l /mnt/data/siping/runs/etf_rotation_results/snapshots/<YYYYMMDD_HHMMSS>/   # 本轮快照目录
+cat /mnt/data/siping/runs/etf_rotation_results/snapshots/<YYYYMMDD_HHMMSS>/snapshot_manifest.json   # 唯一权威索引
+cat manu/report/report_20261105.md                                       # Markdown 报告（交付副本）
+cat /mnt/data/siping/runs/etf_rotation_results/snapshots/<YYYYMMDD_HHMMSS>/heartbeat_20261105.json
+cat /mnt/data/siping/runs/etf_rotation_results/snapshots/<YYYYMMDD_HHMMSS>/execution_card_20261105.json
 
 # 3) 确认服务器上没有本工程的定时任务（应当只有系统默认两行）
 crontab -l
@@ -320,8 +389,12 @@ cd /media/manu/1TB-Volume/workspace/qlib
 #    /home/huangzhe/anaconda3/envs/ql/bin/python -m pytest manu/etf_rotation/daily/tests -q
 ```
 
-> 🔴 **重活开关**：`--refresh-scores`（重跑 S 层，约 **27 分钟**；`qlib_scores.py` 是**整体覆盖** `stock_scores.csv`、**不是增量**）与 `--update-qlib-bin`（刷新 qlib 数据集：滚动官方快照换库 ＋ **日历前缀一致性 fail-closed** 校验）**在模式 B 默认开启**（用户当轮授权后跑）；**模式 A 永远不跑**（无论开关怎么给）。
+> 🔴 **老命令会被拒**：`--mode A` / `--mode B` / `--mode C` 一律**退出码 2** ＋ stderr 迁移提示
+> （Mode A/B/C 三模式分诊已废除；跑哪几段 = `--full` ＋ skip 开关，要不要动真格 = `--live-trade`）。
+> 新旧对照表见 `manu/docs/snapshot_architecture.md` §9。
+> 🔴 **重活开关**：`--refresh-scores`（重跑 S 层，约 **27 分钟**）与 `--update-qlib-bin`（刷新 qlib 数据集）
+> **默认开启**，`--full` 会强制为开 ⇒ **重活须用户当轮授权**（铁律一）。
 > 🔴 **密钥纪律**：126 客户端授权码**只**写进服务器 `/mnt/data/siping/secrets/smtp.env`（权限 **0600**）⇒ **绝不进仓库、不进日志、不进邮件正文**；⚠️ 用**网页登录密码**会 `535 authentication failed`（126 只认客户端授权码）。
-> 退出码：**0** 成功（含非交易日静默退出）· **1** 失败 · **2** 用法错误 / 锁冲突。
+> 退出码：**0** 成功（含非交易日静默退出）· **1** 失败 · **2** 用法或环境错误（含 `--mode` 被拒、`--live-trade` 与 `--dry-run` 互斥、锁冲突）。
 > ⚠️ **看门狗当前不部署**：`manu/tools/etf_watchdog.py` 保留在仓库（纯标准库），但它的守护对象是 cron ⇒ 取消定时后**没有守护对象**；服务器持久盘 `/mnt/data/siping/apps/etf_watchdog.py` 的旧副本保留未删（无害）。
 > 🔴 **`install_schedule.sh` 已删除**（2026-11-05）：它唯一的用途是往用户 crontab 装那 5 条定时任务 ⇒ 取消定时后即死代码 ⇒ 删除，**不要再往 crontab 装本工程任何条目**。

@@ -5,7 +5,7 @@
 
 用法（服务器）：
     python manu/experiments/ashare_topk_selection/inspect_dataset.py \
-        --provider-uri /mnt/data/siping/datasets/qlib/cn_data
+        --provider-uri <落点根>/datasets/qlib/cn_data
 """
 from __future__ import annotations
 

@@ -25,7 +25,7 @@ if str(DAILY_DIR) not in sys.path:
 
 @pytest.fixture()
 def tmp_out_dir(tmp_path: Path) -> Path:
-    """临时产物目录（测试里落盘用，不碰 /mnt/data）。"""
+    """临时产物目录（测试里落盘用，不碰唯一落点根）。"""
     out = tmp_path / "out"
     out.mkdir(parents=True, exist_ok=True)
     return out

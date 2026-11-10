@@ -20,7 +20,7 @@
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_verify_guards.py \
-        --run-root /mnt/data/siping/runs/etf_rotation
+        --run-root <落点根>/runs
 
 【副作用】
 - 只在 `--run-root` 同级的临时目录里写文件（默认 `<run-root>/_probe_guards`），
@@ -34,7 +34,16 @@ import json
 import shutil
 import subprocess
 import sys
+
 from pathlib import Path
+
+#: 研究链根（探针目录不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ETF_ROOT = Path(__file__).resolve().parents[1]
+if str(_ETF_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ETF_ROOT))
+
+import config as C  # noqa: E402  （落点常量单一事实源）
+import verify_artifacts as VA  # noqa: E402  （方向词表 = 生产语义守卫的**单一事实源**）
 
 PY_BIN = "/home/huangzhe/anaconda3/envs/ql/bin/python"
 VERIFY = "manu/etf_rotation/verify_artifacts.py"
@@ -49,6 +58,12 @@ NEEDED = (
     #    「无法校验也判 PASS」的空档才过（现已修成「无法校验 ⇒ FAIL」）。
     "ta_context_meta.json", "ta_research_context.md",
     "etf_rotation_backtest_v4_prefer1.json",
+    # 🔴 2026-11-10：`verify_artifacts.py` 的账户断言改成读**交付件同目录**的
+    #    账户事实源（`account_context.json` 优先、`account_snapshot.csv` 回落）
+    #    ⇒ 临时目录里**缺**这两个件 ⇒ 那边会因事实源缺失而 fail-closed 判 FAIL
+    #    ⇒ 探针的每一条用例都会跟着假红。
+    #    ⇒ 这两个件**存在才拷**（旧账户口径的产物根可能没有）。
+    "account_context.json", "account_snapshot.csv",
 )
 #: 两条新断言在自检输出里的名字
 CHECK_SEMANTIC = "LLM 方向-权重语义自洽"
@@ -72,31 +87,75 @@ def _run_verify(run_root: Path, project_dir: Path) -> tuple[int, dict[str, bool]
     return proc.returncode, verdicts
 
 
+#: 语义守卫的方向词表：**直接取生产守卫的常量**（单一事实源）⇒
+#:   探针与生产**不可能**再各自漂一套词表（2026-11-10：探针曾自己抄一份，
+#:   覆盖不到生产新增的「清 / Sell」等词 ⇒ 漏检）。
+#: ZERO    = 目标权重必须 = 0%；REDUCE = 目标权重必须 < 当前权重。
+_ZERO_DIRECTIONS = tuple(sorted(VA.LLM_DIRECTION_ZERO))
+_REDUCE_DIRECTIONS = tuple(sorted(VA.LLM_DIRECTION_REDUCE))
+
+
 def _mutate_baseline(plan: dict) -> list[tuple[str, dict]]:
-    """构造若干「故意做坏」的交付件变体。"""
+    """构造若干「故意做坏」的交付件变体。
+
+    🔴 2026-11-09（Mode C v2 独立审计实证）修：**负例不许硬编码生产数据的偶然形态**。
+       旧实现把变异目标**写死**：N1/N4 改代码 `563020`、N5 改数值 `25.0`
+       ⇒ 2026-11-09 这一轮决策里 `563020` **不在冲突表**（它不在规则层动作里）、
+         `512800` 的规则层权重**本来就是 25.0**
+       ⇒ 变异**空转**（改了等于没改）⇒ 守卫根本没被触发
+       ⇒ 三条负例全部「守卫生效」地 PASS（实测 N1/N4/N5 三红）。
+       ⇒ 修法：**动态挑行**（挑「ZERO 方向 + 目标 0%」的行）+ **自带兜底夹具**，
+         且外层会**断言变异确实改动了交付件**（改了等于没改 ⇒ 负例无牙 ⇒ 判 FAIL）。
+    """
     variants: list[tuple[str, dict]] = []
 
-    # N1：BLOCKING 类假冲突 —— 「不买」却配 9.11% 目标权重（= 理由栏的浮盈被当成权重）
+    # N1：BLOCKING 类假冲突 —— 「不买/卖」却配 9.11% 目标权重（= 理由栏的浮盈被当成权重）
     bad = json.loads(json.dumps(plan))
-    for conflict in bad["llm_conflicts"]:
-        if conflict["code"] == "563020":
-            conflict["llm_target_pct"] = 9.11
-            for view in conflict["all_divergent_views"]:
-                if view["who"] == "bear":
-                    view["target_pct"] = 9.11
+    _hit = 0
+    for conflict in bad.get("llm_conflicts") or []:
+        if str(conflict.get("llm_direction") or "") not in _ZERO_DIRECTIONS:
+            continue
+        conflict["llm_target_pct"] = 9.11
+        for view in conflict.get("all_divergent_views") or []:
+            if str(view.get("direction") or "") in _ZERO_DIRECTIONS:
+                view["target_pct"] = 9.11
+        _hit += 1
+    if not _hit and bad.get("llm_conflicts"):
+        # 兜底夹具：自造一条「不买 + 9.11%」（**不依赖生产数据恰好有某个代码**）
+        bad["llm_conflicts"][0]["llm_direction"] = "不买"
+        bad["llm_conflicts"][0]["llm_target_pct"] = 9.11
+        _hit = 1
     variants.append(("N1 「不买」配 9.11% 目标权重（假冲突）", bad))
 
-    # N2：只改目标权重、不动方向。
+    # N2：REDUCE 方向那一行的目标改成 **≥ 当前权重**（说减却不减 ⇒ 自相矛盾）。
     # 🔴 2026-11-05 01:3x（M-K 收尾）：旧注释写「「减」方向不受语义守卫约束」——
     #    那**不是设计，是 bug**：旧实现把「当前权重」伪造成**目标值**
     #    ⇒ 「减 ⇒ 目标 < 当前」这一档**恒不成立** ⇒ 语义守卫对「减」方向完全失效。
-    #    现在当前权重 = **账户真值**（512800 = 22.54%）⇒ 「减到 25%」本身自相矛盾
-    #    ⇒ **语义守卫也必须 FAIL**（守卫覆盖变强，不是变松）。
+    # 🔴 2026-11-10（闸门假红修复）：旧实现把变异目标**写死** `512800` + `25.0`
+    #    ⇒ 本轮 512800 的冲突方向是「持有」（NEUTRAL ⇒ **不设约束**）
+    #    ⇒ 变异落在**无约束维度** ⇒ 语义守卫仍 PASS ⇒ 负例**空转**
+    #    ⇒ 期望「语义守卫 FAIL」落空 ⇒ 闸门假红（实测 N2 红）。
+    #    ⇒ 修法：**动态挑 REDUCE 方向的行**（挑不到就用**兜底夹具**自造一条）
+    #      ⇒ REDUCE 这一档**永远有人看守**，不再依赖生产数据碰巧有某个代码/方向。
     bad = json.loads(json.dumps(plan))
-    for conflict in bad["llm_conflicts"]:
-        if conflict["code"] == "512800":
-            conflict["llm_target_pct"] = 25.0
-    variants.append(("N2 目标权重 10%→25%（方向「减」）", bad))
+    _hit = 0
+    for conflict in bad.get("llm_conflicts") or []:
+        if str(conflict.get("llm_direction") or "") not in _REDUCE_DIRECTIONS:
+            continue
+        _cur = float(conflict.get("llm_current_pct") or 0.0)
+        conflict["llm_target_pct"] = _cur  # 「减」却不减到当前以下 ⇒ 自相矛盾
+        for view in conflict.get("all_divergent_views") or []:
+            if str(view.get("direction") or "") in _REDUCE_DIRECTIONS:
+                view["target_pct"] = _cur
+        _hit += 1
+    if not _hit and bad.get("llm_conflicts"):
+        # 兜底夹具：自造一条「减仓 + 目标 = 当前」⇒ 必被 REDUCE 档拦下
+        # （**不依赖生产数据恰好有 REDUCE 行**，否则该档会悄悄失去看守）。
+        bad["llm_conflicts"][0].update({
+            "llm_direction": "减仓", "llm_current_pct": 20.0, "llm_target_pct": 20.0,
+        })
+        _hit = 1
+    variants.append(("N2 REDUCE 方向 ⇒ 目标 ≥ 当前权重（说减却不减）", bad))
 
     # N3：凭空插入一条 LLM 原文里根本没有的冲突
     bad = json.loads(json.dumps(plan))
@@ -109,17 +168,31 @@ def _mutate_baseline(plan: dict) -> list[tuple[str, dict]]:
 
     # N4：方向被改写（「不买」→「买」，但目标权重还是 0% ⇒ 语义矛盾）
     bad = json.loads(json.dumps(plan))
-    for conflict in bad["llm_conflicts"]:
-        if conflict["code"] == "563020":
-            conflict["llm_direction"] = "买"
+    _hit = 0
+    for conflict in bad.get("llm_conflicts") or []:
+        if str(conflict.get("llm_direction") or "") not in _ZERO_DIRECTIONS:
+            continue
+        conflict["llm_direction"] = "买"
+        conflict["llm_target_pct"] = 0.0
+        _hit += 1
+    if not _hit and bad.get("llm_conflicts"):
+        bad["llm_conflicts"][0]["llm_direction"] = "买"
+        bad["llm_conflicts"][0]["llm_target_pct"] = 0.0
+        _hit = 1
     variants.append(("N4 方向「不买」→「买」（目标 0%）", bad))
 
     # N5：规则层权重被改（与 actions 不自洽）
+    #    🔴 2026-11-09 修：旧实现**写死 25.0** ⇒ 本轮 512800 的规则层权重**本来就是 25.0**
+    #    ⇒ 变异空转 ⇒ 可追溯守卫看不到任何改动 ⇒ 负例无牙。
+    #    ⇒ 修法：**在现值上加 5pp**（保证与 actions 重建值**必然不同**）。
     bad = json.loads(json.dumps(plan))
-    for conflict in bad["llm_conflicts"]:
-        if conflict["code"] == "512800":
-            conflict["rule_target_pct"] = 25.0
-    variants.append(("N5 规则层权重 20%→25%（与 actions 不一致）", bad))
+    for conflict in bad.get("llm_conflicts") or []:
+        try:
+            _cur = float(conflict.get("rule_target_pct"))
+        except (TypeError, ValueError):
+            _cur = 0.0
+        conflict["rule_target_pct"] = _cur + 5.0
+    variants.append(("N5 规则层权重 +5pp（与 actions 不一致）", bad))
 
     # N6：无 LLM 意见（--skip-ta 形态）⇒ 两条新断言**按设计**跳过
     bad = json.loads(json.dumps(plan))
@@ -133,7 +206,7 @@ def _mutate_baseline(plan: dict) -> list[tuple[str, dict]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="verify_artifacts 两条新断言的守卫自检")
-    parser.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    parser.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     parser.add_argument("--project-dir", default="/tmp/pycharm_project_658d3fc4")
     parser.add_argument("--keep", action="store_true", help="保留临时目录（默认结束即删）")
     args = parser.parse_args()
@@ -142,7 +215,7 @@ def main() -> int:
     project_dir = Path(args.project_dir)
     # 🔴 2026-11-04 夜实测修（M-F；reviewer 独立复核查出）：
     #    scratch 建在**官方产物目录里面** ⇒ 崩了留残留 + 密钥扫描会扫到 + 并发跑会撞。
-    #    ⇒ 改到 run-root 的**同级**目录（仍在 /mnt/data 下，不写 /tmp）。
+    #    ⇒ 改到 run-root 的**同级**目录（仍在持久盘上，不写 /tmp）。
     scratch = run_root.parent / "_probe_guards"
     if scratch.exists():
         shutil.rmtree(scratch)
@@ -173,6 +246,40 @@ def main() -> int:
 
     baseline_plan = json.loads((scratch / "final_rebalance_plan.json").read_text(encoding="utf-8"))
     plan_path = scratch / "final_rebalance_plan.json"
+
+    # 🔴 2026-11-09 修（Mode C v2 独立审计后补）：**适用性判据只查「决策文件在不在」是漏判**。
+    #    生产交付件是 `run_pipeline.sh --skip-ta` 跑出来的（`run_pipeline.sh:190` 把
+    #    `DECISION_ARG` 指向哨兵 `.no_llm_decision.md`）⇒ 计划里
+    #    `llm_final_decision.available=False`、`llm_targets={}`；
+    #    而产物目录里**躺着上一轮遗留的决策 md/json** ⇒ 老判据以为「有 LLM 层」
+    #    ⇒ 探针进 N9/N10 去取 `llm_targets["512800"]` ⇒ **KeyError 崩溃**（退出码 1）
+    #    ⇒ 被流水线当成「守卫已失效」误杀。
+    #    ⇒ 修法：适用性判据补「**计划里必须真嵌了 LLM 层**」⇒ 缺层 ⇒ 退出码 **2**
+    #      （沿用本探针既有的「不适用 ≠ 通过」语义，**不是**记成 PASS）。
+    _llm_final = baseline_plan.get("llm_final_decision") or {}
+    _llm_targets = baseline_plan.get("llm_targets") or {}
+    if not (_llm_final.get("available") is True or _llm_targets):
+        print("=" * 78)
+        print("[N/A] 守卫自检探针**不适用**：交付件里**没有 LLM 决策层**"
+              f"（llm_final_decision.available={_llm_final.get('available')!r}、"
+              f"llm_targets {len(_llm_targets)} 条）"
+              "⇒ 「方向-权重语义自洽 / 冲突表可追溯」这两条守卫**无从校验**。")
+        print("      **不适用 ≠ 通过**（流水线/闸门按退出码 2 显式跳过并明说）。")
+        print("=" * 78)
+        shutil.rmtree(scratch, ignore_errors=True)
+        return 2
+
+    def _pick_target_code(plan: dict) -> str | None:
+        """🔴 2026-11-09 修：N9/N10 原先**写死** `llm_targets["512800"]`
+        ⇒ 计划里没有 512800 的目标（LLM 裁决没提它）时直接 KeyError 崩溃。
+        ⇒ 改成「从 llm_targets 里挑一个**真有非零目标**的代码」（优先 512800）。
+        """
+        _targets = plan.get("llm_targets") or {}
+        for _code in ("512800", *sorted(_targets)):
+            _row = _targets.get(_code)
+            if isinstance(_row, dict) and (_row.get("target_pct") or 0):
+                return _code
+        return None
     lines: list[str] = []
     failures = 0
 
@@ -207,30 +314,46 @@ def main() -> int:
             f"冲突 {len(_base_conflicts)} 条｜带 llm_current_pct 的 {_n_with_cur} 条")
 
     # ---- N1~N6：故意做坏 ⇒ 对应断言必须 FAIL ----
-    # 期望**哪些断言要报 FAIL**（语义守卫, 可追溯守卫）
+    # 期望**哪些断言要报 FAIL**（语义守卫, 可追溯守卫, 是否校验全局退出码）
+    # 🔴 2026-11-10：加第三维「是否校验 exit」——
+    #    `:305`（旧行号）把两条守卫与**全局**退出码耦合 ⇒ **N6 永远不可能 PASS**：
+    #    N6 期望两条守卫都 PASS（--skip-ta 形态 ⇒ 按设计跳过），
+    #    但只要基线报告里**另一条无关断言**（实测 = 持仓诊断）FAIL，
+    #    整体退出码就仍是 1 ⇒ N6 被那条**与本用例无关**的红灯连坐。
+    #    ⇒ 只对 N6 关掉 exit 校验；**期望某条守卫 FAIL 时仍必须 exit ≠ 0**
+    #      （那半边保留牙 ⇒ 负例不许空转）。
     expectations = {
-        "N1": (True, True),
-        "N2": (True, True),
-        "N3": (False, True),
-        "N4": (True, True),
-        "N5": (False, True),
-        "N6": (False, False),   # --skip-ta 形态 ⇒ 两条断言按设计都 PASS
+        "N1": (True, True, True),
+        "N2": (True, True, True),
+        "N3": (False, True, True),
+        "N4": (True, True, True),
+        "N5": (False, True, True),
+        # --skip-ta 形态 ⇒ 两条断言按设计都 PASS ⇒ **不校验全局退出码**
+        "N6": (False, False, False),
     }
+    _base_json = json.dumps(baseline_plan, ensure_ascii=False, sort_keys=True)
     for tag, variant in _mutate_baseline(baseline_plan):
         key = tag.split(" ", 1)[0]
+        # 🔴 2026-11-09：负例必须**真的改坏了交付件**；改了等于没改 ⇒ 负例**无牙**
+        #    ⇒ 判 FAIL（而不是「守卫生效 ⇒ 探针坏了」这种误报）。
+        mutated = json.dumps(variant, ensure_ascii=False, sort_keys=True) != _base_json
         plan_path.write_text(json.dumps(variant, ensure_ascii=False, indent=2), encoding="utf-8")
         exit_code, verdicts = _run_verify(scratch, project_dir)
-        want_semantic, want_traceable = expectations[key]
+        want_semantic, want_traceable, check_exit = expectations[key]
         got_semantic = verdicts.get(CHECK_SEMANTIC)
         got_traceable = verdicts.get(CHECK_TRACEABLE)
         ok = (
-            got_semantic is (not want_semantic)
+            mutated
+            and got_semantic is (not want_semantic)
             and got_traceable is (not want_traceable)
-            and (exit_code != 0) is (want_semantic or want_traceable)
+            and (not check_exit or (exit_code != 0) is (want_semantic or want_traceable))
         )
         _record(ok, f"{tag} ⇒ 期望 语义守卫{'FAIL' if want_semantic else 'PASS'}"
-                    f" / 可追溯守卫{'FAIL' if want_traceable else 'PASS'}",
-                f"exit={exit_code}｜语义守卫={got_semantic}｜可追溯守卫={got_traceable}")
+                    f" / 可追溯守卫{'FAIL' if want_traceable else 'PASS'}"
+                    + ("" if check_exit else "（**不校验全局退出码**：--skip-ta 形态下"
+                       "全局退出码受**无关断言**连坐）"),
+                f"exit={exit_code}｜语义守卫={got_semantic}｜可追溯守卫={got_traceable}"
+                f"｜变异{'已生效' if mutated else '**未生效（负例无牙）**'}")
 
     # ---- G1 守卫词表必须**覆盖**解析器能产出的全部方向词（从正则里抽，不靠手抄）----
     # 🔴 2026-11-04 夜实测修（M-F；reviewer 独立复核查出）：
@@ -278,26 +401,42 @@ def main() -> int:
             "（期望 False：不确定 ≠ 确定新鲜）")
     meta_path.write_text(meta_backup, encoding="utf-8")
 
-    # ---- N9 英文方向词（Sell）配非零目标 ⇒ 语义守卫必须 FAIL ----
-    bad_en = json.loads(json.dumps(baseline_plan))
-    _v = bad_en["llm_targets"]["512800"]
-    _v["direction"] = "Sell"
-    _v["target_pct"] = 26.96
-    plan_path.write_text(json.dumps(bad_en, ensure_ascii=False, indent=2), encoding="utf-8")
-    exit_code, verdicts = _run_verify(scratch, project_dir)
-    en_ok = verdicts.get(CHECK_SEMANTIC) is False and exit_code != 0
-    _record(en_ok, "N9 英文方向词 Sell 配 26.96% ⇒ 语义守卫必须 FAIL（旧实现 PASS ⇒ 漏检）",
-            f"exit={exit_code}｜语义守卫={verdicts.get(CHECK_SEMANTIC)}"
-            "（期望 False：Sell 属 ZERO ⇒ 目标必须 0%）")
+    # ---- N9/N10 英文方向词 / 未分类方向词 ⇒ 语义守卫必须 FAIL ----
+    # 🔴 2026-11-09 修：取码**动态化**（原先写死 `llm_targets["512800"]` ⇒ 计划里没这个
+    #    代码就 KeyError 崩溃；现在「从 llm_targets 里挑一个真有非零目标的代码」）。
+    #    若**一个都没有** ⇒ 无从构造变异 ⇒ 显式判红并**整块跳过** N9/N10
+    #    （不许拿「未变异的计划」去跑负例 ⇒ 那会把负例变成假阳性）。
+    _probe_code = _pick_target_code(baseline_plan)
+    if _probe_code is None:
+        _record(False, "N9/N10 前置：llm_targets 里必须有带非零 target_pct 的代码（否则无从构造变异）",
+                f"llm_targets {len(baseline_plan.get('llm_targets') or {})} 条"
+                "｜期望 ≥1 条带非零 target_pct")
+        _record(False, "N9 英文方向词 Sell 配 26.96% ⇒ 语义守卫必须 FAIL（旧实现 PASS ⇒ 漏检）",
+                "**未执行**：前置不满足（无可变异的 llm_targets 条目）⇒ 不得记 PASS")
+        _record(False, "N10 未分类方向词 ⇒ 语义守卫必须 FAIL（无法校验 ≠ 可以放过）",
+                "**未执行**：前置不满足（无可变异的 llm_targets 条目）⇒ 不得记 PASS")
+    else:
+        # ---- N9 英文方向词（Sell）配非零目标 ⇒ 语义守卫必须 FAIL ----
+        bad_en = json.loads(json.dumps(baseline_plan))
+        _v = bad_en["llm_targets"][_probe_code]
+        _v["direction"] = "Sell"
+        _v["target_pct"] = 26.96
+        plan_path.write_text(json.dumps(bad_en, ensure_ascii=False, indent=2), encoding="utf-8")
+        exit_code, verdicts = _run_verify(scratch, project_dir)
+        en_ok = verdicts.get(CHECK_SEMANTIC) is False and exit_code != 0
+        _record(en_ok, f"N9 英文方向词 Sell 配 26.96% ⇒ 语义守卫必须 FAIL（旧实现 PASS ⇒ 漏检）"
+                      f"（变异代码 {_probe_code}）",
+                f"exit={exit_code}｜语义守卫={verdicts.get(CHECK_SEMANTIC)}"
+                "（期望 False：Sell 属 ZERO ⇒ 目标必须 0%）")
 
-    # ---- N10 未分类方向词 ⇒ 语义守卫必须 FAIL（不许静默放过）----
-    bad_unk = json.loads(json.dumps(baseline_plan))
-    bad_unk["llm_targets"]["512800"]["direction"] = "减持到三成"
-    plan_path.write_text(json.dumps(bad_unk, ensure_ascii=False, indent=2), encoding="utf-8")
-    exit_code, verdicts = _run_verify(scratch, project_dir)
-    unk_ok = verdicts.get(CHECK_SEMANTIC) is False and exit_code != 0
-    _record(unk_ok, "N10 未分类方向词 ⇒ 语义守卫必须 FAIL（无法校验 ≠ 可以放过）",
-            f"exit={exit_code}｜语义守卫={verdicts.get(CHECK_SEMANTIC)}（期望 False）")
+        # ---- N10 未分类方向词 ⇒ 语义守卫必须 FAIL（不许静默放过）----
+        bad_unk = json.loads(json.dumps(baseline_plan))
+        bad_unk["llm_targets"][_probe_code]["direction"] = "减持到三成"
+        plan_path.write_text(json.dumps(bad_unk, ensure_ascii=False, indent=2), encoding="utf-8")
+        exit_code, verdicts = _run_verify(scratch, project_dir)
+        unk_ok = verdicts.get(CHECK_SEMANTIC) is False and exit_code != 0
+        _record(unk_ok, f"N10 未分类方向词 ⇒ 语义守卫必须 FAIL（无法校验 ≠ 可以放过）（变异代码 {_probe_code}）",
+                f"exit={exit_code}｜语义守卫={verdicts.get(CHECK_SEMANTIC)}（期望 False）")
 
     # ---- N11/N12：F4（M-G）**成对对照实验**（守卫是安全件 ⇒ 两头都要测）----
     # 🔴 2026-11-04 夜实测修（M-G / F4，专题档 §21.4）：

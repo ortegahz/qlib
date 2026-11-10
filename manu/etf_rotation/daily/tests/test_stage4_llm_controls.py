@@ -7,7 +7,7 @@
 1. `daily_config.LLM_TIMEOUT` 默认 **5400** 秒（不再是 1800），env `ETF_ROTATION_LLM_TIMEOUT` 可覆盖；
 2. `main.py` 的 `--llm-timeout` / `--reasoning-effort` 两个 CLI 参数存在且缺省语义正确
    （`--reasoning-effort` 缺省空串 = **不覆盖**）；
-3. `agents_rebalance.run_mode_b` 的 `llm_timeout` 缺省**读 DC.LLM_TIMEOUT**（不写死 1800）；
+3. `agents_rebalance.run_pipeline` 的 `llm_timeout` 缺省**读 DC.LLM_TIMEOUT**（不写死 1800）；
 4. `reasoning_effort` 非空 ⇒ 子进程 env 里出现 `TRADINGAGENTS_REASONING_EFFORT`；
    `_env_with_dotenv` 的**合并顺序** = `.env` < 进程 env < 显式 overrides；
 5. 🔴 账户口径修复：`account_state.write_account_json` 导出的 JSON **必含**
@@ -99,21 +99,21 @@ def test_run_tradingagents_cli_exposes_new_args():
 
 
 # ---------------------------------------------------------------- 3. 超时缺省读配置
-def test_run_mode_b_timeout_defaults_to_dc_llm_timeout(monkeypatch):
-    """`run_mode_b` 不传 `llm_timeout` ⇒ 用 `DC.LLM_TIMEOUT`（**不是** 1800）。"""
+def test_run_pipeline_timeout_defaults_to_dc_llm_timeout(monkeypatch):
+    """`run_pipeline` 不传 `llm_timeout` ⇒ 用 `DC.LLM_TIMEOUT`（**不是** 1800）。"""
     monkeypatch.setattr(DC, "LLM_TIMEOUT", 5400.0)
     assert AR._resolve_llm_timeout(None) == 5400.0
     # 显式传入时以传入值为准
     assert AR._resolve_llm_timeout(123.0) == 123.0
 
 
-def test_run_mode_b_signature_has_no_hardcoded_1800():
-    """🔴 回归护栏：`run_mode_b` 的默认超时**不许**再写死 1800。"""
+def test_run_pipeline_signature_has_no_hardcoded_1800():
+    """🔴 回归护栏：`run_pipeline` 的默认超时**不许**再写死 1800。"""
     import inspect
 
-    sig = inspect.signature(AR.run_mode_b)
+    sig = inspect.signature(AR.run_pipeline)
     assert sig.parameters["llm_timeout"].default is None
-    assert "1800" not in inspect.getsource(AR.run_mode_b).split("llm_timeout")[1][:200]
+    assert "1800" not in inspect.getsource(AR.run_pipeline).split("llm_timeout")[1][:200]
 
 
 # ---------------------------------------------------------------- 4. reasoning_effort env
@@ -261,8 +261,8 @@ class _StopAtStage4(Exception):
     """在阶段 4 抓完命令后主动中断（避免真跑 LLM）。"""
 
 
-def _run_mode_b_until_stage4(tmp_path, monkeypatch, **kwargs):
-    """跑 ``run_mode_b`` 直到阶段 4 的 TA 调用（**不执行任何外部命令**）。"""
+def _run_pipeline_until_stage4(tmp_path, monkeypatch, **kwargs):
+    """跑 ``run_pipeline`` 直到阶段 4 的 TA 调用（**不执行任何外部命令**）。"""
     calls: list[dict] = []
 
     # 🔴 用一个**临时**的 TA 目录（含 .env）⇒ 不碰真 `.env`，也不依赖服务器上的现役值
@@ -274,7 +274,7 @@ def _run_mode_b_until_stage4(tmp_path, monkeypatch, **kwargs):
     monkeypatch.setattr(DC, "TRADINGAGENTS_DIR", ta_dir)
     monkeypatch.delenv("TRADINGAGENTS_REASONING_EFFORT", raising=False)
 
-    def _fake_run_cmd(cmd, *, step, timeout=None, env=None):
+    def _fake_run_cmd(cmd, *, step, timeout=None, env=None, **_kwargs):
         calls.append({"cmd": list(cmd), "step": step, "timeout": timeout, "env": env})
         if step == AR.STEP_TRADINGAGENTS:
             raise _StopAtStage4
@@ -282,7 +282,10 @@ def _run_mode_b_until_stage4(tmp_path, monkeypatch, **kwargs):
 
     monkeypatch.setattr(AR, "_run_cmd", _fake_run_cmd)
     monkeypatch.setattr(AR, "_refresh_scores", lambda **kw: None)
-    monkeypatch.setattr(AR, "_export_stock_prices", lambda asof, notes: None)
+    # 🔴 2026-11-09 修：`_export_stock_prices` 带 `out_dir` 形参（产物落盘目录）
+    #    ⇒ 桩必须跟着签名走，否则这里抛
+    #    `TypeError: got an unexpected keyword argument 'out_dir'` ⇒ 本文件 5 个用例全红。
+    monkeypatch.setattr(AR, "_export_stock_prices", lambda asof, notes, out_dir=None: None)
     monkeypatch.setattr(
         AR, "_resolve_analysis_asof",
         lambda **kw: {
@@ -290,16 +293,28 @@ def _run_mode_b_until_stage4(tmp_path, monkeypatch, **kwargs):
             "grid_last": "2026-11-04", "dataset_max_date": "2026-11-04", "notes": [],
         },
     )
-    monkeypatch.setattr(AR, "_stage_recommendation", lambda *a, **kw: None)
+    def _fake_run_rules_layer(run_path, notes, **kwargs):
+        """🔴 2026-11-09 修：规则层改成**在本快照内现跑**（``_run_rules_layer``）
+        ⇒ 桩仍要产出 ``rebalance_recommendation.json``（build_ta_context 的输入件）。
+        """
+        out = Path(run_path) / "rebalance_recommendation.json"
+        out.write_text(json.dumps({"recommendations": []}), encoding="utf-8")
+        notes.append(f"🧪 桩：规则层推荐件已产出：{out}")
+        return out
+
+    monkeypatch.setattr(AR, "_run_rules_layer", _fake_run_rules_layer)
+    # 🔴 快照根必须落在 tmp_path ⇒ 绝不往**唯一落点根**写真东西
+    monkeypatch.setattr(DC, "SNAPSHOT_ROOT", tmp_path / "snapshots")
 
     with pytest.raises(_StopAtStage4):
-        AR.run_mode_b(asof="2026-12-01", run_dir=tmp_path / "run", **kwargs)
+        AR.run_pipeline(asof="2026-12-01", run_dir=tmp_path / "run",
+                        live_trade=False, **kwargs)
     return calls
 
 
 def test_stage4_call_passes_account_json(tmp_path, monkeypatch):
     """🔴 阶段 4 的 TA 调用**必须**带 `--account-json`（实盘口径）。"""
-    calls = _run_mode_b_until_stage4(tmp_path, monkeypatch, refresh_scores=False)
+    calls = _run_pipeline_until_stage4(tmp_path, monkeypatch, refresh_scores=False)
     ta_call = next(c for c in calls if c["step"] == AR.STEP_TRADINGAGENTS)
     cmd = ta_call["cmd"]
     assert "--account-json" in cmd
@@ -312,13 +327,13 @@ def test_stage4_call_passes_account_json(tmp_path, monkeypatch):
 
 def test_stage4_call_timeout_is_5400_by_default(tmp_path, monkeypatch):
     """🔴 阶段 4 超时缺省 = 5400 秒（不再是 1800）。"""
-    calls = _run_mode_b_until_stage4(tmp_path, monkeypatch, refresh_scores=False)
+    calls = _run_pipeline_until_stage4(tmp_path, monkeypatch, refresh_scores=False)
     ta_call = next(c for c in calls if c["step"] == AR.STEP_TRADINGAGENTS)
     assert ta_call["timeout"] == 5400.0
 
 
 def test_stage4_call_timeout_overridable(tmp_path, monkeypatch):
-    calls = _run_mode_b_until_stage4(
+    calls = _run_pipeline_until_stage4(
         tmp_path, monkeypatch, refresh_scores=False, llm_timeout=1800.0
     )
     ta_call = next(c for c in calls if c["step"] == AR.STEP_TRADINGAGENTS)
@@ -327,7 +342,7 @@ def test_stage4_call_timeout_overridable(tmp_path, monkeypatch):
 
 def test_stage4_env_carries_reasoning_effort_override(tmp_path, monkeypatch):
     """`--reasoning-effort` ⇒ 子进程 env 里出现 `TRADINGAGENTS_REASONING_EFFORT`。"""
-    calls = _run_mode_b_until_stage4(
+    calls = _run_pipeline_until_stage4(
         tmp_path, monkeypatch, refresh_scores=False, reasoning_effort="medium"
     )
     ta_call = next(c for c in calls if c["step"] == AR.STEP_TRADINGAGENTS)
@@ -338,7 +353,7 @@ def test_stage4_env_carries_reasoning_effort_override(tmp_path, monkeypatch):
 
 def test_stage4_env_without_override_has_no_reasoning_effort(tmp_path, monkeypatch):
     """不指定 ⇒ 子进程 env 里是 **.env 的现役值**（不被本轮改写）。"""
-    calls = _run_mode_b_until_stage4(tmp_path, monkeypatch, refresh_scores=False)
+    calls = _run_pipeline_until_stage4(tmp_path, monkeypatch, refresh_scores=False)
     ta_call = next(c for c in calls if c["step"] == AR.STEP_TRADINGAGENTS)
     env = ta_call["env"]
     assert env is not None

@@ -15,7 +15,7 @@ A3 方向为「卖/清仓/不买」而目标格里**没有**百分比 ⇒ 目标
 A4 任何一行的目标权重**不得**等于该行理由栏里出现的百分比（除非它本来就是目标格）。
 
 【口径】
-只读：不写任何产物；用 /mnt/data/siping/runs/etf_rotation 下的真实决策 + 内联合成表。
+只读：不写任何产物；用**唯一落点根**下的真实决策（`<落点根>/runs`）+ 内联合成表。
 """
 from __future__ import annotations
 
@@ -30,19 +30,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import config as C  # noqa: E402  （落点常量单一事实源）
 import final_rebalance_plan as F  # noqa: E402
 import llm_final as LF  # noqa: E402
+import verify_artifacts as VA  # noqa: E402  （生产语义守卫 = 方向-权重判据的**单一事实源**）
 
 #: 运行根目录（**允许用环境变量覆盖** ⇒ 探针可以在**副本**上迭代，不碰官方产物）。
-#:    用法：`ETF_RUN_ROOT=/mnt/data/siping/runs/_probe_iter python manu/etf_rotation/probes/probe_llm_parser.py`
+#:    用法：`ETF_RUN_ROOT=<落点根>/runs/_probe_iter python manu/etf_rotation/probes/probe_llm_parser.py`
 #:    （官方流水线正在重写产物时，用副本迭代才不会读到半写状态、也不会互相打架。）
-RUN_ROOT = Path(os.environ.get("ETF_RUN_ROOT", "/mnt/data/siping/runs/etf_rotation"))
+RUN_ROOT = Path(os.environ.get("ETF_RUN_ROOT", str(C.ETF_RUN_ROOT)))
 #: 🔴 2026-11-04 夜实测修（M-F；reviewer 独立复核查出）：
 #:    探针自称「只读：不写任何产物」，实际把 5 个临时 md **写进官方产物目录** ⇒
 #:    ① 中途崩了就留残留；② `verify_artifacts` 的密钥扫描会把残留一起扫；
 #:    ③ 两个探针并发跑会撞同名文件。
-#:    ⇒ 改写到 run-root 的**同级**目录（仍在 /mnt/data 下，不写 /tmp）。
-SCRATCH = RUN_ROOT.parent / "_probe_llm_parser"
+#:    ⇒ 改写到**临时工作区** `<数据集根>/_work/`（仍在持久盘上，不写 /tmp、不写官方产物树）。
+SCRATCH = C.WORK_ROOT / "_probe_llm_parser"
 
 #: 金标：两份真实决策的冲突集合（code → (规则%, LLM%, 谁说的, 方向)）
 #: 🔴 数值来自 2026-11-04 夜实测产出（官方 final_rebalance_plan.json / scratch 同款），
@@ -256,27 +258,28 @@ def _conflicts(plan: dict, views: dict) -> dict:
     return out
 
 
-def _invariant_failures(plan: dict, views: dict) -> list[str]:
+def _invariant_failures(plan: dict, views: dict | None = None) -> list[str]:
     """冲突表**不变量**判定：返回违例描述列表（空 = 全部自洽）。
 
-    🔴 与决策文件的**措辞无关** ⇒ LLM 重跑换了说话人/换了句子也照样能守住；
-    🔴 但「方向=不买、目标=20%」这种**自相矛盾**必被抓出来（M-L 解析器真 bug 的症状）。
+    🔴 2026-11-10：**改为委托生产语义守卫**（`verify_artifacts._check_llm_direction_semantics`）
+       ⇒ 探针与生产**同一套判据**，杜绝「第三套独立漂移的口径」。
+
+    🔴 旧实现（探针自己写的一套）为什么是错的：
+       · 它拿**规则层 %** 当参照，写成「买 ⇒ 目标 ≥ 规则%」⇒ 把 LLM **合法表达**的
+         「买，但上限 10%（半档）」判成缺陷 ⇒ 2026-11-10 闸门假红
+         （实测本轮 515450 / 515650 两行：规则 20%、LLM 「买，但上限10%」）。
+       · 「减」那一档也该参照**当前权重**（生产口径），不是规则 %。
+       · 词表也比生产守卫窄 ⇒ 解析器能产出的方向词大半不受约束（漏检）。
+    ⇒ 正确判据（生产守卫 `verify_artifacts.py` 5 档，**以该行自己的当前权重为参照**）：
+       ZERO ⇒ 目标 = 0%；POS ⇒ 目标 > 0%；REDUCE ⇒ 目标 < 当前权重；
+       INCREASE ⇒ 目标 > 当前权重；NEUTRAL ⇒ 不设约束；**未分类方向词 ⇒ FAIL**。
+       （规则层 % 只回答「这条算不算分歧」，**不判定方向与数字是否自洽**。）
+
+    🔴 「不许放宽成永真」：本探针同时保留 **N-I1 真负例**（注入「不买 + 20%」⇒ 必须 FAIL），
+       即「原样交付件必须 PASS」＋「自相矛盾必须 FAIL」两头都有牙。
     """
-    bad: list[str] = []
-    for row in plan.get("llm_conflicts") or []:
-        direction = str(row.get("llm_direction") or "")
-        target = row.get("llm_target_pct")
-        rule = row.get("rule_target_pct")
-        if target is None or rule is None:
-            continue
-        if re.search(r"卖|清仓|清掉|不买|退出", direction):
-            if abs(float(target)) > 1e-9:
-                bad.append(f"{row.get('code')}: 方向「{direction}」但目标 {float(target):g}%（必须 0%）")
-        elif direction == "减" and float(target) >= float(rule):
-            bad.append(f"{row.get('code')}: 方向「减」但目标 {float(target):g}% >= 规则 {float(rule):g}%")
-        elif direction == "买" and float(target) < float(rule):
-            bad.append(f"{row.get('code')}: 方向「买」但目标 {float(target):g}% < 规则 {float(rule):g}%")
-    return bad
+    ok, detail = VA._check_llm_direction_semantics(plan)
+    return [] if ok else [detail]
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +324,21 @@ _ZERO_NOBUY_WORDS = ("不建仓", "不买入", "不买")
 #: 部分卖出（减仓）标记：**不是**零方向（目标权重另由「权重/目标」句给）
 _PARTIAL_WORDS = ("减仓", "减持", "减至", "减到", "压缩至", "压到", "下调至", "下调到")
 
+#: md 的强调/代码标记（LLM 常写「卖出约 **2,600份**」⇒ 动词与数量之间夹着 `**`）
+_MD_NOISE = r"[\s*`_~]*"
+
 #: 带数量的「卖出 N 份/股」= 部分卖出（**不是**清仓）
-_SELL_QTY_RE = re.compile(r"(?:卖出|卖掉|减掉)\s*(?:约)?\s*[\d,]+(?:\.\d+)?\s*(?:股|份)")
+#:    🔴 2026-11-10：与解析器 `llm_final._ACTION_RULES` ② **同口径**（探针与被测物必须一致）
+#:    —— ① 允许夹 markdown 强调标记；② 同样认「减持/减仓 + 数量」。
+_SELL_QTY_RE = re.compile(
+    r"(?:卖出|卖掉|减掉|减持|减仓)" + _MD_NOISE + r"(?:约)?" + _MD_NOISE
+    + r"[\d,]+(?:\.\d+)?" + _MD_NOISE + r"(?:股|份)")
+
+#: 否定标记（与解析器 `llm_final._NEG_MARKERS` **同口径** ⇒ 探针与被测物必须一致）
+_NEG_MARKERS = ("不是", "非", "不", "无需", "避免", "杜绝", "不予", "排除", "拒绝", "免于")
+
+#: 否定**作用域**的断点词（与解析器 `llm_final._SCOPE_BREAKERS` 同口径）
+_SCOPE_BREAKERS = ("但", "不过", "然而", "却", "反而", "而是", "改为", "转而")
 
 #: 买入类动作词（照抄解析器 `llm_final._ACTION_RULES`）
 _BUY_ACTION_RE = re.compile(
@@ -333,6 +349,13 @@ _BUY_ACTION_RE = re.compile(
 #:    🔴 与解析器的唯一差别：解析器还把裸「只有」算条件词；探针**不算**
 #:       （「只有 512800 保留，其余清仓」这种句子仍要能看出清仓 ⇒ 少判条件更安全）。
 _COND_WORDS = ("若", "如果", "假如", "倘若", "一旦", "除非", "只有当", "条件", "触发")
+
+#: 🔴 2026-11-09（Mode C v2 审计实证）：「**已触发**」是**既成事实**，不是条件。
+#:    与解析器 `llm_final._FACT_TRIGGER_RE` **同口径**（探针与被测物必须一致）：
+#:    实测：LLM 最终表写「| **159929** | **卖出** | 0% | 已触发持仓MA60强制退出 …」
+#:    ⇒ 旧口径把「触发」当条件词 ⇒ 这条**真裁决**被当成条件句跳过
+#:    ⇒ 三条清仓指令整条漏抽（落进 unparsed_codes）＋ 证据句被误判为条件句。
+_FACT_TRIGGER_RE = re.compile(r"(?:已|已经|均|皆|都|全部)?触发(?![后则时条])")
 
 #: 「否决 / 备选」类 ⇒ 子句里的清仓词**不是**本轮裁决（「清零方案 1 票对 2 票被否」）
 _REJECT_WORDS = ("方案", "被否", "否决", "不考虑", "未采纳", "备选")
@@ -385,14 +408,32 @@ def _md_table_codes(block: list[str]) -> set[str]:
 
 
 def _md_table_invariant(text: str) -> tuple[bool, str]:
-    """**表格块不变量**（A19② 的口径）：与「是哪一份 md」无关。
+    """**表格块不变量**（A19② 的口径）：判据依据是**与是哪一份 md 无关的结构不变量**。
 
-    ① 含代码的表格块 ≥2 个；
-    ② 同一个**代码集合**在 ≥2 个块里出现（多头表 + 空头表都在）；
-    ③ 该集合是所有块里**最大的**（不多不少 ⇒ 不能有多余的半个表）。
+    **前置**：含代码的表格块 ≥2 个。
 
-    ⇒ 能抓住的缺陷：`_tail` 把多头表腰斩 / 空头表整表切掉
-      ⇒ 最大代码集合只剩 1 次出现 ⇒ ② 失效（**不依赖任何行数阈值**）。
+    **两条判据**（2026-11-09 起生效；① 于 2026-11-10 **换判据**，理由见下面注释）：
+    ① **孤表**必须被「已重复代码集合」的**并集**覆盖
+       （⇒ 只出现 1 次、且含有重复集合里没有的代码的表格块 ⇒ FAIL）；
+    ② **≥2 个不同的代码集合**各出现 ≥2 次（⇒ 多头表 + 空头头表**都在**）。
+
+    ⇒ 两条判据能抓住的缺陷（**不依赖任何行数/代码阈值**）：
+      · **多头表腰斩 / 空头表整表切掉** ⇒ 重复出现的代码集合只剩 **1** 个
+        （多头表与空头表不再**成对出现**）⇒ **判据② 失效 ⇒ FAIL**；
+      · **多出一张含新代码的孤表** ⇒ 该表只出现 1 次、且它的代码不在重复集合的
+        并集里 ⇒ **判据① 失效 ⇒ FAIL**。
+
+    🔴 旧判据（③「重复出现的代码集合必须**同时是所有块里最大的**」）已被**替换**
+      （换掉的理由是**实测误红**，不是「比旧判据更强」）：
+      实测 2026-11-09 那一轮决策 md —— 多头表 / 空头表 / 研究经理三张表是
+      **同一个 9 代码集合**（出现 **3** 次），Trader 的最终表是 **10 代码集合**
+      （出现 **2** 次）⇒ 旧判据取「出现 3 次的 9 代码集合」当基准，
+      再看到「存在 10 代码的更大集合」⇒ 报「多出了半个表」
+      ⇒ **误红**（那一轮 md **并没有**半张表）。
+
+    ⇒ 判据只看**代码集合的重复次数**（不写死代码集合、不写死行数）
+      ⇒ LLM 换表格写法不误红，而真腰斩 / 真切表仍红
+      （`_tail` 侧的变异负例见 A19④）。
     """
     blocks = _md_table_blocks(text)
     coded = [b for b in blocks if _md_table_codes(b)]
@@ -404,18 +445,45 @@ def _md_table_invariant(text: str) -> tuple[bool, str]:
         counts[key] = counts.get(key, 0) + 1
     detail_sets = "；".join(
         f"{sorted(s)}×{c}" for s, c in sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0]))))
-    best = max(counts.values())
-    if best < 2:
-        return False, (f"没有任何代码集合在 ≥2 个表格块里重复出现"
-                       f"（各集合出现次数：{detail_sets}）")
-    chosen = max((s for s, c in counts.items() if c == best), key=len)
+    # 🔴 2026-11-09（Mode C v2 审计实证）**判据修正**：
+    #    旧写法把「**出现次数最多**的集合」与「**最大**集合」当成同一个 ⇒ 误红。
+    #    实测 2026-11-09 这一轮决策 md：多头/空头/研究经理三张表是**同一个 9 代码集合**
+    #    （出现 3 次），Trader 的最终表是**10 代码集合**（出现 2 次）
+    #    ⇒ 旧判据取「出现 3 次的 9 代码集合」当基准，再发现「存在 10 代码的更大集合」
+    #    ⇒ 报「多出了半个表」⇒ **误红**（这一轮 md **没有**半张表）。
+    #    ⇒ 判据（**与旧判据不同** —— 不是「更强」而是「不误红」，仍不写死代码/行数）：
+    #      ① **孤表**必须被「已重复代码集合」的**并集**覆盖；
+    #      ② **≥2 个不同的代码集合**各出现 ≥2 次（⇒ 多头表 + 空头表**都在**
+    #         ⇒ 任一张被腰斩/整表切掉 ⇒ 重复的集合就只剩 1 个 ⇒ 立刻 FAIL）。
+    #    ⇒ 判据仍能抓住 docstring 列出的两类缺陷（多头表腰斩 / 空头表整表切掉、
+    #      凭空多出含新代码的孤表），`_tail` 侧的**变异负例**见 A19④
+    #      （真负例 ⇒ 不许 vacuous 通过）。
+    # 🔴 2026-11-10（实测红灯）：判据① 从「**全局最大**集合必须重复」换成
+    #    「**孤表**必须被已重复集合的**并集**覆盖」。换判据的**事实依据**（不是「变松」）：
+    #    本轮决策 md（750 行 / 110 表格行 / 10 块 / 6 个代码集合）——
+    #    多头表（行 174-185）与空头表（行 430-436）**都在且完整**，
+    #    重复集合有 2 个（5 代码 ×4、15 代码 ×2 ⇒ 判据② PASS）；
+    #    而那张 **19 代码**的表是**研究经理「各标的操作意见」汇总表**（行 686-706）
+    #    = 上面两个重复集合的**并集** ⇒ 它**合法地只出现 1 次**
+    #    ⇒ 旧判据①（「全局最大集合必须重复」）⇒ **误红**。
+    #    ⇒ 新判据①：只出现 1 次的表，必须是重复集合并集的**子集**（汇总表合法）
+    #      —— 含并集里没有的新代码 ⇒ **孤表** ⇒ FAIL。
     max_size = max(len(s) for s in counts)
-    if len(chosen) != max_size:
-        return False, (f"重复出现的代码集合只有 {len(chosen)} 个代码，"
-                       f"但存在更大的表格块（{max_size} 个代码）⇒ 多出了半个表"
-                       f"（各集合出现次数：{detail_sets}）")
-    return True, (f"含代码的表格块 {len(coded)} 个｜最大代码集合 {len(chosen)} 个代码，"
-                  f"在 {best} 个块里重复出现｜各集合出现次数：{detail_sets}")
+    repeated_sets = [s for s, c in counts.items() if c >= 2]
+    if len(repeated_sets) < 2:
+        return False, (f"只有 {len(repeated_sets)} 个代码集合在 ≥2 个表格块里重复出现"
+                       f"（必须 ≥2 ⇒ 多头表与空头表都在；有一张被腰斩/切掉了）"
+                       f"｜各集合出现次数：{detail_sets}")
+    union = set().union(*repeated_sets) if repeated_sets else set()
+    orphans = [s for s, c in counts.items() if c == 1 and not set(s) <= union]
+    if orphans:
+        return False, (f"有 {len(orphans)} 张表含重复集合里没有的代码（孤表）"
+                       f"｜孤表代码集合={[sorted(s) for s in orphans]}"
+                       f"｜重复集合并集 {len(union)} 个代码｜各集合出现次数：{detail_sets}")
+    return True, (f"含代码的表格块 {len(coded)} 个｜最大代码集合 {max_size} 个代码"
+                  f"｜重复出现的代码集合 {len(repeated_sets)} 个"
+                  f"（并集 {len(union)} 个代码）｜孤表 0 张"
+                  f"｜各集合出现次数：{detail_sets}")
 
 
 def _md_table_structure(text: str) -> tuple[bool, str]:
@@ -514,8 +582,15 @@ def _md_sentences(text: str) -> list[str]:
 
 
 def _md_clauses(sentence: str) -> list[str]:
-    """按「，」切子句（照抄解析器 `llm_final._clause_spans` 的口径）。"""
-    return [c for c in re.split(r"[，,]", sentence or "") if c.strip()]
+    """按「，」切子句（照抄解析器 `llm_final._clause_spans` 的口径）。
+
+    🔴 2026-11-10 实测漂移：旧实现连 **半角逗号** 一起切 ⇒ 「卖出约 **2,600份**」
+       被切成「卖出约 **2」＋「600份**…」 ⇒ **千分位数字被腰斩**
+       ⇒ 「部分卖出」正则匹配不上 ⇒ 该子句被误判成**裸卖出（清仓）**
+       ⇒ 512800 被探针误判成「零方向」⇒ A20⑥ 假红。
+       ⇒ 解析器只切**全角**「，」（半角逗号留给千分位）⇒ 探针必须**逐字对齐**。
+    """
+    return [c for c in re.split(r"，", sentence or "") if c.strip()]
 
 
 def _md_codes_in(text: str) -> list[str]:
@@ -534,16 +609,47 @@ def _md_is_conditional(sentence: str) -> bool:
     if any(head.startswith(w) for w in ("若", "如果", "假如", "倘若", "一旦", "除非", "只有当")):
         return True
     probe = re.sub(r"有条件买入|条件买入|条件建仓|有条件建仓", "", head)
+    # 🔴 2026-11-09：抹掉「已/均/皆 + 触发」这类**既成事实**（与解析器同口径）
+    probe = _FACT_TRIGGER_RE.sub("", probe)
     first = re.split(r"[，,；;：:]", probe)[0]
     return any(w in first for w in _COND_WORDS)
+
+
+def _md_negated(text: str, pos: int, matched: str = "") -> bool:
+    """`pos` 处的动作词是否被否定（**子句级否定作用域**）。
+
+    🔴 2026-11-10 实测事故（A20⑥ 红灯）：LLM 写
+       「采纳本轮**战术性卖出、降低权益敞口**，但不把 `512800` 一次清仓」
+       ⇒ 旧口径只看动作词**前 4 个字**（「一次」）⇒ 否定词「不」落在窗口外
+       ⇒ 「清仓」被当成**清仓指令** ⇒ 512800 被误判成「零方向」。
+       ⇒ 与解析器 `llm_final._negated` **同口径**（子句级作用域 + 转折断点 + 代码断点）：
+          ① 动作词之前必须有否定标记（取最近的）；② 否定与动作词之间有转折词 ⇒ 管不到；
+          ③ 否定与动作词之间夹着别的代码、且子句里还有否定之前的代码 ⇒ 管不到；
+          ④ 动作词自带否定（「不买」「不建仓」）⇒ 本身就是零方向指令。
+    """
+    if matched and any(matched.startswith(m) for m in ("不", "非")):
+        return False
+    scope = text[:pos]
+    last = -1
+    for marker in _NEG_MARKERS:
+        idx = scope.rfind(marker)
+        if idx > last:
+            last = idx
+    if last < 0:
+        return False
+    if any(b in scope[last:] for b in _SCOPE_BREAKERS):
+        return False
+    codes = list(_CODE_RE.finditer(scope))
+    if any(c.start() > last for c in codes) and any(c.start() < last for c in codes):
+        return False
+    return True
 
 
 def _md_first_unnegated(text: str, words: tuple[str, ...]) -> str | None:
     """text 里第一个**没有被否定**的 words 里的词（「不清仓」「不是清零」不算）。"""
     for w in words:
         for m in re.finditer(re.escape(w), text or ""):
-            pre = (text or "")[max(0, m.start() - 4):m.start()]
-            if any(neg in pre for neg in ("不", "非", "未", "无", "别")):
+            if _md_negated(text or "", m.start(), m.group(0)):
                 continue
             return w
     return None
@@ -741,7 +847,9 @@ def main() -> int:
             # ---- I1~I4：冲突表**不变量**（与决策措辞无关 ⇒ LLM 重跑不会误杀） ----
             _rows = plan.get("llm_conflicts") or []
             _bad = _invariant_failures(plan, views)
-            check("I1 冲突表每行**方向-权重自洽**（零方向 ⇒ 0%；减 ⇒ <规则%；买 ⇒ ≥规则%）",
+            check("I1 冲突表每行**方向-权重自洽**"
+                  "（与生产语义守卫同口径：零方向⇒0%；买⇒>0%；减⇒<当前；增⇒>当前；"
+                  "未分类⇒FAIL）",
                   not _bad, f"异常 {len(_bad)} 条：{_bad[:4]}" if _bad else f"{len(_rows)} 行全部自洽")
             _expect = set()
             for _a in plan.get("actions") or []:
@@ -902,6 +1010,29 @@ def main() -> int:
               v14_512.get("current_pct") is not None
               and abs(float(v14_512.get("current_pct")) - 22.54) < 0.01,
               f"512800 current_pct={v14_512.get('current_pct')}")
+
+        # ---- A14b：🔴 2026-11-10（LLM 本轮实测写法）**方向词回归用例表** ----
+        #    本轮 LLM 在方向格里写了「**买：否**」（= 不买）⇒ 旧解析器
+        #    （最左匹配 + 长词优先）取到「买」⇒ 方向=买 + 目标 0%
+        #    ⇒ 交付件出现「**方向=买 / 目标=0%**」这种**自相矛盾**的行
+        #    ⇒ 交付件自带的语义守卫必然 FAIL（实测本轮 4 行：159207 / 512170 /
+        #    515450 / 515650）⇒ 根因在解析器的方向分类，**不在**探针。
+        #    ⇒ 这里把本轮的写法**沉淀成探针的方向词回归用例**（不许再退化）。
+        #    （探针只**读**解析器：`final_rebalance_plan.py` 由解析器 owner 修。）
+        _DIR_CASES = (
+            ("买：否", "不买"),   # 🔴 本轮 LLM 实测写法：买：否 = 不买
+            ("买", "买"),         # 阳性对照：正常买入方向必须仍然认得出
+            ("不买", "不买"),     # 阳性对照：否定式不买必须仍然认得出
+        )
+        _dir_bad = []
+        for _cell, _want in _DIR_CASES:
+            _got = F._classify_dir_cell(_cell)
+            if _got != _want:
+                _dir_bad.append(f"{_cell!r} → {_got!r}（期望 {_want!r}）")
+        check("A14b 方向词回归用例：「买：否」必须判成「不买」（LLM 本轮实测写法）",
+              not _dir_bad,
+              ("违例：" + "；".join(_dir_bad)) if _dir_bad
+              else "；".join(f"{_c!r}→{_want!r}" for _c, _want in _DIR_CASES) + " 全对")
 
         # ---- A15：🔴 2026-11-05 03:0x（M-L 修）**真 bug 回归** + M-N 加固 ----
         #    症状（2026-11-05 02:39 流水线第 8 步 FATAL，产物本身没问题）：
@@ -1208,9 +1339,13 @@ def main() -> int:
                   not _half,
                   f"表格行 {len(_md_rows)} 行｜残行 {len(_half)} 行：{_half[:2]}")
             # ② **表格块不变量**（**不写死代码集合、不写死行数**）：
-            #    含代码的表格块 ≥2 个 + 同一个代码集合在 ≥2 个块里出现（多头表 + 空头表都在）
-            #    + 该集合是所有块里最大的（不多不少 ⇒ 不能有多余的半个表）
-            #    ⇒ 能抓住：`_tail` 把多头表腰斩 / 空头表整表切掉（最大代码集合只剩 1 次出现）。
+            #    含代码的表格块 ≥2 个 + **最大**代码集合出现 ≥2 次
+            #    + **≥2 个不同的代码集合**各出现 ≥2 次（多头表 + 空头表都在）
+            #    ⇒ 能抓住：`_tail` 把多头表腰斩 / 空头表整表切掉
+            #      （⇒ 重复出现的代码集合只剩 1 个 ⇒ 「≥2 个不同集合各 ≥2 次」这条失效）。
+            #    🔴 旧判据（重复出现的集合必须**同时是所有块里最大的**）已在 2026-11-09
+            #      实测**误红**（9 代码集合 ×3 vs 10 代码集合 ×2）⇒ 判据与理由见
+            #      `_md_table_invariant` 的 docstring。
             _inv_ok, _inv_detail = _md_table_invariant(_md_text)
             check("A19② 官方决策 md 必须**同时含多头表与空头表**（表格块不变量，不写死代码/行数）",
                   _inv_ok, _inv_detail)
@@ -1299,9 +1434,15 @@ def main() -> int:
                   bool(_fin.get("available")),
                   f"available={_fin.get('available')}｜note={_fin.get('note')!r}")
             # ② 评级必须与决策原文逐字一致（回放）
-            _rm = re.search(r"\*\*Rating\*\*\s*[:：]\s*([^\n*]{1,40})", _md_all)
+            # 🔴 2026-11-09：LLM 有时把评级写成**裸**「Rating: Underweight」（无粗体）
+            #    ⇒ 旧正则只认 `**Rating**` ⇒ 判「原文没评级」⇒ 误红。
+            #    ⇒ 两种写法都认（粗体可有可无）。
+            # 🔴 2026-11-09 补：与被测物 `llm_final._RATING_RE` **同口径**加左词边界
+            #    （`(?<![A-Za-z])`）⇒ md 里若先出现「RiskRating:」这类**更长词**，
+            #    探针与产品抽到的必须是**同一个**评级值 ⇒ 否则 A20② 会因两边口径不同而误红。
+            _rm = re.search(r"\*{0,2}(?<![A-Za-z])Rating\*{0,2}\s*[:：]\s*([^\n*]{1,40})", _md_all)
             _rating_md = _rm.group(1).strip() if _rm else None
-            check("A20② 最终裁决评级必须与决策原文 `**Rating**` 逐字一致",
+            check("A20② 最终裁决评级必须与决策原文的 `Rating` 行逐字一致（粗体可有可无）",
                   bool(_rating_md) and _fin.get("rating") == _rating_md,
                   f"原文={_rating_md!r}｜计划={_fin.get('rating')!r}")
             # ③ **可回放**（不写死任何一个代码/百分数）：
@@ -1837,7 +1978,7 @@ def main() -> int:
         print("[N/A] N-I1 负例：计划件/决策件缺失 ⇒ 该负例**不适用**（不适用 ≠ 通过）")
 
     # 🔴 2026-11-04 夜实测修（M-F3；reviewer 指出探针把临时文件写进**官方 run-root**）：
-    #    临时目录已挪到 `RUN_ROOT.parent`（/mnt/data/siping/runs/_probe_llm_parser），
+    #    临时目录已挪到临时工作区（`<数据集根>/_work/_probe_llm_parser`），
     #    但旧收尾只 unlink **文件** ⇒ 目录残留 ⇒ 现在整体 rmtree。
     shutil.rmtree(SCRATCH, ignore_errors=True)
 

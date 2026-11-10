@@ -4799,3 +4799,28 @@ M-S3 收口后按 AGENTS.md 派 `reviewer` 子 agent 独立审 M-S2/M-S3 的全�
 ⇒ **教训**：`§十四.93` 第 2 条 ④ 写的「改了 memory 必须一起跑 `check_memory_tables.py`」**不是空话** ——
 本轮若不跑，缺陷会**静默进库**，而读者只会看到「表格少一列 / 多一列」的排版错乱，不会知道是哪个 cell 出了事。
 ⇒ **口径固化**：**新增/修改任何 memory 表格行后，先 `python3 manu/tools/check_memory_tables.py`，再同步、再重生成指纹表、再跑闸门**（顺序不可换）。
+
+---
+
+## 53. 2026-11-10 · 闸门假红三处修复 ＋ 全量闸门转绿（625 PASS / 0 失败 / rc=0）
+
+> 上一轮 `_gates_full_20261110b.log` = **618 PASS / 4 失败阶段 / rc=1**。两路独立诊断（结论互不冲突）后逐条修。
+> 🔴 **三条都是「探针口径」问题，生产逻辑一字未动**；主档记录见 `manu/memory/memory.md`（2026-11-10 条目）。
+
+### 53.1 诊断与修法（文件 : 行）
+
+| 红灯 | 根因 | 修法 | 验收 |
+|:--|:--|:--|:--|
+| P1 / P4 | `probes/probe_signal_feasibility.py:98-102` 日历查询窗**缺**生产口径那步「截到 `cal_end`」（`qlib_scores.py:572`）⇒ 期望栅格按**新**日历（末日 11-09）、断言对象是**旧**基线产物（末日 11-03）⇒ 两个 vintage；「末日例外」（`data/signal_policy.py:183-187`）再把 11-09 拉进栅格 ⇒ P1 只差末元素、P4 的 S1 假硬拦 | 日历窗补 `hi = max(SCORE_END_TIME, artifact_asof)`；`P4` 的 `qlib_calendar_max_date` 写死值 → `SP.calendar_max_date(QLIB_CALENDAR)`（S2 长回牙齿） | `20/20`；数据集回退到 10-30 ⇒ S1+S2 双报 ✓ |
+| I1 / N2 | `probes/probe_llm_parser.py` **自带第三套**方向-权重判据（拿**规则层 %** 当参照）⇒ 本轮 515450/515650「买，但上限 10%」被**误杀**；`probes/probe_verify_guards.py` 的 N2 写死 `512800` + `25.0` +「减」，而本轮该行方向是「持有」（NEUTRAL ⇒ 无约束）⇒ 负例**空转** | 探针 `_invariant_failures` **委托生产守卫** `VA._check_llm_direction_semantics`；N2 改**动态挑 REDUCE 行**（目标 = 当前权重）＋ 兜底夹具；方向词表取 `VA.LLM_DIRECTION_ZERO/REDUCE` | `76/76` ＋ `15/15`；原样交付件仍 PASS，N-I1/N1/N4/N9/N10 真负例**仍会红**（**不是**永真） |
+| A1 / A2 / A6 | **15/16 闸门直接跑信号日探针** ⇒ 探针红 ⇒ `die` ⇒ 流水线 rc=1 ⇒ A1/A6 红；日志 2 条 `[FAIL]` ⇒ A2 红（`run_pipeline.sh:378-381`） | **无独立修法** —— 15/16 转绿后自动转绿 | 单独跑 `probe_run_lock` **6/6**；全量闸门内 `EXITCODE probe_run_lock=0` |
+
+### 53.2 落盘与验收（本地优先铁律：本地改 → `sync_to_server.sh` → md5 双侧比对 → 服务器实跑）
+
+- 同步 **7 个文件**（3 个探针 ＋ `daily/main.py` / `daily/report.py` / `tools/overnight_snapshot_run.sh` / `tools/server_full_pipeline_run.sh`；后 4 个是**本地领先、服务器滞后**的文案口径）⇒ **md5 双侧逐字一致** ✅；
+- 三探针单跑：**20/20、76/76、15/15**，退出码全 0；
+- **全量闸门复跑** `_gates_full_20261110c.log`：**断言 PASS 625 行 / 失败阶段 0 / 跳过 1 / 不适用 0 / 退出码 0**（对照 618 / 4 / 1 / **rc=1**）；
+- 本轮交付：快照 `snapshots/20261110_143019/`（`mode=unified`、`live_trade=False`、**TA 已启用**、执行卡 `order_enabled=False` ＋ 水印「【观察态 · 挂单禁用 · 非实盘信号】」），
+  交付面报告 `reports/report_20261109.md`；买入 4 只（159207/512170/515450/515650）、卖出 1 只（512800）、调仓后现金 423.02 元；
+- 🔴 **EWMA 口径订正**：alpha=0.35 ⇒ **半衰期 1.61 个交易日**（需求文档写「3~5 日」，数学上不成立；3~5 日 ⇒ alpha ≈ 0.13~0.21）。默认值仍按文档取 0.35，**报告已显式披露**；
+- 痕迹清零（`rules.md §十六`）：`/tmp` 下 ETF 线 **35** 件 ＋ 共享目录 `siping/runs/` 下 **14** 个 ETF 专属散落目录**已删**；`/mnt/data` 根与 data 目录下**无** `_etf_daily_*`；别的项目**未碰**。

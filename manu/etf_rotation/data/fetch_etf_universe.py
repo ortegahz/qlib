@@ -7,7 +7,7 @@
    2) ``ak.fund_etf_category_ths(symbol="ETF基金")`` —— 同花顺 ETF 分类（粗类型 + 申购/赎回状态）
    3) ``ak.fund_name_em()``                     —— 东方财富全市场基金名录（细粒度基金类型，ETF 全覆盖）
 
-【产物】（落盘目录 ``--out-dir``，默认 ``/mnt/data/siping/datasets/etf``）
+【产物】（落盘目录 ``--out-dir``，默认 ``<落点根>/datasets/etf``）
    - ``etf_spot.csv``      快照原样落盘 + 补 ``exchange`` 列（SH/SZ/BJ）
    - ``etf_universe.csv``  候选池（硬门槛过滤 + 上限截断）
 
@@ -50,11 +50,19 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+#: 研究链根（`data/` 不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import config as C  # noqa: E402
+
 warnings.filterwarnings("ignore")
 
 import pandas as pd  # noqa: E402
 
-DEFAULT_OUT_DIR = "/mnt/data/siping/datasets/etf"
+#: ETF 数据集目录（落点 `<落点根>/datasets/etf`；与每日链 `daily_config.ETF_DATA_ROOT` 同源）
+DEFAULT_OUT_DIR = str(C.ETF_DATA_ROOT)
 
 # 刷新口径统一放在 refresh_policy.py（纯函数；**ql env 也能测**）
 sys.path.insert(0, str(Path(__file__).resolve().parent))

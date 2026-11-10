@@ -11,7 +11,7 @@
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_llm_stage_repro.py \
-        --run-root /mnt/data/siping/runs/etf_rotation
+        --run-root <落点根>/runs
     （省略 `--run-root` 时取 `config.ETF_RUN_ROOT`；退出码 0 = 全过，1 = 有 FAIL）
 
 【比什么】
@@ -78,8 +78,10 @@ LLM_SCRIPTS = (
 RENDER_SCRIPT = "manu/etf_rotation/llm/run_tradingagents.py"
 
 #: 探针自己的临时目录（**必须在 run-root 之外**：产物根只放交付件，见 rules.md）
-TMP_ROOT = Path("/mnt/data/siping/runs/_probe_llm_stage_tmp")
+TMP_ROOT = C.WORK_ROOT / "_probe_llm_stage_tmp"
 
+#: 快照根目录名（架构迁移后：交付件在 `<canonical>/snapshots/<stamp>/`，指纹表留在 canonical 根）
+SNAPSHOT_DIR_NAME = "snapshots"
 #: 交付件 / 指纹文件名
 DECISION_JSON = "tradingagents_decision.json"
 DECISION_MD = "tradingagents_decision.md"
@@ -314,11 +316,43 @@ def _parse_fingerprint(path: Path) -> dict[str, str]:
     return out
 
 
-def _check_fingerprint(run_root: Path, repo_root: Path) -> tuple[bool, str]:
+def _resolve_fingerprint_path(run_root: Path, explicit: str = "") -> Path:
+    """指纹表落点解析（🔴 架构迁移后指纹表**不在快照里**）。
+
+    指纹表 ``_ms5_md5.txt`` 是 **canonical 根**的「代码状态登记表」
+    （md5 段登记仓库脚本、sha1 段登记交付件基线）⇒ 它**不是**某一次运行的交付件
+    ⇒ 不在快照的 16 交付件清单里。
+    断言对象从 canonical 迁到「最新完整快照」之后，若只认 ``<run-root>/_ms5_md5.txt``
+    ⇒ P2 会以「指纹文件不存在」误红。
+
+    解析优先级：
+    ① ``--fingerprint-table`` 显式指定；
+    ② ``<run-root>/_ms5_md5.txt``（旧口径：run-root 本身就是 canonical 根）；
+    ③ run-root 在 ``<canonical>/snapshots/<stamp>/`` 下 ⇒ ``<canonical>/_ms5_md5.txt``；
+    ④ 兜底：``<run-root>/../_ms5_md5.txt``。
+    """
+    if explicit:
+        return Path(explicit)
+    direct = run_root / FINGERPRINT_FILE
+    if direct.is_file():
+        return direct
+    candidates: list[Path] = []
+    if run_root.parent.name == SNAPSHOT_DIR_NAME:
+        candidates.append(run_root.parent.parent / FINGERPRINT_FILE)
+    candidates.append(run_root.parent / FINGERPRINT_FILE)
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return direct
+
+
+def _check_fingerprint(run_root: Path, repo_root: Path, explicit: str = "") -> tuple[bool, str]:
     """P2：指纹文件登记了这两个 LLM 脚本，且 md5 与当前文件一致（漂移 ⇒ FAIL）。"""
-    fp_path = run_root / FINGERPRINT_FILE
+    fp_path = _resolve_fingerprint_path(run_root, explicit)
     if not fp_path.is_file():
-        return False, f"指纹文件不存在：{fp_path}"
+        return False, (f"指纹文件不存在：{fp_path}"
+                       f"（指纹表是**canonical 根**的代码状态登记表，"
+                       f"不在快照里；可用 --fingerprint-table 显式指定）")
     try:
         registry = _parse_fingerprint(fp_path)
     except OSError as exc:
@@ -335,7 +369,8 @@ def _check_fingerprint(run_root: Path, repo_root: Path) -> tuple[bool, str]:
             problems.append(f"{rel} 指纹漂移：登记 {declared} ≠ 当前文件 {actual}")
         else:
             notes.append(f"{rel} md5={actual}")
-    detail = "；".join(problems) if problems else "；".join(notes)
+    detail = ("；".join(problems) if problems
+              else f"指纹表 {fp_path}｜" + "；".join(notes))
     return (not problems), detail
 
 
@@ -577,7 +612,7 @@ def _mutate_context_sha1(payload: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- 主流程
-def run_checks(run_root: Path, repo_root: Path) -> list[tuple[str, str, bool, str]]:
+def run_checks(run_root: Path, repo_root: Path, fingerprint_table: str = "") -> list[tuple[str, str, bool, str]]:
     """跑全部断言 ⇒ 返回 (id, 名称, 是否通过, 细节) 列表。"""
     checker = Checker()
 
@@ -600,7 +635,7 @@ def run_checks(run_root: Path, repo_root: Path) -> list[tuple[str, str, bool, st
     ok, detail = _check_repo_scripts(repo_root)
     checker.add("P1", "LLM 脚本在 git 仓库里常驻（存在 / 非空 / 是文件）", ok, detail)
 
-    ok, detail = _check_fingerprint(run_root, repo_root)
+    ok, detail = _check_fingerprint(run_root, repo_root, fingerprint_table)
     checker.add("P2", "指纹文件登记了两个 LLM 脚本且 md5 与当前文件一致（漂移 ⇒ FAIL）",
                 ok, detail)
 
@@ -714,9 +749,11 @@ def main() -> int:
     """命令行入口：``--run-root`` 指向产物根。"""
     ap = argparse.ArgumentParser(description="LLM（TradingAgents）阶段可复现闸门")
     ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
+    ap.add_argument("--fingerprint-table", default="",
+                    help="指纹表路径（缺省：run-root 下 → canonical 根；指纹表不在快照里）")
     args = ap.parse_args()
 
-    items = run_checks(Path(args.run_root), REPO_ROOT)
+    items = run_checks(Path(args.run_root), REPO_ROOT, args.fingerprint_table)
     failed = [it for it in items if not it[2]]
     for check_id, name, ok, detail in items:
         print("[%s] %s %s" % ("PASS" if ok else "FAIL", check_id, name)

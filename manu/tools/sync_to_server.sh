@@ -73,9 +73,14 @@ EXCLUDES=(--exclude='__pycache__/' --exclude='*.pyc' --exclude='.pytest_cache/'
 md5_local() {
   # 用与 rsync 相同的排除规则算，保证两侧样本集一致
   local rel="$1"
+  # 🔴 2026-11-09 修：**必须与 rsync 的 EXCLUDES 完全一致** —— 原来漏了 `manu/report/`：
+  #    rsync 推送时排除 `manu/report/`（报告真值在服务器，host 那份是 pull 回来的），
+  #    而这里的 find **没排除** ⇒ 两侧样本集不同 ⇒ host 每多一份 pull 回来的报告
+  #    就被判成「不一致」（实测 2026-11-09：本地 131 / 服务器 130 ⇒ 假漂移）⇒ 铁律判据失真。
   ( cd "$SRC_REPO" && find "$rel" -type f \
       ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path '*/.pytest_cache/*' \
       ! -path '*/.ipynb_checkpoints/*' ! -name '*.swp' ! -name '.DS_Store' \
+      ! -path 'manu/report/*' ! -path '*/manu/report/*' \
       -print0 | LC_ALL=C sort -z | xargs -0 -r md5sum )
 }
 
@@ -108,9 +113,11 @@ echo "== [2/3] md5 双侧比对 =="
 FAIL=0
 for p in "${PATHS[@]}"; do
   local_sum=$(md5_local "$p")
+  # 🔴 排除规则必须与本地侧**逐字一致**（含 `manu/report/`）⇒ 两侧样本集才真的一致
   remote_sum=$(ssh "${SSH_BASE[@]}" "$SSH_HOST" "cd '$REMOTE_ROOT' && find '$p' -type f \
       ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path '*/.pytest_cache/*' \
       ! -path '*/.ipynb_checkpoints/*' ! -name '*.swp' ! -name '.DS_Store' \
+      ! -path 'manu/report/*' ! -path '*/manu/report/*' \
       -print0 | LC_ALL=C sort -z | xargs -0 -r md5sum" 2>/dev/null | grep -vE 'WARNING|store now|openssh.com|hostfile_replace|update_known')
 
   n_local=$(echo "$local_sum" | grep -c . || true)

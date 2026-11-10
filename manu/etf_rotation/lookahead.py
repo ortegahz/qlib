@@ -579,8 +579,20 @@ def rank_flip_robustness(
         🔴 **口径固定为极端档**（排序键 ``margin_extreme`` 降序）⇒ 回答的问题是
         「**按极端档上界，谁最难翻**」⇒ **不等于**「最终分差最近的那一对」。
         对外暴露为 ``same_theme_challengers``（历史口径，保持不变，向后兼容）。
+        🔴 2026-11-10（服务器实跑 20261110_120420 实证）：旧排序键
+           ``-(r.get("margin_extreme") or -1e9)`` 用了**真值兜底** ⇒
+           ① ``margin_extreme is None`` 的行被当成 −1e9（虽然排在最后，但**不是**真「不可得」）；
+           ② **``margin_extreme == 0.0`` 也被当成 −1e9** ⇒ 一个真实的 0 余量配对被踢到最后
+           ⇒ 与「``margin_extreme`` 降序」的文档口径**相反** ⇒ 闸门 L17「极端档余量未降序」红。
+           ⇒ 修法：**显式**把 ``None``（不可得）排最后，其余按数值降序（0.0 仍是真值）。
         """
-        return sorted(rows_, key=lambda r: -(r.get("margin_extreme") or -1e9))[:5]
+        def _key(r: dict) -> tuple:
+            me = r.get("margin_extreme")
+            if me is None:
+                return (1, 0.0)
+            return (0, -float(me))
+
+        return sorted(rows_, key=_key)[:5]
 
     def _closest_by_gap(rows_: list[dict]) -> list[dict]:
         """**最终分差最近**的一批配对（``|final_gap|`` 升序，取前 5）。
@@ -605,12 +617,20 @@ def rank_flip_robustness(
         口径：``margin_realistic`` 降序（余量越大 ⇒ 越难翻）；``margin_realistic``
         为 ``None``（该档上界不可得）的一律排在**最后**。
         回答的问题：「**在现实档上界下，谁最难翻**」⇒ 这是现实档的**最难翻**口径。
+        🔴 2026-11-10（服务器实跑 20261110_120420 实证）：旧排序键把 ``None`` 打成
+           ``(0, 0.0)``、把真值打成 ``(1, -mr)`` ⇒ **``None`` 反而排在最前**
+           ⇒ 与本函数 docstring「None 排最后」**正好相反** ⇒ 本轮报告把
+           「现实档余量最大」口径表首行点成**余量不可得（None）**的那一对，
+           而真正余量最大的是 −0.079164（512800/515020）⇒ 报告内部自相矛盾
+           （正文一处说「不可得」、另一处说「余量 −0.0792」）⇒ 闸门 L17 失败。
+           ⇒ 修法：``None`` 显式排**最后**（``(1, 0.0)``），真值按降序（``(0, -mr)``）。
+           ⚠️ ``None`` 的行**不许丢**（不许悄悄少报一行）⇒ 只是排到末尾。
         """
         def _key(r: dict) -> tuple:
             mr = r.get("margin_realistic")
             if mr is None:
-                return (0, 0.0)
-            return (1, -float(mr))
+                return (1, 0.0)
+            return (0, -float(mr))
 
         return sorted(rows_, key=_key)[:5]
 

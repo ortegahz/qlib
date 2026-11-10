@@ -10,7 +10,7 @@ akshare 的 `tool_trade_date_hist_sina()`（新浪）给出交易所公布的**�
 
 【用法】
     /home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/data/fetch_trade_calendar.py \
-        --out /mnt/data/siping/datasets/etf/trade_calendar.csv
+        --out <落点根>/datasets/etf/trade_calendar.csv
 """
 from __future__ import annotations
 
@@ -20,7 +20,15 @@ from pathlib import Path
 
 import pandas as pd
 
-DEFAULT_OUT = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+#: 研究链根（`data/` 不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import config as C  # noqa: E402  （落点常量单一事实源）
+
+#: 交易日历落盘位置（与每日链 `daily_config.TRADE_CALENDAR_CSV` 同源）
+DEFAULT_OUT = C.ETF_DATA_ROOT / "trade_calendar.csv"
 
 
 def fetch() -> pd.DataFrame:

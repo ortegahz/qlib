@@ -2,12 +2,14 @@
 
 【为什么全离线】
 报告渲染器是**纯函数**（不联网、不读行情、不 import qlib）⇒ 可以用**合成数据**
-把「缺字段」「破位」「调仓卡」三条路径都钉死，不依赖服务器上的任何产物。
+把「缺字段」「观察态」「实盘态」三条路径都钉死，不依赖服务器上的任何产物。
 
 【钉死的纪律】
 * 缺失字段渲染成「—」，整篇报告**不出现** ``None`` / ``nan`` 字样；
 * 百分比按小数口径渲染（``+3.93%``），金额带千分位（``30,035.57``）；
-* 模式 A 的「构造性保证」文案必须出现在报告里。
+* **观察态**（``live_trade=False``）的报告**不许**出现任何下单指令；
+* **实盘态**（``live_trade=True``）的挂单清单**一行都不许退化**；
+* Mode A/B/C 分诊**已下线** ⇒ ``"A"`` / ``"C"`` 必须抛 ``ValueError``（附迁移提示）。
 """
 from __future__ import annotations
 
@@ -26,113 +28,8 @@ import report  # noqa: E402
 # =============================================================================
 # 合成数据
 # =============================================================================
-def _mode_a_ok() -> dict:
-    """模式 A · 趋势完好（数值取自 2026-11-05 实测口径）。"""
-    return {
-        "mode": "A",
-        "asof": "2026-11-05",
-        "status": "ok",
-        "holding": {
-            "code": "512800",
-            "name": "银行ETF华宝",
-            "shares": 7700,
-            "cost_price": 0.8239,
-            "price": 0.866,
-            "market_value": 6668.20,
-            "pnl_pct": 0.0511,
-        },
-        "account": {
-            "snapshot_date": "2026-11-05",
-            "total_assets": 30035.57,
-            "cash": 23367.37,
-            "cash_weight": 0.778,
-            "market_value": 6668.20,
-            "market_value_weight": 0.222,
-            "discrepancy_note": "⚠️ 账户口径披露：用户口径里现价与市值相差 7.70 元，未做抹平。",
-        },
-        "ma": {
-            "code": "512800",
-            "close": 0.8740,
-            "close_date": "2026-11-05",
-            "ma20": 0.8650,
-            "ma60": 0.8410,
-            "above_ma20": True,
-            "above_ma60": True,
-            "distance_to_ma60_pct": 0.0393,
-            "safety_buffer_amount": 254.23,
-            "safety_buffer_pct": 0.0393,
-            "n_obs": 120,
-        },
-        "action": None,
-        "email_kind": "daily_ok",
-        "notes": [
-            "✅ 趋势完好，守纪律躺平：收盘 0.8740 高于 MA60 0.8410（安全垫 +3.93%）",
-            "🔴 模式 A 是构造性保证：路径内没有打分 / 选股 / LLM 调用",
-        ],
-        "generated_at": "2026-11-05T15:31:12",
-    }
-
-
-def _mode_a_broken() -> dict:
-    """模式 A · 跌破 MA60（触发紧急平仓）。"""
-    base = _mode_a_ok()
-    base["status"] = "broken"
-    base["ma"].update({
-        "close": 0.8000,
-        "ma60": 0.8410,
-        "above_ma60": False,
-        "distance_to_ma60_pct": -0.0487,
-        "safety_buffer_amount": -315.70,
-        "safety_buffer_pct": -0.0487,
-    })
-    base["action"] = {
-        "action": "紧急平仓",
-        "kind": "emergency_liquidation",
-        "code": "512800",
-        "name": "银行ETF华宝",
-        "shares": 7700,
-        "trigger_price": 0.8000,
-        "ma60": 0.8410,
-        "break_pct": -0.0487,
-        "reason": "收盘价 0.8000 有效跌破 MA60（0.8410），跌破幅度 -4.87%",
-        "instruction": "下一交易时段清掉 7700 股 银行ETF华宝（参考价 0.8000 元/股）",
-    }
-    base["email_kind"] = "emergency_break"
-    base["notes"] = [
-        "🔴 紧急避险：512800 收盘 0.8000 < MA60 0.8410（-4.87%）⇒ 已生成紧急平仓指令",
-    ]
-    return base
-
-
-def _mode_a_missing() -> dict:
-    """模式 A · 字段大面积缺失（样本不足 / 账户不完整）。"""
-    return {
-        "mode": "A",
-        "asof": "2026-11-05",
-        "status": "insufficient_data",
-        "holding": {"code": "512800"},
-        "account": {"snapshot_date": "2026-11-05"},
-        "ma": {
-            "code": "512800",
-            "close": None,
-            "close_date": None,
-            "ma20": None,
-            "ma60": None,
-            "above_ma20": None,
-            "above_ma60": None,
-            "distance_to_ma60_pct": None,
-            "safety_buffer_amount": None,
-            "safety_buffer_pct": None,
-            "n_obs": 0,
-        },
-        "action": None,
-        "notes": ["⚠️ 样本不足：MA60 需要 60 根收盘价，实际只有 0 根 ⇒ 不做破位判定"],
-        "generated_at": None,
-    }
-
-
-def _mode_b_result() -> dict:
-    """模式 B · 完整执行卡（数值取自 2026-11-04 dry 实测口径）。"""
+def _pipeline_result(live_trade: bool = False) -> dict:
+    """统一流水线 · 完整执行卡（数值取自 2026-11-04 dry 实测口径）。"""
     orders = [
         {
             "code": "512800", "name": "银行ETF华宝", "action": "卖出",
@@ -220,15 +117,21 @@ def _mode_b_result() -> dict:
         },
     }
     return {
-        "mode": "B",
+        "mode": "unified",
+        "live_trade": live_trade,
         "asof": "2026-11-04",
         "execution_date": "2026-11-05",
-        "run_dir": "/mnt/data/siping/runs/etf_rotation/daily/20261104",
-        "report_json": "/mnt/data/siping/runs/etf_rotation/daily/20261104/etf_analysis_report.json",
-        "plan_json": "/mnt/data/siping/runs/etf_rotation/daily/20261104/final_rebalance_plan.json",
-        "node_json": "/mnt/data/siping/runs/etf_rotation/daily/20261104/node_reprice_20261104.json",
+        "run_dir": "/mnt/data/siping/runs/etf_rotation_results/daily/20261104",
+        "snapshot": {
+            "root": "/mnt/data/siping/runs/etf_rotation_results/snapshots",
+            "path": "/mnt/data/siping/runs/etf_rotation_results/snapshots/20261104_160244",
+            "run_id": "20261104_160244",
+        },
+        "report_json": "/mnt/data/siping/runs/etf_rotation_results/daily/20261104/etf_analysis_report.json",
+        "plan_json": "/mnt/data/siping/runs/etf_rotation_results/daily/20261104/final_rebalance_plan.json",
+        "node_json": "/mnt/data/siping/runs/etf_rotation_results/daily/20261104/node_reprice_20261104.json",
         "card_json": (
-            "/mnt/data/siping/runs/etf_rotation/daily/20261104/execution_card_20261104.json"
+            "/mnt/data/siping/runs/etf_rotation_results/daily/20261104/execution_card_20261104.json"
         ),
         "card": card,
         "email_kind": "rebalance_card",
@@ -249,57 +152,13 @@ def _mode_b_result() -> dict:
 # =============================================================================
 # 测试
 # =============================================================================
-def test_mode_a_ok_report_says_lie_flat():
-    text = report.render_report(_mode_a_ok())
-    assert "None" not in text
-    assert "nan" not in text
-    assert "趋势完好，守纪律躺平" in text
-    assert "不产生任何买卖指令" in text
-    assert "## 均线安全带" in text
-    assert "## 账户卡片" in text
-    assert "## 数据口径与备注" in text
-
-
-def test_mode_a_ok_formats_pct_and_money():
-    text = report.render_report(_mode_a_ok())
-    assert "+3.93%" in text
-    assert "30,035.57" in text
-    assert "23,367.37" in text
-    assert "0.8740" in text
-    assert "254.23" in text
-
-
-def test_mode_a_broken_report_has_emergency_instruction():
-    text = report.render_report(_mode_a_broken())
-    assert "已跌破 MA60，需紧急平仓" in text
-    assert "紧急平仓" in text
-    assert "0.8000" in text
-    assert "7700" in text
-    assert "-4.87%" in text
-
-
-def test_mode_a_missing_fields_render_placeholder():
-    text = report.render_report(_mode_a_missing())
-    assert "样本不足，不做破位判定" in text
-    assert "—" in text
-    assert "None" not in text
-    assert "nan" not in text
-
-
-def test_mode_a_account_uses_account_argument_as_fallback():
-    result = _mode_a_ok()
-    result["account"] = {"snapshot_date": "2026-11-05"}
-    text = report.render_report(result, account=_mode_a_ok()["account"])
-    assert "30,035.57" in text
-    assert "23,367.37" in text
-
-
-def test_mode_b_report_has_all_sections():
-    text = report.render_report(_mode_b_result())
+def test_unified_report_has_all_sections():
+    text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
     assert "None" not in text
     assert "nan" not in text
     for header in (
         "# ETF 月度调仓决策卡",
+        "## 快照与运行口径",
         "## 执行摘要",
         "## 六阶段流水线状态",
         "## 买入清单",
@@ -316,8 +175,8 @@ def test_mode_b_report_has_all_sections():
         assert stage in text, stage
 
 
-def test_mode_b_discloses_score_date():
-    text = report.render_report(_mode_b_result())
+def test_unified_report_discloses_score_date():
+    text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
     assert "打分日 = 2026-11-03" in text
     assert "qlib 数据集覆盖末日 = 2026-11-03" in text
     assert "18,215.70" in text
@@ -327,8 +186,8 @@ def test_mode_b_discloses_score_date():
     assert "10,001.00" in text
 
 
-def test_mode_b_shows_cap_note_and_ordering():
-    text = report.render_report(_mode_b_result())
+def test_unified_report_shows_cap_note_and_ordering():
+    text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
     # capped=True ⇒ cap_note 必须出现
     assert "单只上限 6000.00 元" in text
     # 买入单在买入清单、卖出单在卖出清单
@@ -340,20 +199,121 @@ def test_mode_b_shows_cap_note_and_ordering():
     assert "563020" not in sell_section
 
 
-def test_mode_b_card_missing_does_not_crash():
-    result = _mode_b_result()
+def test_unified_report_card_missing_does_not_crash():
+    result = _pipeline_result(live_trade=True)
     result["card"] = None
-    text = report.render_report(result)
+    text = report.render_report(result, live_trade=True)
     assert "没有执行卡" in text
     assert "None" not in text
     assert "nan" not in text
 
 
 def test_unknown_mode_raises():
+    """🔴 2026-11-09：Mode A/B/C 分诊**已下线** ⇒ ``"A"`` / ``"C"`` 与乱填的
+    ``"X"`` 一样是**非法值**；错误文案必须给**迁移提示**（不许写「未知模式」）。"""
+    for bad in ("A", "C", "X"):
+        with pytest.raises(ValueError) as excinfo:
+            report.render_report({"mode": bad})
+        message = str(excinfo.value)
+        assert "未知模式" not in message
+        assert "--live-trade" in message
+        assert "--full" in message
+    # 结果里根本没有 mode ⇒ 同样非法（统一流水线只有一种模式）
     with pytest.raises(ValueError):
-        report.render_report({"mode": "C"})
+        report.render_report({})
     with pytest.raises(TypeError):
         report.render_report(None)  # type: ignore[arg-type]
+
+
+def test_legacy_mode_b_alias_is_treated_as_unified():
+    """旧别名 ``"B"`` 兼容 ⇒ 视作 unified（不抛异常）。"""
+    text = report.render_report(_pipeline_result(live_trade=True), mode="B")
+    assert "# ETF 月度调仓决策卡" in text
+
+
+def test_observation_mode_report_marks_order_disabled():
+    """🔴 观察态（``live_trade=False``）的报告**不许**出现任何下单指令。
+
+    实测事故（2026-11-06）：观察态报告里渲染出了
+    「## 挂单清单（次日开盘人工执行）」＋「按本表在券商 App 手工挂单」
+    ⇒ 顶部有警示块也没用（有人会单独截取那张表）⇒ 违反「**结构性不可下单**」。
+    """
+    text = report.render_report(_pipeline_result(live_trade=False), live_trade=False)
+    assert "观察态" in text
+    assert "挂单禁用" in text
+    assert "挂单清单" not in text
+    assert "手工挂单" not in text
+    assert "券商 App" not in text
+    assert "观察清单" in text
+    assert "不可下单" in text
+
+
+def test_live_trade_report_renders_order_instructions():
+    """🔴 零回归：实盘态的**真**挂单清单必须原样保留（一行都不许退化）。"""
+    text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
+    assert "## 挂单清单（次日开盘人工执行）" in text
+    assert "按本表在券商 App 手工挂单" in text
+    assert "观察清单" not in text
+    assert "观察态" not in text
+    # 清单内容本身（含方向与股数）不许退化
+    order_section = text.split("## 挂单清单（次日开盘人工执行）")[1]
+    assert "563020" in order_section
+    assert "512800" in order_section
+    assert "+4900" in order_section
+    assert "-900" in order_section
+
+
+def test_observation_mode_report_has_no_legacy_mode_c_wording():
+    """🔴 防回归：观察态报告**不许**再出现 Mode A/B/C 时代的旧词。"""
+    text = report.render_report(_pipeline_result(live_trade=False), live_trade=False)
+    for banned in ("MODE C", "影子", "shadow", "模式 C", "Mode C", "影子推演"):
+        assert banned not in text, banned
+
+
+def test_report_discloses_snapshot_and_live_trade():
+    """🔴 快照目录 / live_trade 必须**显式披露**（缺 ⇒「—」，不许编造）。"""
+    result = _pipeline_result(live_trade=False)
+    text = report.render_report(result, live_trade=False)
+    assert result["snapshot"]["path"] in text
+    assert "快照目录" in text
+    assert "live_trade" in text
+    # 结果里没有 live_trade 字段 ⇒ 披露成「—」（不猜）
+    bare = _pipeline_result(live_trade=False)
+    bare.pop("live_trade")
+    bare.pop("snapshot")
+    bare_text = report.render_report(bare, live_trade=False)
+    assert "| live_trade | — |" in bare_text
+    assert "| 快照目录 | — |" in bare_text
+
+
+def test_report_ranking_basis_is_copied_from_result():
+    """🔴 排序依据口径**照抄 result 里的真实值**（不许写死常量）。"""
+    result = _pipeline_result(live_trade=True)
+    result["score_smoothing"] = {
+        "ranking_basis": "EWMA 平滑分（alpha=0.35，窗口 5 交易日）",
+    }
+    text = report.render_report(result, live_trade=True)
+    assert "排序依据：EWMA 平滑分（alpha=0.35，窗口 5 交易日）" in text
+
+    # 只有原始参数（没有 ranking_basis）⇒ 照抄参数拼口径
+    result2 = _pipeline_result(live_trade=True)
+    result2["score_smoothing"] = {"method": "ewma", "window": 5, "alpha": 0.35}
+    text2 = report.render_report(result2, live_trade=True)
+    assert "排序依据：5 日 EWMA 平滑分（alpha=0.35）" in text2
+
+    # 没有该字段 ⇒ 「—」（不编造）
+    text3 = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
+    assert "排序依据：—" in text3
+
+
+def test_observation_mode_report_missing_values_render_placeholder():
+    result = _pipeline_result(live_trade=False)
+    result.pop("snapshot")
+    result["generated_at"] = None
+    text = report.render_report(result, live_trade=False)
+    assert "—" in text
+    assert "None" not in text
+    assert "nan" not in text
 
 
 def test_write_report_creates_parent_dir(tmp_path: Path):
@@ -361,3 +321,31 @@ def test_write_report_creates_parent_dir(tmp_path: Path):
     written = report.write_report("# hello\n", out)
     assert written.exists()
     assert written.read_text(encoding="utf-8") == "# hello\n"
+
+
+# =============================================================================
+# 排序依据口径（2026-11-10：交付面报告表头的「排序依据」不许渲染成「—」）
+# =============================================================================
+def test_ranking_basis_reads_score_smoothing_ranking_basis() -> None:
+    """🔴 回归：result 带了 `score_smoothing` ⇒ 表头必须显示**真实**排序口径。
+
+    🔴 旧行为：pipeline 的 result **不带** `score_smoothing`
+    ⇒ `daily/report.py::_ranking_basis()` 找不到 ⇒ 渲染成「—」
+    ⇒ 用户在交付面报告表头看不到「排序依据」⇒ 与铁律「口径必须显式」相悖。
+    """
+    result = {
+        "score_smoothing": {
+            "enabled": True,
+            "method": "ewma",
+            "alpha": 0.35,
+            "window": 5,
+            "ranking_basis": "EWMA 平滑分（alpha=0.35，窗口 5 交易日）",
+        },
+    }
+
+    assert report._ranking_basis(result) == "EWMA 平滑分（alpha=0.35，窗口 5 交易日）"
+
+
+def test_ranking_basis_missing_is_placeholder_not_invented() -> None:
+    """没有平滑段 ⇒ 渲染「—」（**不许编造**口径）。"""
+    assert report._ranking_basis({}) == report.PLACEHOLDER

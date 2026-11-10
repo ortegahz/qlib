@@ -1,4 +1,4 @@
-"""test_agents_rebalance.py —— 双轨模式与执行卡的**离线**自测。
+"""test_agents_rebalance.py —— 统一流水线与执行卡的**离线**自测。
 
 🔴 **完全离线**：不联网、不跑研究链、不调 LLM、不写仓库内任何文件；
    价格与账户全部用**合成数据**（``tmp_path``）⇒ 本机与服务器都能跑同一套断言。
@@ -7,12 +7,14 @@
 
 1. ``compute_ma_levels``：MA20/MA60 数值正确、**只用 asof 之前的数据**（禁未来函数）、
    样本不足 ⇒ ``ma60 is None``；
-2. ``run_mode_a``：未破位 ⇒ ``status == "ok"`` 且 ``action is None``；破位 ⇒
-   ``status == "broken"`` 且给出清仓指令；**返回值里没有任何新仓位动作**；
+2. ``run_pipeline``：**唯一**入口（Mode A/B/C 分诊已下线）⇒ 只有一条流水线；
 3. ``build_execution_card``：整手向下取整、单只金额上限、货基碎屑过滤、
    现金缓冲守卫、卖出含印花税；
-4. ``mode_router.route``：2026-12-01 ⇒ B、2026-11-20 ⇒ A 且处于静默防守；
-5. ``build_run_dir`` / ``log_path``：路径前缀与建目录行为。
+4. 🔴 **观察态 / 实盘态二态**：``live_trade=False``（缺省）⇒ 执行卡**挂单禁用**；
+   ``live_trade=True`` ⇒ 不带禁用标记（可下单）；
+5. 🔴 **无「模式」概念**：`mode_router` / `calendar_gate` 都**不许**再有 mode API；
+   当日口径只给**事实**（是否信号日 / 执行日 / 静默防守），**不带 mode 键**；
+6. ``build_run_dir`` / ``log_path``：路径前缀与建目录行为。
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ if str(_DAILY) not in sys.path:
     sys.path.insert(0, str(_DAILY))
 
 import agents_rebalance as AR  # noqa: E402
+import calendar_gate as CG  # noqa: E402
 import daily_config as DC  # noqa: E402
 import mode_router as MR  # noqa: E402
 
@@ -38,12 +41,6 @@ def _price_frame(closes: list[float], code: str = "512800") -> pd.DataFrame:
     """造一段合成日线（工作日连续，无跳空）。"""
     dates = pd.bdate_range(start="2026-08-03", periods=len(closes))
     return pd.DataFrame({"code": [code] * len(closes), "date": dates, "close": closes})
-
-
-def _write_prices_csv(path: Path, closes: list[float], code: str = "512800") -> Path:
-    frame = _price_frame(closes, code=code)
-    frame.to_csv(path, index=False)
-    return path
 
 
 def _all_strings(obj: object):
@@ -113,82 +110,26 @@ def test_compute_ma_levels_insufficient_data():
     assert ma["ma20"] is not None
 
 
-# ---------------------------------------------------------------- 2. 模式 A
-def test_run_mode_a_ok(tmp_path):
-    """趋势完好 ⇒ status == "ok" 且 action 必须是 None。"""
-    closes = [1.0 + i * 0.01 for i in range(60)]
-    csv_path = _write_prices_csv(tmp_path / "prices.csv", closes)
+# ---------------------------------------------------------------- 2. 统一流水线入口
+def test_run_pipeline_is_the_only_entry_point():
+    """🔴 2026-11-09：Mode A/B/C 分诊**已下线** ⇒ 只剩 ``run_pipeline`` 一条入口，
+    且 ``live_trade`` 缺省 **False**（= 观察态 ⇒ 挂单禁用）。"""
+    import inspect
 
-    result = AR.run_mode_a(asof="2026-11-20", prices_csv=csv_path)
-
-    assert result["mode"] == "A"
-    assert result["asof"] == "2026-11-20"
-    assert result["status"] == "ok"
-    assert result["action"] is None
-    assert result["email_kind"] == "daily_ok"
-    assert result["ma"]["above_ma60"] is True
-    assert result["holding"]["code"] == DC.PRIMARY_HOLDING_CODE
-    assert result["holding"]["shares"] == DC.PRIMARY_HOLDING_SHARES
-
-
-def test_run_mode_a_broken(tmp_path):
-    """破位 ⇒ status == "broken" 且给出清仓指令（股数 / 触发价 / MA60 / 跌破幅度）。"""
-    closes = [1.0] * 59 + [0.8]
-    csv_path = _write_prices_csv(tmp_path / "prices.csv", closes)
-
-    result = AR.run_mode_a(asof="2026-11-20", prices_csv=csv_path)
-
-    assert result["status"] == "broken"
-    assert result["email_kind"] == "emergency_break"
-    action = result["action"]
-    assert action is not None
-    assert action["action"] == "紧急平仓"
-    assert action["shares"] == DC.PRIMARY_HOLDING_SHARES
-    assert action["trigger_price"] == pytest.approx(0.8)
-    assert action["ma60"] == pytest.approx(sum(closes) / 60)
-    assert action["break_pct"] < 0
-
-
-def test_run_mode_a_insufficient_data(tmp_path):
-    """样本不足 ⇒ insufficient_data，且**不**产生任何动作。"""
-    closes = [1.0 + i * 0.01 for i in range(10)]
-    csv_path = _write_prices_csv(tmp_path / "prices.csv", closes)
-
-    result = AR.run_mode_a(asof="2026-11-20", prices_csv=csv_path)
-
-    assert result["status"] == "insufficient_data"
-    assert result["action"] is None
-    assert result["email_kind"] == "daily_ok"
-
-
-def test_run_mode_a_never_produces_new_position_action(tmp_path):
-    """🔴 模式 A 是**构造性保证**：返回值里不允许出现任何新仓位动作。"""
-    ok_csv = _write_prices_csv(tmp_path / "ok.csv", [1.0 + i * 0.01 for i in range(60)])
-    broken_csv = _write_prices_csv(tmp_path / "broken.csv", [1.0] * 59 + [0.8])
-
-    for csv_path in (ok_csv, broken_csv):
-        result = AR.run_mode_a(asof="2026-11-20", prices_csv=csv_path)
-        for text in _all_strings(result):
-            assert "买" not in text, f"模式 A 出现了新仓位动作：{text}"
-        assert not result.get("orders")
-        if result["status"] == "ok":
-            assert result["action"] is None
-
-
-def test_run_mode_a_writes_artifact(tmp_path):
-    csv_path = _write_prices_csv(tmp_path / "prices.csv", [1.0 + i * 0.01 for i in range(60)])
-    run_dir = tmp_path / "run"
-    result = AR.run_mode_a(asof="2026-11-20", prices_csv=csv_path, run_dir=run_dir)
-    artifact = Path(result["artifact"])
-    assert artifact.exists()
-    assert artifact.name == "mode_a_20261120.json"
+    assert hasattr(AR, "run_pipeline")
+    assert not hasattr(AR, "run_mode_a"), "Mode A 已死"
+    assert not hasattr(AR, "run_mode_b"), "Mode B 已死"
+    sig = inspect.signature(AR.run_pipeline)
+    assert sig.parameters["live_trade"].default is False
 
 
 # ---------------------------------------------------------------- 3. 执行卡片
 def _card(actions, **kwargs):
     account = kwargs.pop("account", {"total_assets": 30035.57, "cash": 23367.37})
+    live_trade = kwargs.pop("live_trade", False)
     return AR.build_execution_card(
-        actions=actions, account=account, asof="2026-12-01", execution_date="2026-12-02", **kwargs)
+        actions=actions, account=account, asof="2026-12-01", execution_date="2026-12-02",
+        live_trade=live_trade, **kwargs)
 
 
 def test_card_shares_floor_to_lot():
@@ -291,22 +232,78 @@ def test_card_missing_fields_become_none_with_warning():
     assert any("cash" in w for w in card["warnings"])
 
 
-# ---------------------------------------------------------------- 4. 模式路由
-def test_route_signal_date_is_mode_b():
-    result = MR.route("2026-12-01")
-    assert result["date"] == "2026-12-01"
-    assert result["mode"] == "B"
-    assert result["execution_date"] == DC.NEXT_EXECUTION_DATE
-    assert result["is_silent_defense"] is False
-    assert "2026-12-01" in result["reason"]
+def test_card_observation_mode_is_order_disabled():
+    """🔴 观察态（``live_trade=False``，缺省）⇒ 执行卡**带挂单禁用标记**。"""
+    card = _card(
+        [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
+          "price": 1.0, "target_amount": 1000.0}],
+        live_trade=False,
+    )
+    assert card["live_trade"] is False
+    assert card["order_enabled"] is False
+    assert card["disabled"] is True
+    assert card["observation_only"] is True
+    assert "挂单禁用" in card["watermark"]
+    assert "不可下单" in card["notice"]
+    for order in card["orders"]:
+        assert order["disabled"] is True
+        assert order["order_enabled"] is False
+    # 🔴 观察卡**正文**也不许教人下单（只有「挂单禁用」这种否定表述可以出现）
+    for text in _all_strings(card):
+        assert "券商" not in text, text
+        assert "挂单" not in text or "挂单禁用" in text, text
 
 
-def test_route_normal_day_is_mode_a_and_silent():
-    result = MR.route("2026-11-20")
-    assert result["mode"] == "A"
-    assert result["is_silent_defense"] is True
-    assert result["execution_date"] is None
-    assert result["run_dir"].endswith("20261120")
+def test_card_live_trade_mode_has_no_order_disabled_marker():
+    """🔴 实盘态（``live_trade=True``）⇒ 执行卡**不带**禁用标记（可下单）。"""
+    card = _card(
+        [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
+          "price": 1.0, "target_amount": 1000.0}],
+        live_trade=True,
+    )
+    assert card["live_trade"] is True
+    assert card["order_enabled"] is True
+    assert card.get("disabled") is not True
+    assert card.get("observation_only") is not True
+    for order in card["orders"]:
+        assert order.get("disabled") is not True
+        assert order.get("order_enabled") is not False
+
+
+# ---------------------------------------------------------------- 4. 无「模式」概念
+# 🔴 2026-11-09（需求 1：删除 Mode C、精简到**单一**流水线）：
+#    旧版这里钉的是「模式路由」（2026-12-01 ⇒ B、2026-11-20 ⇒ A）。
+#    模式分诊已整体下线 ⇒ 改为钉住**新契约**：代码里不许再有 mode API，
+#    且「是否信号日 / 执行日 / 静默防守」这些**事实**必须仍然算得出来。
+
+
+def test_no_mode_routing_api_anywhere():
+    """mode_router / calendar_gate 都**不许**再暴露「模式」概念。"""
+    assert not hasattr(MR, "route"), "mode_router 不许再有 route()（模式分诊已下线）"
+    for name in ("MODE_A", "MODE_B"):
+        assert not hasattr(CG, name), f"calendar_gate 不许再有 {name}"
+    for name in ("resolve_mode", "describe_mode"):
+        assert not hasattr(CG, name), f"calendar_gate 不许再有 {name}()"
+
+
+def test_describe_day_signal_date():
+    """信号日的当日口径：**只有事实，没有 mode 键**。"""
+    desc = CG.describe_day("2026-12-01")
+    assert "mode" not in desc, "当日口径不许再带 mode 键"
+    assert desc["date"] == "2026-12-01"
+    assert desc["is_signal_date"] is True
+    assert desc["execution_date"] == DC.NEXT_EXECUTION_DATE
+    assert desc["is_silent_defense"] is False
+    assert "2026-12-01" in desc["reason"]
+
+
+def test_describe_day_normal_day_is_silent():
+    """普通日的当日口径。"""
+    desc = CG.describe_day("2026-11-20")
+    assert "mode" not in desc
+    assert desc["is_signal_date"] is False
+    assert desc["is_silent_defense"] is True
+    assert desc["execution_date"] is None
 
 
 # ---------------------------------------------------------------- 5. 目录 / 日志
@@ -325,11 +322,11 @@ def test_build_run_dir_and_log_path(tmp_path, monkeypatch):
     assert log.parent.is_dir()
 
 
-def test_route_does_not_create_directories(tmp_path, monkeypatch):
+def test_date_helpers_do_not_create_directories(tmp_path, monkeypatch):
+    """🔴 纯判定不许写磁盘（「看一眼就把磁盘写满」的老毛病）。"""
     monkeypatch.setattr(DC, "RUN_ROOT", tmp_path / "runs")
-    result = MR.route("2026-12-01")
+    assert MR.normalize_date("2026-12-01") == "2026-12-01"
     assert not (tmp_path / "runs").exists()
-    assert result["run_dir"] == str(tmp_path / "runs" / "20261201")
 
 
 # ---------------------------------------------------------------- 6. 执行卡落盘

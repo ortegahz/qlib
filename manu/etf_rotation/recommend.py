@@ -4,7 +4,7 @@
     export PYTHONHASHSEED=0
     python manu/etf_rotation/recommend.py --asof 2026-11-03 \
         --holdings "510300:0.5,518880:0.5" \
-        --out-dir /mnt/data/siping/runs/etf_rotation
+        --out-dir <落点根>/runs
 
 `--holdings` 传**当前持仓权重**（可省略；省略则视为空仓 ⇒ 全部是买入）。
 不传当前持仓时脚本只给「目标组合」，不产生买卖差额。
@@ -28,6 +28,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as C  # noqa: E402
+import score_smoothing as SS  # noqa: E402
 from engine.features import load_prices  # noqa: E402
 from engine.portfolio import build_portfolio, load_universe  # noqa: E402
 from engine.weights import load_holdings  # noqa: E402
@@ -53,6 +54,17 @@ def parse_args() -> argparse.Namespace:
                    help="同族内「已持有品种优先」：1=开（默认 config.THEME_PREFER_HELD），0=关")
     p.add_argument("--entry-ma-window", type=int, default=None, help="入场破位过滤均线（0=关）")
     p.add_argument("--exit-ma-window", type=int, default=None, help="持仓强制退出均线（0=关）")
+    # ---- 🔴 穿透分时间平滑（与 analyze.py **同名同默认**，少一个就分叉）----
+    p.add_argument("--no-smoothing", action="store_true",
+                   help="关闭穿透分时间平滑（排序退回单日瞬态分；默认开启）")
+    p.add_argument("--smoothing-method", default=None, choices=list(SS.SMOOTHING_METHODS),
+                   help="平滑方法：ewma（默认）/ rolling")
+    p.add_argument("--smoothing-window", type=int, default=None,
+                   help="滚动窗口（交易日；默认 5）")
+    p.add_argument("--smoothing-alpha", type=float, default=None,
+                   help="EWMA 系数（默认 0.35）")
+    p.add_argument("--smoothing-history-days", type=int, default=None,
+                   help="EWMA 预热历史跨度（交易日；默认 30）")
     return p.parse_args()
 
 
@@ -97,6 +109,26 @@ def main() -> int:
         print(f"[INFO] 风控刹车检查：净值 {nav:.4f} / 峰值 {peak:.4f} ⇒ 回撤 {dd:+.2%} "
               f"（阈值 -{C.DRAWDOWN_BRAKE_THRESHOLD:.0%}）⇒ {'🚨 刹车 ON：切防守资产' if in_brake else '正常'}")
 
+    # ---- 🔴 穿透分时间平滑：参数与 analyze.py **同名同默认** ----
+    #    🔴 这里不自己算平滑表：由引擎走
+    #    `score_smoothing.build_alpha_override`（与 analyze.py 同一个函数、
+    #    同一份输入文件）⇒ 规则层与交付层**同源**。
+    smoothing_config = SS.SmoothingConfig(
+        enabled=(not args.no_smoothing) and bool(C.ENABLE_SCORE_SMOOTHING),
+        method=args.smoothing_method or C.SMOOTHING_METHOD,
+        window=(
+            C.SMOOTHING_WINDOW if args.smoothing_window is None else int(args.smoothing_window)
+        ),
+        alpha=(
+            C.SMOOTHING_ALPHA if args.smoothing_alpha is None else float(args.smoothing_alpha)
+        ),
+        history_span_days=(
+            C.SMOOTHING_HISTORY_SPAN_DAYS
+            if args.smoothing_history_days is None
+            else int(args.smoothing_history_days)
+        ),
+    ).validated()
+
     result = build_portfolio(
         asof=asof,
         prices=prices,
@@ -110,6 +142,17 @@ def main() -> int:
         exit_ma_window=args.exit_ma_window,
         prefer_held_in_theme=(None if args.prefer_held_in_theme is None
                               else bool(args.prefer_held_in_theme)),
+        smoothing_config=smoothing_config,
+    )
+    smoothing_diag = result.get("score_smoothing") or {}
+    if smoothing_diag.get("warning"):
+        print(f"[WARN] {smoothing_diag['warning']}")
+    print(
+        f"[INFO] 穿透分平滑：{'关闭' if not smoothing_config.enabled else smoothing_config.method}"
+        f"｜窗口 {smoothing_config.window} 交易日｜alpha {smoothing_config.alpha}"
+        f"｜观测日 {smoothing_diag.get('n_observation_dates')} 个"
+        f"（{', '.join(smoothing_diag.get('observation_dates') or []) or '无'}）"
+        f"｜退化成瞬态分 {smoothing_diag.get('n_codes_fallback_transient')} 只"
     )
 
     # ---- 落盘 ----
@@ -123,6 +166,8 @@ def main() -> int:
                 "defensive_mode": result["defensive_mode"],
                 "brake_mode": result.get("brake_mode", False),
                 "pool_mode": result.get("pool_mode"),
+                # 🔴 平滑口径审计（规则层自己算的那一份 ⇒ 可与交付层对账）
+                "score_smoothing": smoothing_diag,
                 "nav_state": nav_state,
                 "relaxed_absolute_momentum_filter": result["relaxed_absolute_momentum_filter"],
                 "rebalance_every_n_days": C.DEPLOYED_REBALANCE_EVERY_N_DAYS,

@@ -1,22 +1,26 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""「三项分歧组合矩阵」产物闸门探针（M-S6 新增）。
+"""「分歧组合矩阵」产物闸门探针（M-S6 新增）。
 
 【用途】
-把 `manu/etf_rotation/make_decision_scenarios.py` 生成的 8 行情景矩阵
-（`decision_scenarios_<label>.json/md`）变成**可执行的闸门**：
+把 `manu/etf_rotation/make_decision_scenarios.py` 生成的 2^N 行情景矩阵
+（`decision_scenarios_<label>.json/md`，N = 分歧项个数）变成**可执行的闸门**：
 脚本在仓库里常驻、生成器跑得通、**两次运行逐字节相同**（幂等）、
-8 行情景与 5 条自洽断言齐全、A/A/A 情景现金与 `final_rebalance_plan.json` 对齐、
+2^N 行情景与 5 条自洽断言齐全、A/A/A 情景现金与 `final_rebalance_plan.json` 对齐、
 与 `decision_options_<label>.json` 逐项对账、且与已交付产物**逐字节一致**（漂移即 FAIL）。
+
+🔴 **分歧项个数 / 情景数一律不写死**：N 与期望情景数（2^N）都从**交付件 payload**
+    动态取（「全 A」组合标签也按产物里的分歧码顺序动态拼）⇒ 分歧项换人时
+    探针不用改，也不会与新产物错配。
 
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_decision_scenarios.py \
-        --run-root /mnt/data/siping/runs/etf_rotation
+        --run-root <落点根>/runs
     （退出码 0 = 全过，1 = 有 FAIL，2 = 环境错）
 
 【为什么需要】
-`decision_options_20261105.md` 只给「每项各自选 A 还是 B」，**缺「三项一起选」时的账户后果**
+`decision_options_<label>.md` 只给「每项各自选 A 还是 B」，**缺「多项一起选」时的账户后果**
 （期末现金 / 权益 / 破单席 / 可执行性）。本探针保证那份矩阵
 ① 不会被静默改坏、② 不会与 `final_rebalance_plan.json` 脱节、③ 不会与 options 表脱节。
 
@@ -24,9 +28,9 @@
 P1  生成器脚本在仓库里常驻（存在 / 非空 / 是文件）
 P2  生成器跑通：退出码 0 且日志里 5 条「断言 N: PASS」齐全
 P3  幂等：两次独立运行产出的 json / md **逐字节**相同
-P4  产物结构完整：必备顶层键齐全、8 个情景、5 条断言全 PASS、notes / disclaimer 非空
+P4  产物结构完整：必备顶层键齐全、情景数 = 2^N、5 条断言全 PASS、notes / disclaimer 非空
 P5  A/A/A 情景期末现金 == `final_rebalance_plan.json` 的 `cash_flow.cash_end`（容差 0.01 元）
-P6  **独立重算**：8 行情景的现金 / 权益 / 总资产由 plan.json 手推，与产物逐项一致（容差 0.01 元）；
+P6  **独立重算**：全部情景的现金 / 权益 / 总资产由 plan.json 手推，与产物逐项一致（容差 0.01 元）；
     分歧标的的落地股数也**从上游输入推导**（选项 A = 规则层 `target_shares`；
     选项 B = LLM 最终裁决的方向 / 保留手数 / 目标权重），**不写死常量**；
     且现金均不为负、情景间总资产最大偏差 ≤ 全部费用之和
@@ -56,6 +60,9 @@ while not (REPO_ROOT / "manu" / "etf_rotation" / "make_decision_scenarios.py").i
         break
     REPO_ROOT = REPO_ROOT.parent
 GENERATOR = REPO_ROOT / "manu" / "etf_rotation" / "make_decision_scenarios.py"
+
+sys.path.insert(0, str(REPO_ROOT / "manu" / "etf_rotation"))
+import config as C  # noqa: E402  （落点常量单一事实源）
 
 #: 成本口径（与 `final_rebalance_plan.json` 的 cash_flow 同源）
 FEE_RATE_ONE_WAY = 0.00065
@@ -92,6 +99,50 @@ def load_json(path: Path, label: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"{label}顶层必须是 JSON 对象：{path}")
     return payload
+
+
+def divergence_codes_of(payload: dict) -> list[str]:
+    """从 `decision_scenarios_*.json` 的 payload 取**分歧码集合**（按产物里的顺序）。
+
+    🔴 取值优先级：`meta.divergence_codes` → 顶层 `divergence_items` 的键 →
+       各情景 `choices` 的键（按首次出现顺序）。
+       **不写死任何具体代码、不写死分歧项个数** ⇒ 分歧项换人时探针不用改。
+    """
+    meta_codes = (payload.get("meta") or {}).get("divergence_codes")
+    if isinstance(meta_codes, (list, tuple)) and meta_codes:
+        return [str(code) for code in meta_codes]
+    items = payload.get("divergence_items")
+    if isinstance(items, dict) and items:
+        return [str(code) for code in items]
+    codes: list[str] = []
+    for item in payload.get("scenarios") or []:
+        for code in (item.get("choices") or {}):
+            if str(code) not in codes:
+                codes.append(str(code))
+    return codes
+
+
+def all_a_label(codes: list[str]) -> str:
+    """「全 A」组合标签：按产物里的分歧码顺序拼接（**不写死任何具体代码**）。"""
+    return ",".join(f"{code}=A" for code in codes)
+
+
+def all_a_scenario(scenarios: list[dict], expect_label: str = "") -> dict | None:
+    """找「全部选项都是 A」的那个情景（2^N 组合里唯一）。
+
+    先按**动态标签**（`expect_label`，按产物里的分歧码顺序拼）匹配；
+    标签形态对不上时退回**语义匹配**（choices 里全是 A）⇒ 既不依赖写死的标签串，
+    也不依赖标签的书写格式。
+    """
+    if expect_label:
+        for item in scenarios or []:
+            if str(item.get("label") or "") == expect_label:
+                return item
+    for item in scenarios or []:
+        choices = dict(item.get("choices") or {})
+        if choices and all(letter == "A" for letter in choices.values()):
+            return item
+    return None
 
 
 def recompute_scenario(plan: dict, choices: dict) -> tuple[float, float, float, float]:
@@ -221,10 +272,15 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
     plan = load_json(plan_path, "final_rebalance_plan.json")
     options = load_json(options_path, f"decision_options_{label}.json")
     delivered = load_json(scenarios_path, f"decision_scenarios_{label}.json")
+    #: 分歧码集合 / 期望情景数：**从交付件 payload 动态取**（N 个分歧项 ⇒ 2^N 情景）
+    #: 🔴 不写死 8 / 16 / 3 / 4 ⇒ 分歧项换人时探针不用改，也不会与新产物错配。
+    ref_codes = divergence_codes_of(delivered)
+    expected_scen = 2 ** len(ref_codes)
+    aaa_label = all_a_label(ref_codes)
 
     tmp_parent = run_root.parent
     if not str(tmp_parent).startswith("/mnt/data/"):
-        tmp_parent = Path("/mnt/data/siping/runs")
+        tmp_parent = C.WORK_ROOT
     tmp_root = tmp_parent / "_scen_probe_tmp"
 
     def run_generator(out_dir: Path) -> tuple[int, str]:
@@ -280,8 +336,17 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
             if key not in fresh:
                 p4_problems.append(f"缺顶层键 {key}")
         scen_list = fresh.get("scenarios", [])
-        if len(scen_list) != 8:
-            p4_problems.append(f"情景数 {len(scen_list)} ≠ 8")
+        #: 新鲜产物里的分歧码集合（逐情景 choices 的键去重）
+        fresh_codes = sorted({c for item in scen_list for c in (item.get("choices") or {})})
+        if not ref_codes:
+            p4_problems.append("交付件里推不出分歧码集合（无法确定期望情景数 2^N）")
+        else:
+            if len(scen_list) != expected_scen:
+                p4_problems.append(
+                    f"情景数 {len(scen_list)} ≠ 2^{len(ref_codes)} = {expected_scen}")
+            if fresh_codes != sorted(ref_codes):
+                p4_problems.append(
+                    f"新鲜产物的分歧码集合 {fresh_codes} ≠ 交付件 {sorted(ref_codes)}")
         assertions = fresh.get("assertions", [])
         if len(assertions) != 5:
             p4_problems.append(f"断言数 {len(assertions)} ≠ 5")
@@ -293,27 +358,36 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
         if not fresh.get("disclaimer"):
             p4_problems.append("disclaimer 为空")
         p4_ok = not p4_problems
-        checker.add("P4", "产物结构完整（必备键 / 8 情景 / 5 断言全 PASS / notes / disclaimer）",
+        checker.add("P4", "产物结构完整（必备键 / 情景数 = 2^N / 5 断言全 PASS / notes / disclaimer）",
                     p4_ok, "；".join(p4_problems) if p4_problems
-                    else f"顶层键 {len(need_top)} 项、情景 {len(scen_list)} 个、断言 {len(assertions)} 条全 PASS")
+                    else f"顶层键 {len(need_top)} 项、情景 {len(scen_list)} 个"
+                         f"（= 2^{len(ref_codes)} = {expected_scen}）、"
+                         f"断言 {len(assertions)} 条全 PASS")
 
         # --- P5 A/A/A 现金 == plan.cash_flow.cash_end ---
-        aaa = None
-        for item in scen_list:
-            if item.get("label") == "511880=A,512800=A,563020=A":
-                aaa = item
-                break
+        # 🔴 2026-11-09 修（Mode C v2 独立审计后补）：原来**写死**标签
+        #    「全 A」组合标签串 ⇒ 分歧标的集合一变（本轮 LLM 裁决不同 ⇒
+        #    分歧项就换人）就「找不到 A/A/A 情景」⇒ **假红**。
+        #    ⇒ 改成**动态找「全部选项都是 A」的情景**（2^N 情景 ⇒ 唯一）
+        #      ⇒ 断言强度不变（仍要求 A/A/A 现金 == plan.cash_flow.cash_end），
+        #        但不再依赖「分歧恰好是这几只」。
+        aaa = all_a_scenario(scen_list, aaa_label)
         p5_ok = False
-        p5_detail = "找不到 A/A/A 情景"
+        p5_detail = "找不到 A/A/A 情景（全部选项都是 A 的那一个）"
         if aaa is not None:
             expect = float(plan["cash_flow"]["cash_end"])
             diff = abs(float(aaa["cash_end"]) - expect)
             p5_ok = diff < 0.01
-            p5_detail = f"情景 {aaa['cash_end']:.6f} vs plan {expect:.6f}｜差 {diff:.10f} 元（容差 0.01）"
+            p5_detail = (f"情景「{aaa.get('label')}」期末现金 {float(aaa['cash_end']):.6f} "
+                         f"vs plan {expect:.6f}｜差 {diff:.10f} 元（容差 0.01）")
         checker.add("P5", "A/A/A 情景期末现金 == final_rebalance_plan.json 的 cash_flow.cash_end", p5_ok, p5_detail)
 
         # --- P6 独立重算（现金 / 权益 / 总资产）+ 非负现金 + 费用上界 ---
-        p6_problems = []
+        # 🔴 2026-11-09 修：情景为空时 P6/P7 会「零违例 ⇒ PASS」而 detail 谎报
+        #    「全部情景手推全对」⇒ 空洞通过。⇒ 空情景必须 FAIL。
+        _scen_missing = ([] if scen_list else
+                         ["新鲜生成的场景集合为空（生成器未产出 ⇒ 一条情景都没核对）"])
+        p6_problems = list(_scen_missing)
         totals = []
         fee_sum = 0.0
         for item in scen_list:
@@ -334,18 +408,17 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
             p6_problems.append(f"情景总资产最大偏差 {spread:.6f} > 费用之和 {fee_sum:.6f}")
         p6_ok = not p6_problems
         #: 分歧标的的落地股数（当场从 plan 推导）⇒ 写进 detail 供人工核对推导口径
-        divergence_codes = sorted({c for item in scen_list for c in (item.get("choices") or {})})
-        derived = derived_option_shares(plan, divergence_codes)
+        derived = derived_option_shares(plan, fresh_codes)
         shares_desc = "；".join(
             f"{code} A={derived[code]['A']}/B={derived[code]['B']}"
-            for code in divergence_codes if code in derived)
-        checker.add("P6", "独立重算：8 情景现金/权益/总资产与产物一致（且现金非负、总资产偏差 ≤ 费用之和）",
+            for code in fresh_codes if code in derived)
+        checker.add("P6", "独立重算：全部情景的现金/权益/总资产与产物一致（且现金非负、总资产偏差 ≤ 费用之和）",
                     p6_ok, "；".join(p6_problems) if p6_problems
-                    else f"8 情景手推全对（选项股数由 plan 的 actions / llm_final_decision 推导："
+                    else f"{len(scen_list)} 情景手推全对（选项股数由 plan 的 actions / llm_final_decision 推导："
                          f"{shares_desc}）｜总资产最大偏差 {spread:.6f} ≤ 费用之和 {fee_sum:.6f}")
 
         # --- P7 与 decision_options 逐项一致 ---
-        p7_problems = []
+        p7_problems = list(_scen_missing)
         per_code = {p["code"]: p for p in options.get("options", {}).get("per_code_options", [])}
         for item in scen_list:
             choices = dict(item.get("choices", {}))
@@ -363,14 +436,26 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
         p7_ok = not p7_problems
         checker.add("P7", "与 decision_options 的分歧项选项（股数 / 金额）逐项一致", p7_ok,
                     "；".join(p7_problems) if p7_problems
-                    else f"{len(per_code)} 个分歧项 × 2 选项 × 8 情景全部对齐")
+                    else f"{len(per_code)} 个分歧项 × 2 选项 × {len(scen_list)} 情景全部对齐")
 
         # --- P8 与已交付产物逐字节一致（漂移检测）---
         p8_problems = []
+        # 🔴 交付件自身也要自洽：N 个分歧项 ⇒ 2^N 个情景（交付件坏了要单独报出来）
+        if ref_codes and len(delivered.get("scenarios") or []) != expected_scen:
+            p8_problems.append(
+                f"交付件情景数 {len(delivered.get('scenarios') or [])} ≠ "
+                f"2^{len(ref_codes)} = {expected_scen}")
         for path, name in ((fresh_path, "json"), (fresh_md_path, "md")):
             target = scenarios_path if name == "json" else scenarios_md_path
             if not target.is_file():
                 p8_problems.append(f"交付件缺失 {target.name}")
+                continue
+            # 🔴 2026-11-09 修：新鲜生成件**不存在**时，旧实现直接 `sha1_of(path)` ⇒
+            #    FileNotFoundError ⇒ 冒泡到顶层 `except` ⇒ 闸门只报 rc=2
+            #    「无法完成」，把「生成器没产出」这个真因盖掉了。
+            #    ⇒ 修法：缺件**判 FAIL**（漂移检测照样成立：缺件比字节漂移更严重）。
+            if not path.is_file():
+                p8_problems.append(f"新鲜生成结果缺失 {path.name}（生成器未产出 ⇒ 交付件无法核对）")
                 continue
             if sha1_of(path) != sha1_of(target):
                 p8_problems.append(f"{target.name} 与新鲜生成结果不一致（漂移）")
@@ -405,20 +490,23 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
         d1_detail = "负例未能触发"
         if fresh:
             mutated = copy.deepcopy(fresh)
-            for item in mutated.get("scenarios", []):
-                if item.get("label") == "511880=A,512800=A,563020=A":
-                    item["cash_end"] = float(item["cash_end"]) + 100.0
-                    break
-            detected = False
-            for item in mutated.get("scenarios", []):
-                choices = dict(item.get("choices", {}))
-                cash, _equity, _total, _fees = recompute_scenario(plan, choices)
-                if abs(cash - float(item["cash_end"])) >= 0.01:
-                    detected = True
-                    break
-            d1_ok = detected
-            d1_detail = (f"改坏后独立复算检出偏差 {cash - float(item['cash_end']):.6f} 元 ⇒ 闸门会 FAIL"
-                         if detected else "改坏后独立复算**未**检出 ⇒ 闸门无牙")
+            #: 负例目标 =「全 A」情景（标签按产物里的分歧码顺序动态拼；找不到就退语义匹配）
+            target = all_a_scenario(mutated.get("scenarios", []), aaa_label)
+            if target is None:
+                d1_detail = "找不到「全部选项都是 A」的情景 ⇒ 负例无法构造（闸门无牙）"
+            else:
+                target["cash_end"] = float(target["cash_end"]) + 100.0
+                detected = False
+                for item in mutated.get("scenarios", []):
+                    choices = dict(item.get("choices", {}))
+                    cash, _equity, _total, _fees = recompute_scenario(plan, choices)
+                    if abs(cash - float(item["cash_end"])) >= 0.01:
+                        detected = True
+                        break
+                d1_ok = detected
+                d1_detail = (f"改坏「{target.get('label')}」后独立复算检出偏差 "
+                             f"{cash - float(item['cash_end']):.6f} 元 ⇒ 闸门会 FAIL"
+                             if detected else "改坏后独立复算**未**检出 ⇒ 闸门无牙")
         checker.add("D1", "真负例：A/A/A 现金改坏 +100 元 ⇒ 独立复算必须 FAIL（证明闸门有牙）",
                     d1_ok, d1_detail)
 
@@ -430,8 +518,8 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
 
 def main() -> int:
     """命令行入口：``--run-root`` 指向产物根。"""
-    ap = argparse.ArgumentParser(description="三项分歧组合矩阵产物闸门")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap = argparse.ArgumentParser(description="分歧组合矩阵产物闸门")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     args = ap.parse_args()
     try:
         items = run_checks(Path(args.run_root))

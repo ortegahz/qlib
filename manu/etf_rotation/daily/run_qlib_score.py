@@ -68,6 +68,30 @@ def _load_research_config():
     return C
 
 
+#: 研究链 `qlib_provider.py` 的模块级缓存（避免每次调用重复 exec 整条依赖链）
+_PROVIDER_MODULE = None
+
+
+def _load_qlib_provider():
+    """加载研究链 `qlib_provider.py`（**provider 单一事实源**；按路径加载，非包）。"""
+    global _PROVIDER_MODULE
+    if _PROVIDER_MODULE is not None:
+        return _PROVIDER_MODULE
+    path = _RESEARCH_DIR / "qlib_provider.py"
+    spec = importlib.util.spec_from_file_location("manu_daily_qlib_provider", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 provider 模块：{path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    _PROVIDER_MODULE = module
+    return module
+
+
 def load_scores_meta(scores_csv: str | Path | None = None) -> dict:
     """读 `stock_scores.csv` 的元信息（**只读**，不做任何写操作）。
 
@@ -102,16 +126,64 @@ def score_grid(
 ) -> list[str]:
     """算打分日栅格（委托 `signal_policy.score_grid_dates` —— **唯一事实源**）。
 
-    日历缺省用 qlib 数据集的 `calendars/day.txt`（与研究链 `qlib_scores.trading_calendar` 同源）。
+    日历缺省用**本次选定的 provider** 的 `calendars/day.txt`
+    （与研究链 `qlib_scores.trading_calendar` 同源）。
+
+    🔴🔴 **口径同源（2026-11-06 09:2x 实测修复）**：相位口径是
+    ``i % every_n == every_n - 1``，而 ``i`` 是**传入列表**的下标
+    ⇒ **切片起点决定相位**！
+    研究链（`qlib_scores.trading_calendar(C.SCORE_START_TIME, cal_end)`）从
+    **`SCORE_START_TIME`（2023-06-01）**起算；每日链原来传的是**数据集全量日历
+    （2000-01-04 起）** ⇒ 两条链的相位**差 2 个交易日**
+    ⇒ 实测**共同日期只有 1 个**（末日例外）⇒ 「缺分数」判定全错
+    ⇒ 每轮都会**误触发全量重打分**（21~27 分钟）＋ 报告误报「落后」。
+    ⇒ 这里与研究链**逐位同源**：切片起点 = `SCORE_START_TIME`，
+    切片终点 = `max(SCORE_END_TIME, end)`（研究链的 `cal_end` 规则）。
     """
     sp = _load_signal_policy()
     cfg = _load_research_config()
     every_n = int(every_n if every_n is not None else cfg.REBALANCE_EVERY_N_DAYS)
-    cal_path = Path(calendar_path) if calendar_path else (DC.QLIB_CN_DATA / "calendars" / "day.txt")
+    if calendar_path:
+        cal_path = Path(calendar_path)
+    else:
+        provider, _ = select_provider(end)
+        cal_path = provider / "calendars" / "day.txt"
     cal_dates = sp.read_calendar_dates(cal_path)
     if not cal_dates:
         return []
+    # 🔴 与研究链同源：切片起点 = SCORE_START_TIME，终点 = max(SCORE_END_TIME, end)
+    slice_start = str(cfg.SCORE_START_TIME)
+    slice_end = max(str(cfg.SCORE_END_TIME), end) if end else str(cfg.SCORE_END_TIME)
+    cal_dates = [
+        d
+        for d in cal_dates
+        if slice_start <= (d.isoformat() if hasattr(d, "isoformat") else str(d)) <= slice_end
+    ]
     return sp.score_grid_dates(cal_dates, every_n, start=start, end=end)
+
+
+def select_provider(asof: str | None = None) -> tuple[Path, str]:
+    """选本次打分用的 qlib provider 目录 ⇒ `(目录, 理由)`。
+
+    🔴 **2026-11-09 起：委托研究链层单一事实源 `manu/etf_rotation/qlib_provider.py`。**
+    为什么要改：每日链原本**自带一份**「谁新用谁」规则、研究链又**另写一份**
+    （`qlib_scores.py` 默认基座）⇒ 两条链口径会分叉（研究链永远停在基座末日）。
+    ⇒ 规则提到研究链层 ⇒ 两条链共用同一实现、同一组环境变量名。
+
+    **公开签名与语义逐位不变**（每日链零回归）：
+    * 派生目录日历末日 **> 基座** ⇒ 用派生目录；
+    * 否则用上游基座 `cn_data`（默认路径，零回归）；
+    * 派生目录**永远不覆盖**基座 ⇒ 上游换库的前缀闸门不受影响；
+    * `asof` 未被派生目录覆盖时，只在 reason 里**告警**，**不换数据源**。
+
+    路径仍由每日链常量（`DC.QLIB_CN_DATA` / `DC.QLIB_CN_DATA_LIVE`）显式传入
+    ⇒ 每日链的路径口径**不动**；与研究链默认值的一致性由
+    `daily_config.cross_check_provider_paths()` 对账（防第二个字面量分叉）。
+    """
+    qp = _load_qlib_provider()
+    return qp.select_provider(
+        asof, base=Path(DC.QLIB_CN_DATA), live=Path(DC.QLIB_CN_DATA_LIVE)
+    )
 
 
 def ensure_scores_fresh(
@@ -122,6 +194,7 @@ def ensure_scores_fresh(
     refresh: bool = False,
     out_dir: str | Path | None = None,
     dry_run: bool = True,
+    merge: bool = True,
 ) -> dict:
     """判定 S 层相对 `asof` 的新鲜度；`refresh=True` 时才**可选**地重跑打分。
 
@@ -133,9 +206,23 @@ def ensure_scores_fresh(
     - `missing_grid_dates`：栅格里 ≤ asof 但 S 里没有的日期（**可能非空**，如实报）；
     - `stale`：S 是否落后于最近一个应打分日；
     - `notes`：中文说明（会进邮件/日志）；
-    - `merged_into` / `backup`：仅 `refresh=True` 时有值。
+    - `merged_into` / `backup`：仅 `refresh=True` **且 `merge=True`** 时有值。
+
+    🔴 `merge=False`：打分**只落本次目录**，**严禁合并回 canonical** `stock_scores.csv`
+    ⇒ canonical 的哈希**保持不变**（本函数会实测并披露）。
+    ⚠️ **2026-11-10 订正**（上一版注释指向**已删除**的路径，作废）：
+    ① 「Mode C 影子链实际走的是 `agents_rebalance._refresh_scores(merge=False)`」——
+       **Mode C 已于 2026-11-09 整体废除**（单一流水线 ＋ 快照制），
+       且 `_refresh_scores` **根本没有 `merge` 参数**（签名是
+       `_refresh_scores(*, scores_path, notes, end_date=None)`）⇒ 这句是错的。
+    ② 今天真正保证「canonical 不被写」的是**另一套机制**：
+       `agents_rebalance._refresh_scores` 只写**本快照内**的 `scores_path`，
+       并在前后对 canonical `stock_scores.csv` 做 md5 对照取证；
+       本函数的 `merge` 参数**只在本函数自己的 `__main__` 里以默认 `True` 使用**
+       ⇒ 每日流水线**不经过本函数** ⇒ 它是**预留位**，别当成每日链的现行开关。
     """
     meta = load_scores_meta(scores_csv)
+    provider, provider_reason = select_provider(asof)
     grid = score_grid(calendar_path=calendar_path, end=asof)
     grid_in_window = [d for d in grid if d <= asof]
 
@@ -150,6 +237,7 @@ def ensure_scores_fresh(
         analysis_asof = max_score or grid_last
 
     notes: list[str] = []
+    notes.append(f"ℹ️ 打分数据源：{provider}（{provider_reason}）")
     if not missing:
         notes.append(f"S 层新鲜：现有 S 覆盖到 {max_score}，栅格内无需补的日子。")
     else:
@@ -178,10 +266,14 @@ def ensure_scores_fresh(
 
     if not refresh:
         result["action"] = "skip_heavy"
+        sp = _load_signal_policy()
+        provider_max = sp.calendar_max_date(provider / "calendars" / "day.txt")
         notes.append(
-            "🔴 重跑 S 层需要**重建 qlib 数据集**（数据集覆盖末日 = 2026-11-03，"
-            "2026-11-04 起不在打分栅格上）⇒ 属重活且未获当轮授权 ⇒ "
-            "**本次沿用最近一次 S**，不重打分、不覆盖 stock_scores.csv。"
+            f"🔴 重跑 S 层需要**扩展 qlib 数据集覆盖**（当前数据源覆盖末日 = {provider_max}，"
+            f"打分日 {asof} 需要覆盖到它）⇒ 属重活且未获当轮授权 ⇒ "
+            f"**本次沿用最近一次 S**，不重打分、不覆盖 stock_scores.csv。"
+            f"（阶段 1 的「自建增量日」可把派生目录补到 {asof}："
+            f"`stage1_rolling_increment.py --day {asof}`）"
         )
         return result
 
@@ -198,6 +290,7 @@ def ensure_scores_fresh(
         "--start", missing[0],
         "--end", asof,
         "--out-dir", str(work_dir),
+        "--provider-uri", str(provider),
     ]
     notes.append(f"🔴 正在重跑 S 层（{missing[0]} ~ {asof}），这一步实测约 27 分钟……")
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -212,6 +305,24 @@ def ensure_scores_fresh(
 
     new_df = pd.read_csv(new_csv)
     new_df["date"] = new_df["date"].astype(str).str.slice(0, 10)
+    if not merge:
+        # 🔴 **不合并模式：不合并回 canonical**（canonical 逐字节不变）
+        import hashlib
+
+        digest = hashlib.md5(scores_path.read_bytes()).hexdigest()
+        result.update({
+            "action": "scored_no_merge",
+            "merged_into": None,
+            "backup": None,
+            "scores_output": str(new_csv),
+            "canonical_md5": digest,
+            "n_new_rows": int(len(new_df)),
+        })
+        notes.append(
+            f"🧪 **不合并模式（merge=False）**：S 层只落独立目录 {new_csv}"
+            f"（{len(new_df)} 行）⇒ **未合并回 canonical**；canonical md5 = {digest}"
+        )
+        return result
     old_df = pd.read_csv(scores_path)
     old_df["date"] = old_df["date"].astype(str).str.slice(0, 10)
     keep = old_df[~old_df["date"].isin(set(new_df["date"]))]

@@ -57,11 +57,19 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+#: 研究链根（`data/` 不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import config as C  # noqa: E402
+
 warnings.filterwarnings("ignore")
 
 import pandas as pd  # noqa: E402
 
-DEFAULT_OUT_DIR = "/mnt/data/siping/datasets/etf"
+#: ETF 数据集目录（落点 `<落点根>/datasets/etf`；与每日链 `daily_config.ETF_DATA_ROOT` 同源）
+DEFAULT_OUT_DIR = str(C.ETF_DATA_ROOT)
 DEFAULT_START = "20200101"
 #: 结束日**留空** ⇒ 自动解析为「今天之前（含）的最近一个交易日」（见 refresh_policy.resolve_end_date）
 DEFAULT_END = ""

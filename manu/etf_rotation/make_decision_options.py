@@ -9,7 +9,7 @@
 
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/make_decision_options.py
-    ... --run-root /mnt/data/siping/runs/etf_rotation --out-dir <目录> --asof-label 20261105
+    ... --run-root <落点根>/runs --out-dir <目录> --asof-label 20261105
 
 【数据来源（全部只读）】
     * <run-root>/final_rebalance_plan.json    —— 规则层 + LLM 层对齐后的主产物
@@ -47,12 +47,14 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import account as A  # noqa: E402
+import config as C  # noqa: E402  （落点常量单一事实源）
 from final_rebalance_plan import LOT  # noqa: E402
 
 #: 分歧判定阈值（pp）——沿用 `final_rebalance_plan.py` 的冲突判定口径（2.0pp）
 DIVERGENCE_THRESHOLD_PP = 2.0
 #: 产物根默认值（只读输入目录）
-DEFAULT_RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
+#: 产物根（落点 `<落点根>/runs`；与研究链 `config.ETF_RUN_ROOT` 同源）
+DEFAULT_RUN_ROOT = C.ETF_RUN_ROOT
 #: 文件名标签默认值
 DEFAULT_ASOF_LABEL = "20261105"
 

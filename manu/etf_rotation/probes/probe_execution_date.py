@@ -36,11 +36,19 @@ import argparse
 import copy
 import json
 import sys
+
 from pathlib import Path
 
-RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
-QLIB_CALENDAR = Path("/mnt/data/siping/datasets/qlib/cn_data/calendars/day.txt")
-AK_CALENDAR = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+#: 研究链根（探针目录不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ETF_ROOT = Path(__file__).resolve().parents[1]
+if str(_ETF_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ETF_ROOT))
+
+import config as C  # noqa: E402  （落点常量单一事实源）
+
+RUN_ROOT = C.ETF_RUN_ROOT
+QLIB_CALENDAR = Path(C.PROVIDER_URI) / "calendars" / "day.txt"
+AK_CALENDAR = C.ETF_DATA_ROOT / "trade_calendar.csv"
 
 #: 引擎口径：信号→执行的滞后交易日数（config.EXECUTION_LAG_DAYS）
 EXPECTED_LAG = 1

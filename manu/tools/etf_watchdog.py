@@ -54,10 +54,24 @@ from email.utils import formataddr, formatdate
 from pathlib import Path
 
 # ---------------------------------------------------------------- 默认路径
-DEFAULT_RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation/daily")
+#: 🔴 **结果落点根**：单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
+#:    `ETF_ROTATION_RESULTS_ROOT`；本看门狗**刻意不 import 工程模块**（工程坏了它照样能跑）
+#:    ⇒ 按**同一个环境变量**取值，两边不会分叉。
+RESULTS_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_RESULTS_ROOT", "/mnt/data/siping/runs/etf_rotation_results"
+    )
+)
+#: 🔴 **数据集落点根**（交易日历等数据集文件；同上：不 import 工程模块）
+OUTPUT_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_OUTPUT_ROOT", "/mnt/data/siping/datasets/manu/etf_rotation"
+    )
+)
+DEFAULT_RUN_ROOT = RESULTS_ROOT / "daily"
 DEFAULT_SECRETS = Path("/mnt/data/siping/secrets/smtp.env")
 DEFAULT_REPO = Path("/tmp/pycharm_project_658d3fc4")
-DEFAULT_CALENDAR = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+DEFAULT_CALENDAR = OUTPUT_ROOT / "datasets" / "etf" / "trade_calendar.csv"
 CRON_TAG = "etf_rotation_daily"
 
 #: secrets 文件里必须有的键

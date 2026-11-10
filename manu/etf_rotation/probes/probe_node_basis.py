@@ -50,7 +50,7 @@ import account as A  # noqa: E402
 import config as C  # noqa: E402
 from final_rebalance_plan import LOT, load_prices, _round_lot  # noqa: E402
 
-TMP_ROOT = Path("/mnt/data/siping/runs/_probe_node_basis_tmp")
+TMP_ROOT = C.WORK_ROOT / "_probe_node_basis_tmp"
 TOOL = ROOT / "reprice_node_day.py"
 
 
@@ -362,7 +362,29 @@ def run_checks(run_root: Path):
         import pandas as pd
         df = pd.read_csv(prices_path, dtype={"code": str})
         df["code"] = df["code"].astype(str).str.zfill(6)
-        synth_code = "159929"
+        #: 🔴 2026-11-10（实测红灯）：**变异目标不许写死**。
+        #:    旧值 `159929` 已于 2026-11-05 清仓 ⇒ 不在本轮计划里 ⇒ 改它的价格
+        #:    不改变 node 口径总资产 ⇒ 漂移仍是 +0.2051%（向上）⇒ 方向判定 up、
+        #:    股数没变 ⇒ 场景「没 bites」⇒ P14 假红。
+        #: ⇒ 改法：**从本轮计划派生** —— 取 `plan["actions"]` 里 `current_shares > 0`
+        #:   的持仓（本轮 = 512800 / 7700 股）⇒ 改它的节点日收盘价 ×0.90
+        #:   ⇒ node 口径总资产下降 ⇒ 漂移向下 ⇒ 阈值必落在 `drift_to_window_lo_pct`。
+        #: 计划里**没有**持仓 ⇒ 明确报错（**不许**静默跳过）。
+        held = [str(a.get("code") or "").zfill(6)
+                for a in (plan_doc.get("actions") or [])
+                if int(a.get("current_shares") or 0) > 0]
+        if not held:
+            raise ValueError("计划件里没有 current_shares>0 的持仓 ⇒ 无法构造合成漂移场景")
+        synth_code = ""
+        for _code in held:
+            _hit = int(((df["code"] == _code)
+                         & (df["date"].astype(str) == node_date)).sum())
+            if _hit > 0:
+                synth_code = _code
+                break
+        if not synth_code:
+            raise ValueError("计划件的持仓 " + ",".join(held) + " 在节点日 " + node_date
+                             + " 都没有行情行 ⇒ 无法构造合成漂移场景")
         mask = (df["code"] == synth_code) & (df["date"].astype(str) == node_date)
         if int(mask.sum()) == 0:
             synth_detail = "合成场景未命中行：" + synth_code + " @ " + node_date
@@ -408,6 +430,7 @@ def run_checks(run_root: Path):
                 + "｜阈值=" + str(bs_syn.get("first_tripwire_code"))
                 + "/" + str(bs_syn.get("first_tripwire_side"))
                 + "｜改单条数=" + str(bs_syn.get("n_shares_differ_plan_vs_node"))
+                + "｜变异代码=" + str(synth_code)
                 + ("｜" + "；".join(problems) if problems else ""))
     except Exception as exc:  # noqa: BLE001
         synth_ok = False

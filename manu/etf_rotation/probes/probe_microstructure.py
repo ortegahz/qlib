@@ -38,13 +38,20 @@ import json
 import math
 import re
 import sys
-from pathlib import Path
 
+from pathlib import Path
 import numpy as np
 import pandas as pd
+#: 研究链根（探针目录不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ETF_ROOT = Path(__file__).resolve().parents[1]
+if str(_ETF_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ETF_ROOT))
 
-RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
-ETF_DATA = Path("/mnt/data/siping/datasets/etf")
+import config as C  # noqa: E402  （落点常量单一事实源）
+
+
+RUN_ROOT = C.ETF_RUN_ROOT
+ETF_DATA = C.ETF_DATA_ROOT
 
 #: 年化交易日数
 TD = 252
@@ -94,11 +101,23 @@ def _to_instrument(code: str, exchange: str | None) -> str | None:
     return None
 
 
-def independent_recompute(codes: list[str], asof: str, lookback: int = 60) -> dict:
+def independent_recompute(codes: list[str], asof: str, lookback: int = 60,
+                          stock_prices: Path | None = None,
+                          etf_prices: Path | None = None) -> dict:
     """**独立**重算折溢价率中位数与跟踪误差代理中位数（不走 analyze 的实现路径）。
 
     刻意另写一份实现：从 ``etf_prices.csv`` / ``etf_holdings.csv`` / ``etf_spot.csv``
     / ``stock_prices.csv`` 直接起算，用于校验报告里的数字**确实是数据算出来的**。
+
+    ``stock_prices`` = 个股日线 CSV 路径（缺省 = canonical 产物根那份）；
+    架构迁移后**交付件根 = 快照目录** ⇒ 独立重算必须读**同一轮**的个股日线，
+    否则「报告数字 vs 独立重算」会跨轮对比。
+
+    🔴 ``etf_prices`` = ETF 行情 CSV 路径（缺省 = canonical ``etf_prices.csv``，
+       止于 2026-11-04）——**报告读的是本轮** ``etf_prices_effective_<asof>.csv``
+       （止于 2026-11-09）⇒ 探针不传对输入就**根本没在验报告那份数据**
+       （实测报告 2.5451% vs 用 canonical 重算 2.4437%，差 0.1014pp > 0.05pp）。
+       ⇒ 调用方必须把**报告实际用的那份**传进来（见 :func:`resolve_etf_prices`）。
     """
     asof_ts = pd.Timestamp(asof)
     out: dict = {"premium_median_pct": None, "te_median_pct": None, "n_te_computable": 0}
@@ -115,13 +134,17 @@ def independent_recompute(codes: list[str], asof: str, lookback: int = 60) -> di
         out["premium_n"] = len(vals)
 
     # ---- 跟踪误差代理 ----
-    prices_path = ETF_DATA / "etf_prices.csv"
+    prices_path = Path(etf_prices) if etf_prices is not None else (ETF_DATA / "etf_prices.csv")
     hold_path = ETF_DATA / "etf_holdings.csv"
-    sp_path = RUN_ROOT / "stock_prices.csv"
+    sp_path = Path(stock_prices) if stock_prices is not None else (RUN_ROOT / "stock_prices.csv")
+    out["etf_prices_path"] = str(prices_path)
+    out["etf_prices_last_date"] = None
     if not (prices_path.exists() and hold_path.exists() and sp_path.exists()):
         return out
     pr = pd.read_csv(prices_path, dtype={"code": str})
     pr["date"] = pd.to_datetime(pr["date"])
+    if not pr.empty:
+        out["etf_prices_last_date"] = str(pr["date"].max().date())
     pr["code"] = pr["code"].astype(str).str.zfill(6)
     pr = pr[pr["date"] <= asof_ts].sort_values(["code", "date"])
     etf_ret: dict[str, pd.Series] = {}
@@ -201,6 +224,29 @@ def independent_recompute(codes: list[str], asof: str, lookback: int = 60) -> di
     return out
 
 
+def resolve_etf_prices(report_path: Path, asof: str, explicit: str = "") -> tuple[Path, str]:
+    """决定探针用哪一份 ETF 行情 ⇒ (路径, 口径说明)。
+
+    优先级：
+    ① ``--etf-prices`` 显式指定；
+    ② **报告同目录**的 ``etf_prices_effective_<asof>.csv``（交付件里的落盘口径是
+       ``<YYYYMMDD>`` 紧凑写法，``daily/main.py`` 用 ``asof.replace('-', '')`` 命名；
+       = 报告本轮实际用的那份；架构迁移后交付件根 = 快照目录，effective 行情随快照一起落盘）；
+    ③ canonical ``etf_prices.csv``（止于上一轮 asof ⇒ **跨轮对比**，只在 ② 不存在时回落）。
+
+    🔴 回落口径必须在输出里**显式打印**（路径 + 末日）⇒ 事后能判读探针到底验了哪份数据。
+    """
+    if explicit:
+        return Path(explicit), "显式指定（--etf-prices）"
+    # 🔴 交付件里的命名口径 = ``etf_prices_effective_<YYYYMMDD>.csv``（daily/main.py:
+    #    ``asof.replace('-', '')``）⇒ 两种写法都试，命中即用。
+    for stamp in (asof.replace("-", ""), asof):
+        effective = report_path.resolve().parent / f"etf_prices_effective_{stamp}.csv"
+        if effective.is_file():
+            return effective, f"报告同目录 effective（asof={asof}）"
+    return ETF_DATA / "etf_prices.csv", "canonical 回落（⚠️ 与报告那份可能不同轮）"
+
+
 def evaluate(report: dict, md_text: str, indep: dict) -> list[tuple[str, bool, str]]:
     """对给定报告跑**全部**断言，返回 [(名称, 是否通过, 详情), ...]。
 
@@ -248,7 +294,9 @@ def evaluate(report: dict, md_text: str, indep: dict) -> list[tuple[str, bool, s
         and abs(float(tm) - float(itm)) <= TOL_TE_PP
     )
     add("M4 跟踪误差代理中位数与独立重算一致（±0.05pp）",
-        ok4, f"报告={tm}%｜独立重算={itm}%")
+        ok4,
+        f"报告={tm}%｜独立重算={itm}%｜探针输入={indep.get('etf_prices_path')}"
+        f"（末日 {indep.get('etf_prices_last_date')}）")
 
     # M5 跟踪误差可算只数与独立重算一致
     add("M5 跟踪误差代理可算只数与独立重算一致",
@@ -331,6 +379,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="ETF 微观结构披露闸门")
     ap.add_argument("--report", default=str(RUN_ROOT / "etf_analysis_report.json"))
     ap.add_argument("--md", default=str(RUN_ROOT / "etf_analysis_report.md"))
+    ap.add_argument("--stock-prices", default=str(RUN_ROOT / "stock_prices.csv"),
+                    help="个股日线 CSV（缺省 = 产物根那份；交付件根 = 快照时须显式指向快照内那份）")
+    ap.add_argument("--etf-prices", default="",
+                    help="ETF 行情 CSV（缺省 = 报告同目录 etf_prices_effective_<asof>.csv；"
+                         "没有才回落 canonical etf_prices.csv）")
     args = ap.parse_args()
 
     rep_path, md_path = Path(args.report), Path(args.md)
@@ -343,8 +396,12 @@ def main() -> int:
 
     codes = [str(c.get("code", "")).zfill(6) for c in (report.get("candidates") or [])]
     asof = str((report.get("meta") or {}).get("asof") or "")
+    etf_prices, price_source = resolve_etf_prices(rep_path, asof, args.etf_prices)
     print(f"[INFO] 候选 {len(codes)} 只｜asof {asof}｜独立重算中…")
-    indep = independent_recompute(codes, asof)
+    print(f"[INFO] 探针 ETF 行情输入：{etf_prices}（口径：{price_source}）")
+    indep = independent_recompute(codes, asof, stock_prices=Path(args.stock_prices),
+                                   etf_prices=etf_prices)
+    print(f"[INFO] 该行情末日：{indep.get('etf_prices_last_date')}")
     print(f"[INFO] 独立重算：折溢价中位={indep.get('premium_median_pct')}%｜"
           f"TE 中位={indep.get('te_median_pct')}%｜可算 {indep.get('n_te_computable')} 只")
 

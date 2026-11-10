@@ -33,7 +33,7 @@ F6    W 快照滞后只看 **max**         ⇒ 刷新部分失败造成「混合
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \\
         manu/etf_rotation/probes/probe_refresh_integrity.py \\
-        [--run-root /mnt/data/siping/runs/etf_rotation]
+        [--run-root <落点根>/runs]
 """
 from __future__ import annotations
 
@@ -331,7 +331,7 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
 def main() -> int:
     """跑探针；退出码 0 = 全部断言通过，1 = 有断言失败。"""
     ap = argparse.ArgumentParser(description="刷新链路 · 策略与输入完整性回归探针")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     args = ap.parse_args()
 
     items = run_checks(Path(args.run_root))

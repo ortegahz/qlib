@@ -5,7 +5,7 @@
    **没有只读开关**（它的 `--resume` 只跳过「fetch_date 已是今天」的 code，其余照爬）
    ⇒ 每日链路**只读**缓存 `etf_holdings.csv`；陈旧度**只披露、不拦**。
 2. 🔴 **akshare 绝不装进 ql env** ⇒ 本模块**不 import akshare**，
-   而是把一段 python 源码写到 `/mnt/data` 的临时脚本，用 `DC.AK_PY`（ak env）**子进程**执行。
+   而是把一段 python 源码写到**唯一落点根**下的临时脚本，用 `DC.AK_PY`（ak env）**子进程**执行。
 3. 🔴 **不写共享的 canonical 数据集**：每日增量落**自己的** run root，
    由下游把 canonical + 增量**合并**成有效价格序列 ⇒ 每日链路可复现、且不污染研究链输入。
 
@@ -42,8 +42,8 @@ _RESEARCH_ROOT = _HERE.parent
 if str(_RESEARCH_ROOT) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_ROOT))
 
-#: 临时工作目录（铁律二：**不落 /tmp**，一律落 /mnt/data）
-_WORK_ROOT = Path("/mnt/data")
+#: 临时工作目录（铁律二：**不落 /tmp**，一律落**数据集根**下的 `_work/`）
+_WORK_ROOT = DC.WORK_ROOT
 
 #: canonical 行情文件的列（服务器 `etf_prices.csv` 实测：`date,code,open,high,low,close,volume,amount`）
 _PRICE_COLS = ("date", "code", "open", "high", "low", "close", "volume", "amount")
@@ -193,32 +193,51 @@ BAR_FINALIZE_MM = 5
 
 
 def drop_unfinalized_bars(df: pd.DataFrame, asof: str) -> tuple[pd.DataFrame, str | None]:
-    """丢掉**还没定型**的当日 bar（🔴 防污染）。
+    """丢掉**还没定型**的**今天**那根 bar（🔴 防污染）。
 
-    收盘前（< 15:05）akshare 可能返回当天的**盘中 / 未收盘** bar
+    收盘前（< 15:05）akshare 可能返回**今天**的**盘中 / 未收盘** bar
     ⇒ 写进缓存会污染 MA20 / MA60 与破位判定 ⇒ 一律丢弃，并如实记日志。
+
+    🔴 2026-11-10 修复（服务器实跑暴露的真 bug）：
+    「未定型」只可能发生在**今天** ⇒ ① 掩码必须锚 **today**（不是 asof）；
+    ② 「现在」必须锚**市场时区**（`DC.MARKET_TZ`），不是机器本地时区。
+    原实现两处都错：
+    - 掩码锚 asof + 只看墙钟 ⇒ 当 asof 是**过去的交易日**（例：asof=2026-11-09 的补跑，
+      墙钟 2026-11-10 10:37 < 15:05）时，**早已收盘的 asof bar 被当成盘中数据丢掉**
+      ⇒ 行情底座永远比信号日差一天 ⇒ 下游 `_data_freshness_guard` fail-closed
+      ⇒ 整轮白跑（实测：底座只到 2026-11-06，信号日 2026-11-09 ⇒ 拒绝出报告）；
+    - 用 `datetime.now().astimezone()`（机器本地时区）⇒ 机器跑在 UTC 容器里时，
+      07:00 UTC（= 15:00 CST，A 股**已收盘**）仍被判成「未收盘」⇒ 同一类事故原样复现。
+
+    现在：掩码锚 **today** ＋ 时钟锚**市场时区** ⇒
+    - asof 是过去的交易日 ⇒ 抓取端已按 `date <= asof` 过滤 ⇒ 帧里**没有今天**的行
+      ⇒ 命中 0 行 ⇒ **原样保留**（含已收盘的 asof 那根）；
+    - asof 就是今天且未过 15:05 ⇒ 丢掉**今天**那根（防盘中污染）；
+    - asof 是未来 ⇒ 帧里可能含**今天**的盘中 bar ⇒ 同样被正确丢掉。
 
     返回 `(过滤后的表, 说明)`；说明为 None 表示没丢过东西。
     """
-    now = datetime.now().astimezone()
+    now = datetime.now(DC.MARKET_TZ)
     if (now.hour, now.minute) >= (BAR_FINALIZE_HH, BAR_FINALIZE_MM):
         return df, None
     if df.empty or "date" not in df.columns:
         return df, None
-    mask = df["date"].astype(str).str.slice(0, 10) == str(asof)
+    today = now.date().isoformat()
+    # 🔴 掩码锚 **today**（不是 asof）：「未定型」只可能发生在今天
+    mask = df["date"].astype(str).str.slice(0, 10) == today
     n = int(mask.sum())
     if n == 0:
         return df, None
     note = (
         f"⏳ 当日 bar 尚未定型（现在 {now:%H:%M} < "
         f"{BAR_FINALIZE_HH:02d}:{BAR_FINALIZE_MM:02d}）⇒ 已丢弃 {n} 行 "
-        f"asof={asof} 的未收盘数据（均线将用上一个交易日）"
+        f"今天({today})的未收盘数据（asof={asof}；均线将用上一个交易日）"
     )
     return df[~mask].copy(), note
 
 
 def _work_root() -> Path:
-    """临时工作目录：优先 `/mnt/data`（铁律二）；写不了就退回**每日产物根**。
+    """临时工作目录：优先**数据集根**下的 `_work/`（铁律二）；写不了就退回**每日产物根**。
 
     🔴 **绝不**落 `/tmp`（tmpfs ⇒ 重启即失 ⇒ 增量白抓）。
     """
@@ -957,7 +976,12 @@ def run_fetch(
             "diverged": [],
             "errors": [],
             "calendar_appended": False,
-            "notes": "未开启 qlib 二进制增量（--update-qlib-bin 才开）",
+            # 🔴 2026-11-10 订正：原文写「--update-qlib-bin 才开」**与实际接线不符** ——
+            #    每日链把 `update_qlib` **硬编码成 False**（`main.py` 阶段 1），
+            #    `--update-qlib-bin` 管的是**另一个**开关（`stage1_dataset` 滚动快照换库），
+            #    跟本函数（qlib 二进制增量）**无关** ⇒ 照原文会以为「加个 flag 就能开」。
+            "notes": "未开启 qlib 二进制增量（每日链**不走**这条路：qlib 数据集由 "
+                     "`stage1_dataset` 滚动快照换库负责，见 `--update-qlib-bin`）",
         }
     return {
         "asof": asof,

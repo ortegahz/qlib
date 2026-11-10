@@ -31,7 +31,7 @@
 【执行机】服务器；解释器 `/home/huangzhe/anaconda3/envs/ql/bin/python`
 【用法】
     export PYTHONHASHSEED=0
-    python manu/etf_rotation/qlib_scores.py --mode infer --out-dir /mnt/data/siping/runs/etf_rotation
+    python manu/etf_rotation/qlib_scores.py --mode infer --out-dir <落点根>/runs
 """
 from __future__ import annotations
 
@@ -78,6 +78,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", default=None, help="打分结束日（默认数据最后交易日）")
     p.add_argument("--universe", default=C.FULL_UNIVERSE, help="qlib 股票池（默认 all = 全市场）")
     p.add_argument(
+        "--provider-uri",
+        default=None,
+        help=(
+            "qlib provider 目录（默认 = 上游基座 cn_data）；"
+            "阶段 1 自建增量日时指向派生目录 cn_data_live"
+        ),
+    )
+    p.add_argument(
         "--validate-pred",
         default=str(DEFAULT_MODEL_DIR / "pred.pkl"),
         help="个股线 pred.pkl 路径；用它交叉校验本次打分在 csi300 上是否与训练线一致",
@@ -87,12 +95,22 @@ def parse_args() -> argparse.Namespace:
 
 # ------------------------------------------------------------------ qlib 侧
 
+#: 🔴 **provider_uri 覆盖**（阶段 1 自建增量日派生目录用）：
+#: 默认仍是 `C.PROVIDER_URI`（上游基座）；传 `--provider-uri` ⇒ 指向派生目录
+#: （`cn_data_live`，上游快照滞后时的兜底）⇒ **不改任何默认路径**。
+_PROVIDER_URI_OVERRIDE: str | None = None
+
+
+def provider_uri() -> str:
+    """本次实际使用的 provider_uri（覆盖值优先）。"""
+    return _PROVIDER_URI_OVERRIDE or C.PROVIDER_URI
+
 
 def init_qlib() -> None:
     import qlib
     from qlib.constant import REG_CN
 
-    qlib.init(provider_uri=C.PROVIDER_URI, region=REG_CN)
+    qlib.init(provider_uri=provider_uri(), region=REG_CN)
 
 
 class FrozenZScoreNorm:
@@ -530,10 +548,17 @@ def format_ic_summary(ic: dict[str, Any]) -> str:
 
 
 def main() -> int:
+    global _PROVIDER_URI_OVERRIDE
     args = parse_args()
     t0 = time.time()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 🔴 provider_uri 覆盖（默认仍是上游基座 ⇒ **默认路径零回归**）
+    if args.provider_uri:
+        _PROVIDER_URI_OVERRIDE = str(Path(args.provider_uri).expanduser().resolve())
+        print(f"[INFO] provider_uri 覆盖为：{_PROVIDER_URI_OVERRIDE}")
+    print(f"[INFO] provider_uri = {provider_uri()}")
 
     init_qlib()
 
@@ -557,7 +582,7 @@ def main() -> int:
     #   「数据集只到 2026-12-01」⇒ 用户据此判断「要不要重建数据集」会被误导。
     #   ⇒ 数据集真实覆盖末日**直读 `calendars/day.txt`**（唯一权威来源）。
     dataset_max = SP.calendar_max_date(
-        Path(str(C.PROVIDER_URI)) / "calendars" / "day.txt"
+        Path(provider_uri()) / "calendars" / "day.txt"
     ) or data_max
     end_capped = bool(requested_end > dataset_max)
     if end_capped:
@@ -663,7 +688,7 @@ def main() -> int:
         ),
         "label_expression": C.STOCK.LABEL_EXPRESSIONS,
         "fit_window": [C.STOCK.FIT_START, C.STOCK.FIT_END],
-        "provider_uri": C.PROVIDER_URI,
+        "provider_uri": provider_uri(),
         "region": C.REGION,
         "ic": ic,
         "ic_missing_reason": ic_reason or None,

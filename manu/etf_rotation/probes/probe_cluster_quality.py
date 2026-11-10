@@ -28,7 +28,7 @@ from engine.filters import _weight_overlap, cluster_by_overlap  # noqa: E402
 from engine.features import load_prices  # noqa: E402
 from engine.weights import load_holdings  # noqa: E402
 
-RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
+RUN_ROOT = C.ETF_RUN_ROOT
 
 
 def corr120(prices: pd.DataFrame, codes: list[str], asof: pd.Timestamp) -> pd.DataFrame:
@@ -109,7 +109,7 @@ def main() -> int:
     universe = sorted(holdings["etf_code"].astype(str).unique())
     name_map = {}
     try:
-        uni = pd.read_csv("/mnt/data/siping/datasets/etf/etf_universe.csv", dtype={"code": str})
+        uni = pd.read_csv(C.ETF_DATA_ROOT / "etf_universe.csv", dtype={"code": str})
         if "name" in uni.columns:
             name_map = dict(zip(uni["code"].astype(str), uni["name"].astype(str)))
     except Exception:

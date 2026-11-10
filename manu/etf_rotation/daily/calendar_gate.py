@@ -1,4 +1,4 @@
-"""calendar_gate.py —— **每日流水线的交易日历门**（fail-closed 判定 + 模式分流）。
+"""calendar_gate.py —— **每日流水线的交易日历门**（fail-closed 判定 + 当日口径）。
 
 【本模块是干什么的】
 每日流水线每个交易日 15:30 被 cron 触发，但 **cron 只按「周一~周五」过滤**（`DC.CRON_EXPR`）：
@@ -57,11 +57,6 @@ _RESEARCH_ROOT = _HERE.parent
 if str(_RESEARCH_ROOT) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_ROOT))
 
-#: 模式常量
-MODE_A = "A"
-MODE_B = "B"
-
-
 class CalendarUnavailable(RuntimeError):
     """交易日历读不到 / 覆盖不到目标日期 ⇒ **拒绝判定**（不许当成「非交易日」）。"""
 
@@ -107,12 +102,13 @@ def _parse_date(value: str, what: str = "日期") -> date:
 
 
 def today_str() -> str:
-    """本机本地时区当天（`YYYY-MM-DD`）。
+    """**市场时区**当天（`YYYY-MM-DD`）。
 
-    🔴 用**本地时区**而不是 UTC：服务器在 Asia/Shanghai，
-    UTC 的「今天」在 08:00 之前会落后一天 ⇒ 会把调仓节点日判错。
+    🔴 用**市场时区**（`DC.MARKET_TZ` = 东八区）而不是机器本地时区：
+    「今天」是**市场日历**的概念 —— 服务器在 Asia/Shanghai 时两者一致，
+    但机器跑在 UTC 容器里时，UTC 的「今天」在 08:00 之前会落后一天 ⇒ 会把调仓节点日判错。
     """
-    return date.today().isoformat()
+    return datetime.now(DC.MARKET_TZ).date().isoformat()
 
 
 # ---------------------------------------------------------------- 交易日历
@@ -267,7 +263,7 @@ def next_rebalance_node(after, calendar_path=None) -> dict:
     }
 
 
-# ---------------------------------------------------------------- 模式分流
+# ---------------------------------------------------------------- 当日口径
 def is_silent_defense_window(date_str) -> bool:
     """`date_str` 落在**静默防守窗口**（含端点）⇒ True。
 
@@ -280,26 +276,16 @@ def is_silent_defense_window(date_str) -> bool:
     return start <= day <= end
 
 
-def resolve_mode(date_str) -> str:
-    """当日模式：`DC.NEXT_SIGNAL_DATE`（2026-12-01）⇒ 模式 B；其余 ⇒ 模式 A。
+def describe_day(date_str) -> dict:
+    """当日口径的**完整描述**（给 ``main.py`` / 邮件 / 产物做统一口径）。
 
-    * 模式 A：**只刷新数据 + 监控 + 推送日报**，不调仓、不调 LLM；
-    * 模式 B：**调仓节点日**（出信号、生成调仓清单、跑 LLM 辩论、下发执行卡）。
+    🔴 2026-11-09（需求 1：删除模式概念）：旧版叫 ``describe_mode``、带 ``mode`` 键
+    （``"A"`` / ``"B"``）。**模式分诊已下线** ⇒ 这里只给**事实**，**不给模式**。
 
-    🔴 分流**只看日期**（不猜、不兜底）：信号日是用户锁死的 `DC.NEXT_SIGNAL_DATE`。
+    返回键：``date`` / ``is_silent_defense`` / ``is_signal_date`` /
+    ``execution_date`` / ``reason``。
     """
     day = _parse_date(date_str, "日期")
-    return MODE_B if day.isoformat() == str(DC.NEXT_SIGNAL_DATE) else MODE_A
-
-
-def describe_mode(date_str) -> dict:
-    """当日模式的**完整描述**（给 `main.py` / 邮件 / 产物做统一口径）。
-
-    返回键：`date` / `mode` / `is_silent_defense` / `is_signal_date` /
-    `execution_date` / `reason`。
-    """
-    day = _parse_date(date_str, "日期")
-    mode = resolve_mode(day.isoformat())
     is_signal = day.isoformat() == str(DC.NEXT_SIGNAL_DATE)
     is_execution_day = day.isoformat() == str(DC.NEXT_EXECUTION_DATE)
     silent = is_silent_defense_window(day.isoformat())
@@ -310,13 +296,13 @@ def describe_mode(date_str) -> dict:
     if is_signal:
         reason = (
             f"{day.isoformat()} 是锁定的下一正式调仓**信号日**（DC.NEXT_SIGNAL_DATE）"
-            f" ⇒ 走模式 B：收盘出信号 → 生成调仓清单 → 跑 LLM 辩论 → 下发执行卡"
+            f" ⇒ 收盘出信号 → 生成调仓清单 → 跑 LLM 辩论 → 下发执行卡"
             f"（执行日 {DC.NEXT_EXECUTION_DATE} 开盘）"
         )
     elif is_execution_day:
         reason = (
             f"{day.isoformat()} 是上一信号日的**执行日**（DC.NEXT_EXECUTION_DATE）"
-            f" ⇒ 模式 A（只刷数据 + 监控 + 推送日报）；执行卡在**开盘**执行，本日不产生新信号"
+            f" ⇒ 执行卡在**开盘**执行，本日不产生新信号"
         )
     elif silent:
         reason = (
@@ -325,13 +311,12 @@ def describe_mode(date_str) -> dict:
         )
     else:
         reason = (
-            f"{day.isoformat()} 不是调仓信号日 ⇒ 走模式 A："
-            f"只刷新数据 + 监控 + 推送日报，不调仓、不调 LLM"
+            f"{day.isoformat()} 不是调仓信号日 ⇒ 只刷新数据 + 监控 + 推送日报，"
+            f"不调仓、不调 LLM"
         )
 
     return {
         "date": day.isoformat(),
-        "mode": mode,
         "is_silent_defense": bool(silent),
         "is_signal_date": bool(is_signal),
         "execution_date": execution_date,
@@ -356,4 +341,4 @@ if __name__ == "__main__":  # pragma: no cover - 手工自检
     import json
 
     _ensure_hash_seed()
-    print(json.dumps(describe_mode(today_str()), ensure_ascii=False, indent=2))
+    print(json.dumps(describe_day(today_str()), ensure_ascii=False, indent=2))

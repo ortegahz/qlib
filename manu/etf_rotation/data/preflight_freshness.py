@@ -28,7 +28,7 @@
 
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/data/preflight_freshness.py \
-        [--asof 2026-12-01] [--run-root /mnt/data/siping/runs/etf_rotation]
+        [--asof 2026-12-01] [--run-root <落点根>/runs]
 
 【退出码】0 = 全部达标；1 = 有硬拦项不达标（**流水线必须 die**）。
 """

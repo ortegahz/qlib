@@ -208,7 +208,7 @@ def write_account_json(path: str | Path) -> Path:
     ⇒ Portfolio Manager 拿的是**用户根本没持有的组合** ⇒ 交付件混入无源结论
     （历史实测编出过「目标 15%」「止损 0.804」这类假论据）。
     ⇒ 每日流水线在阶段 4 之前把**实盘口径**（本模块）导出成 JSON，
-    再用 `--account-json` 传给 TA ⇒ TA 拿到的与模式 A 报告里的账户卡片**完全一致**。
+    再用 `--account-json` 传给 TA ⇒ TA 拿到的与巡检报告里的账户卡片**完全一致**。
 
     JSON 字段（**必含** 现金 / 总资产 / 持仓（代码 · 股数 · 成本））：
         `cash` / `total_assets` / `positions[{code, name, shares, cost, ...}]`

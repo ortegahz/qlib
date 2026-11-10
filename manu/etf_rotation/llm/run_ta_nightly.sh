@@ -5,7 +5,10 @@
 set -uo pipefail
 PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
 LLM_PY="${LLM_PY:-/home/huangzhe/anaconda3/envs/llm/bin/python}"
-RUN_ROOT="${RUN_ROOT:-/mnt/data/siping/runs/etf_rotation}"
+#: 🔴 **结果落点根**（单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
+#:    `ETF_ROTATION_RESULTS_ROOT`）⇒ 产物根 = 结果根
+RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-/mnt/data/siping/runs/etf_rotation_results}"
+RUN_ROOT="${RUN_ROOT:-$RESULTS_ROOT}"
 TICKER="${1:-512800}"
 ASOF="${2:-2026-11-03}"
 cd "$PROJ" || exit 1

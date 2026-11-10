@@ -20,7 +20,7 @@
 【用法】
     PYTHONHASHSEED=0 /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_report_spec.py \
-        --report /mnt/data/siping/runs/etf_rotation/etf_analysis_report.json
+        --report <落点根>/runs/etf_analysis_report.json
 
 【副作用】
 不写任何文件（负例在内存里改副本）；只读正式报告与两个日历文件。
@@ -34,17 +34,29 @@ import csv
 import json
 import re
 import sys
+
 from pathlib import Path
 
+#: 研究链根（探针目录不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ETF_ROOT = Path(__file__).resolve().parents[1]
+if str(_ETF_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ETF_ROOT))
+
+import config as C  # noqa: E402  （落点常量单一事实源）
+
 #: qlib 历史日历（一行一个 YYYY-MM-DD）
-QLIB_CALENDAR = Path("/mnt/data/siping/datasets/qlib/cn_data/calendars/day.txt")
+QLIB_CALENDAR = Path(C.PROVIDER_URI) / "calendars" / "day.txt"
 #: akshare 完整交易日历（**宽表**：第一行是表头 + 全部日期列）
-AK_CALENDAR = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+AK_CALENDAR = C.ETF_DATA_ROOT / "trade_calendar.csv"
 #: 被静态审计的源码（`analyze.py`；规格硬性要求：中文 docstring / 4 空格 / snake_case）
 ANALYZE_SOURCE = Path(__file__).resolve().parents[1] / "analyze.py"
-#: 真实账户口径（用户任务书 §2，**不许改数**）
-EXPECTED_TOTAL_ASSETS = 29854.67
-EXPECTED_CASH = 15518.87
+#: 账户事实源（**报告同目录**）：``account_context.json`` —— 期望值的唯一来源
+#: 🔴 期望值**不再写死**（旧值 29854.67 / 15518.87 是 2026-11-04 的 5 只旧账户口径
+#:    ⇒ 本轮真实账户是 2026-11-05 口径（1 只 512800 / 30035.57 / 23367.37）⇒ 写死必红）；
+#:    事实源缺失 ⇒ H1 **必定 FAIL**（不许真空 PASS）。
+ACCOUNT_CONTEXT_NAME = "account_context.json"
+#: 金额**精确对账**容差（元）：事实源 ↔ 报告的同一笔数字，只许浮点表示噪声
+ACCOUNT_EXACT_TOLERANCE = 1e-6
 #: 风险披露必须覆盖的主题（用户任务书 §5 第 9 条点名的 7 项）
 REQUIRED_RISK_IDS = (
     "in_sample_selection_bias",
@@ -76,6 +88,56 @@ def load_calendar() -> list[str]:
                 if _DATE_RE.fullmatch(text):
                     days.add(text)
     return sorted(days)
+
+
+def load_account_expectation(report_dir: Path) -> dict:
+    """从**报告同目录**的 ``account_context.json`` 派生账户期望值。
+
+    返回 ``{"codes": [...], "total_assets": float|None, "cash": float|None,
+    "source": str, "error": str}``。
+
+    🔴 事实源缺失 / 不完整 ⇒ ``error`` 非空 ⇒ H1 **必须 FAIL**（不许真空 PASS）。
+    """
+    path = report_dir / ACCOUNT_CONTEXT_NAME
+    info: dict = {"codes": [], "total_assets": None, "cash": None,
+                  "source": str(path), "error": ""}
+    if not path.is_file():
+        info["error"] = f"账户事实源缺失 ⇒ 不许真空 PASS：{path}"
+        return info
+    try:
+        ctx = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 —— 事实源损坏必须报出来，不许静默
+        info["error"] = f"账户事实源不可读 {path}：{type(exc).__name__}: {exc}"
+        return info
+    if not isinstance(ctx, dict):
+        info["error"] = f"账户事实源格式非法 {path}（不是 JSON 对象）"
+        return info
+    positions = ctx.get("positions")
+    if not isinstance(positions, list) or not positions:
+        info["error"] = f"账户事实源 {path} 里没有非空 positions 列表"
+        return info
+    codes: list[str] = []
+    for item in positions:
+        if not isinstance(item, dict):
+            info["error"] = f"账户事实源 {path} 的 positions 里有非对象元素"
+            return info
+        code = str(item.get("code") or "").strip()
+        if not code:
+            info["error"] = f"账户事实源 {path} 的 positions 里有缺 code 的行"
+            return info
+        codes.append(code)
+    total_assets = ctx.get("total_assets")
+    cash = ctx.get("cash")
+    if not isinstance(total_assets, (int, float)) or isinstance(total_assets, bool):
+        info["error"] = f"账户事实源 {path} 缺 total_assets"
+        return info
+    if not isinstance(cash, (int, float)) or isinstance(cash, bool):
+        info["error"] = f"账户事实源 {path} 缺 cash"
+        return info
+    info["codes"] = sorted(codes)
+    info["total_assets"] = float(total_assets)
+    info["cash"] = float(cash)
+    return info
 
 
 class Checker:
@@ -110,8 +172,13 @@ def _get(report: dict, path: str, default=None):
     return node
 
 
-def run_checks(report: dict, calendar: list[str]) -> list[tuple[str, str, bool, str]]:
-    """对报告跑全部规格断言，返回 [(id, 名称, 是否通过, 细节)]。"""
+def run_checks(report: dict, calendar: list[str],
+               account: dict | None = None) -> list[tuple[str, str, bool, str]]:
+    """对报告跑全部规格断言，返回 [(id, 名称, 是否通过, 细节)]。
+
+    ``account`` = 账户事实源派生值（见 :func:`load_account_expectation`）；
+    缺省 ``None`` ⇒ H1 按 fail-closed 判 FAIL（不许真空 PASS）。
+    """
     checker = Checker()
     asof = str(_get(report, "meta.asof", "") or "")
 
@@ -325,11 +392,37 @@ def run_checks(report: dict, calendar: list[str]) -> list[tuple[str, str, bool, 
     # ---------- §7 current_holdings_diagnosis ----------
     hd = _get(report, "current_holdings_diagnosis", {}) or {}
     holdings = hd.get("holdings") or []
-    checker.add("H1", "真实持仓逐只诊断（5 只）+ 总资产/现金与 §2 一致（不许改数）",
-                len(holdings) == 5
-                and abs(float(hd.get("total_assets", 0)) - EXPECTED_TOTAL_ASSETS) < 0.01
-                and abs(float(hd.get("cash", 0)) - EXPECTED_CASH) < 0.01,
-                f"持仓={len(holdings)} 只｜总资产={hd.get('total_assets')}｜现金={hd.get('cash')}")
+    # 🔴 期望值来自**报告同目录的账户事实源**（``account_context.json``）⇒ 不再写死旧账户口径。
+    if account is None:
+        acct: dict = {}
+        acct_err = "未加载账户事实源 ⇒ 不许真空 PASS"
+    else:
+        acct = account
+        acct_err = str(acct.get("error") or "")
+    exp_codes = list(acct.get("codes") or [])
+    exp_total = acct.get("total_assets")
+    exp_cash = acct.get("cash")
+    got_codes = sorted(str(row.get("code") or "").strip() for row in holdings)
+    if acct_err or not exp_codes:
+        checker.add("H1", "真实持仓逐只诊断（与账户事实源一致）+ 总资产/现金精确对账",
+                    False,
+                    f"{acct_err}｜诊断持仓={got_codes}")
+    else:
+        got_total = hd.get("total_assets")
+        got_cash = hd.get("cash")
+        ok_codes = got_codes == exp_codes
+        ok_total = (
+            isinstance(got_total, (int, float)) and not isinstance(got_total, bool)
+            and abs(float(got_total) - float(exp_total)) <= ACCOUNT_EXACT_TOLERANCE
+        )
+        ok_cash = (
+            isinstance(got_cash, (int, float)) and not isinstance(got_cash, bool)
+            and abs(float(got_cash) - float(exp_cash)) <= ACCOUNT_EXACT_TOLERANCE
+        )
+        checker.add("H1", "真实持仓逐只诊断（与账户事实源一致）+ 总资产/现金精确对账",
+                    ok_codes and ok_total and ok_cash,
+                    f"口径={acct.get('source')}｜诊断持仓={got_codes}｜期望={exp_codes}（精确相等）"
+                    f"｜总资产 {got_total} vs {exp_total}｜现金 {got_cash} vs {exp_cash}")
     bad_h = []
     for row in holdings:
         for field in ("code", "name", "shares", "market_value", "pnl_pct", "in_candidate_pool",
@@ -338,12 +431,20 @@ def run_checks(report: dict, calendar: list[str]) -> list[tuple[str, str, bool, 
                 bad_h.append(f"{row.get('code')}.{field}")
     checker.add("H2", "每只持仓带诊断字段（在池/MA20/MA60/破位/E/动量/市值/盈亏）",
                 not bad_h, f"缺字段={bad_h[:5] or '无'}")
-    no_reason_h = [row.get("code") for row in holdings
-                   if not row.get("selected") and not str(row.get("reject_reason") or "").strip()]
+    unselected = [row for row in holdings if not row.get("selected")]
+    no_reason_h = [row.get("code") for row in unselected
+                   if not str(row.get("reject_reason") or "").strip()]
+    # 🔴 本轮账户只有 1 只持仓且 **selected=True** ⇒ 「未入选」集合为空 ⇒
+    #    H3 恒 PASS（**真空 PASS**）⇒ 必须在 detail 里说清楚，避免被误读成「守卫有效」。
+    vacuous_note = (
+        "｜本轮**无未入选持仓** ⇒ 真空 PASS（本断言本轮不构成有效拦人，负例 N6 用夹具补测）"
+        if not unselected else ""
+    )
     checker.add("H3", "每只未入选的持仓都写明被哪道网淘汰 + 原因",
                 not no_reason_h,
                 f"缺原因={no_reason_h or '无'}｜淘汰阶段="
-                f"{[ (row.get('code'), row.get('rejected_by_stage')) for row in holdings if not row.get('selected')]}")
+                f"{[(row.get('code'), row.get('rejected_by_stage')) for row in unselected]}"
+                f"{vacuous_note}")
 
     # ---------- §8 next_rebalance ----------
     nr = _get(report, "next_rebalance", {}) or {}
@@ -528,6 +629,8 @@ def main() -> int:
         return 1
     report = json.loads(report_path.read_text(encoding="utf-8"))
     calendar = load_calendar()
+    # 🔴 账户事实源 = **报告同目录**的 ``account_context.json``（缺失 ⇒ H1 fail-closed）
+    account = load_account_expectation(report_path.resolve().parent)
 
     lines: list[str] = []
     failures: list[str] = []
@@ -539,7 +642,7 @@ def main() -> int:
             failures.append(f"{tag} {name}")
 
     # ---- 正例：正式报告原样 ----
-    results = run_checks(report, calendar)
+    results = run_checks(report, calendar, account)
     for check_id, name, ok, detail in results:
         emit(check_id, name, ok, detail)
 
@@ -556,7 +659,43 @@ def main() -> int:
     def mutate(fn):
         bad = copy.deepcopy(report)
         fn(bad)
-        return {cid: ok for cid, _n, ok, _d in run_checks(bad, calendar)}
+        return {cid: ok for cid, _n, ok, _d in run_checks(bad, calendar, account)}
+
+    def _break_reject_reason(rep: dict) -> None:
+        """把某只**未入选**持仓的淘汰原因抹掉 ⇒ H3 必须 FAIL。
+
+        🔴 本轮唯一持仓是 ``selected=True``、``reject_reason=None``
+           ⇒ 旧负例直接抹 ``holdings[0].reject_reason`` **进不了 H3 的判定集**
+           ⇒ H3 必然仍 PASS ⇒ 负例**无牙**。
+           ⇒ 修法：先找「未入选且有 reject_reason」的行；找不到就**自造夹具**
+             （塞一条 ``selected=False`` 且带 reject_reason 的行）再抹它的原因。
+        """
+        hd = rep.get("current_holdings_diagnosis")
+        if not isinstance(hd, dict):
+            hd = {}
+            rep["current_holdings_diagnosis"] = hd
+        holdings = hd.get("holdings")
+        if not isinstance(holdings, list):
+            holdings = []
+            hd["holdings"] = holdings
+        target = next(
+            (row for row in holdings
+             if isinstance(row, dict) and not row.get("selected")
+             and str(row.get("reject_reason") or "").strip()),
+            None,
+        )
+        if target is None:
+            target = {
+                "code": "999999", "name": "夹具-未入选持仓", "shares": 0,
+                "market_value": 0.0, "pnl_pct": 0.0, "in_candidate_pool": True,
+                "ma20_ok": True, "ma60_ok": True, "broken": False, "mom120": 0.0,
+                "selected": False, "rejected_by_stage": "filter_net_1_liquidity",
+                "rejected_by_stage_title": "流动性过滤",
+                "reject_reason": "夹具：近 20 日平均成交额不足（负例用）",
+                "reject_detail": "夹具",
+            }
+            holdings.append(target)
+        target["reject_reason"] = ""
 
     negative_cases = [
         ("N1", "删掉 meta.hash_seed", "M5",
@@ -569,8 +708,11 @@ def main() -> int:
          lambda r: r["rank_ic"]["horizons"]["5"]["per_date"][0].__setitem__("date", "2099-01-01")),
         ("N5", "过滤网 1 的淘汰计数改错", "F2",
          lambda r: r["filter_stats"]["per_net"]["filter_net_1_liquidity"].__setitem__("n_eliminated", 1)),
-        ("N6", "删掉某只持仓的淘汰原因", "H3",
-         lambda r: r["current_holdings_diagnosis"]["holdings"][0].__setitem__("reject_reason", "")),
+        # 🔴 2026-11-10 修：旧负例抹的是 ``holdings[0]``（本轮它 selected=True）
+        #    ⇒ 抹了也进不了 H3 的判定集 ⇒ H3 仍 PASS ⇒ **负例无牙**。
+        #    ⇒ 改成「未入选且有原因的行优先；没有就自造夹具」⇒ H3 必须转 FAIL。
+        ("N6", "抹掉某只未入选持仓的淘汰原因（无则自造夹具）", "H3",
+         _break_reject_reason),
         ("N7", "下一节点的交易日距离改成 999", "N3",
          lambda r: r["next_rebalance"].__setitem__("trading_days_until", 999)),
         ("N8", "删掉「策略容量」那条风险披露", "G1",
@@ -646,6 +788,10 @@ def main() -> int:
     print("=" * 78)
     print("ETF 分析报告 · 规格符合性探针（用户任务书 §5 的 10 段 + 硬性要求 + analyze.py 静态规范）")
     print(f"报告：{report_path}｜日历：qlib ∪ akshare（{len(calendar)} 个交易日）")
+    print(f"账户事实源：{account.get('source')}｜"
+          + (f"错误={account.get('error')}" if account.get("error")
+             else f"持仓={account.get('codes')}｜总资产={account.get('total_assets')}"
+                  f"｜现金={account.get('cash')}"))
     print("-" * 78)
     print("\n".join(lines))
     print("-" * 78)

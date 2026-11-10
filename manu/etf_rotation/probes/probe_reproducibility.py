@@ -3,9 +3,9 @@
 【用法】
     export PYTHONHASHSEED=0
     python manu/etf_rotation/probes/probe_reproducibility.py \
-        --baseline /mnt/data/siping/runs/etf_rotation \
-        --rerun   /mnt/data/siping/runs/etf_rotation/_repro_check \
-        --out     /mnt/data/siping/runs/etf_rotation/probe_reproducibility.json
+        --baseline <落点根>/runs \
+        --rerun   <落点根>/runs/_repro_check \
+        --out     <落点根>/runs/probe_reproducibility.json
 
 【比什么】
 - JSON：深比对，**只剔除**声明的易变键（默认 ``meta.generated_at`` / ``generated_at``）；

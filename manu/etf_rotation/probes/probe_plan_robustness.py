@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""最终计划构建器的**鲁棒性**回归探针（只读正式产物；临时文件写在 /mnt/data）。
+"""最终计划构建器的**鲁棒性**回归探针（只读正式产物；临时文件写在持久盘上）。
 
 【为什么需要】
 2026-11-04 22:3x 实测出两个真 bug（专题档 §25）：
@@ -12,7 +12,7 @@
   ⇒ 修法：改成「**运行内快照**」语义——key = 决策件绝对路径；一次构建内**只读一次盘、
   判定恒定**；下一次构建开头调 `reset_decision_failure_cache()` 清缓存 ⇒ 新构建必读新盘。
 
-  🔴 2026-11-04 22:5x 实测**推翻了「按 (mtime_ns, 大小) 失效」的设计**：本机 /mnt/data 的
+  🔴 2026-11-04 22:5x 实测**推翻了「按 (mtime_ns, 大小) 失效」的设计**：本机持久盘的
   mtime 粒度约 **4ms**，且**同大小改写时 mtime 与 size 都不变**（连写 3 次只得 2 个不同
   mtime_ns）⇒ 该键会返回**旧判定**，比不缓存更危险 ⇒ 改用快照语义。
 
@@ -33,7 +33,7 @@
   ⇒ R7/R7b/R7c 断言「计划现金必须与期末现金对得上」+「md 显示原值 → 可达值」。
 
 【副作用】
-只在 <run-root>/_probe_robustness/ 下写临时文件，结束即删；**不碰正式产物**。
+只在临时工作区 `<数据集根>/_work/_probe_robustness/` 下写临时文件，结束即删；**不碰正式产物**。
 """
 from __future__ import annotations
 
@@ -46,15 +46,16 @@ from pathlib import Path
 #: 工程根目录：probes/ → etf_rotation/ → manu/ → 工程根
 PROJECT_DIR = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_DIR / "manu" / "etf_rotation"))
+import config as C  # noqa: E402  （落点常量单一事实源）
 import final_rebalance_plan as frp  # noqa: E402
 from report_fingerprint import report_content_sha1  # noqa: E402
 
-RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
+RUN_ROOT = C.ETF_RUN_ROOT
 #: 🔴 2026-11-04 夜实测修（M-F；reviewer 独立复核查出）：
 #:    探针自称「只读」，实际把 scratch 目录建在**官方产物目录里面** ⇒
 #:    崩了就留残留 + 密钥扫描会扫到 + 并发跑会撞。
-#:    ⇒ 改到 run-root 的**同级**目录（仍在 /mnt/data 下，不写 /tmp）。
-SCRATCH = RUN_ROOT.parent / "_probe_robustness"
+#:    ⇒ 改到**临时工作区** `<数据集根>/_work/`（仍在持久盘上，不写 /tmp、不写官方产物树）。
+SCRATCH = C.WORK_ROOT / "_probe_robustness"
 
 #: 一份**有效**的决策件正文（首行不能含「未完成」，也不能有「- 异常：」行）
 VALID_DECISION_MD = "# TradingAgents 决策纪要 · 测试\n\n- 标的：**512800**；最终评级：**Hold**\n"

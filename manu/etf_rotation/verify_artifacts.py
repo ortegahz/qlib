@@ -8,13 +8,18 @@
 ③ **报告 → context → 决策的 sha1 链是否新鲜**（不许「新规则层 + 旧 LLM 意见」混进交付件）。
 
 【口径】
-- **只读**：本脚本不修改任何产物；唯一的写入是 ``<run-root>/verify_artifacts.log``（自检记录）。
+- **只读**：本脚本不修改任何产物；唯一的写入是**自检日志**。
+- 🔴 2026-11-10（架构迁移收口）：**自检日志绝不写进快照目录**。
+  架构迁移后闸门的断言对象 = **最新完整快照**（``<canonical>/snapshots/<stamp>/``），
+  而快照是**不可变**的（跑完即冻结）⇒ 日志落点改成：
+  ① ``--log-path`` 显式指定 > ② canonical 根（快照根的上一级）
+  ⇒ ``verify_artifacts_<快照名>.log``；**非快照目录**保持旧口径（``<run-root>/verify_artifacts.log``）。
 - 任一断言失败 ⇒ 打印 FAIL 表并以**非零退出码**结束（可直接进 CI / 交接检查）。
 - 断言一律带**数字与容差**，不写「看起来正常」这种无数字结论。
 
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/verify_artifacts.py \
-        --run-root /mnt/data/siping/runs/etf_rotation
+        --run-root <落点根>/runs
 """
 from __future__ import annotations
 
@@ -29,18 +34,29 @@ from typing import Any
 #: 基准 510300 年化的回归探针值与容差（rules.md §十四：必须恒为 12.11%）
 BENCH_ANNUALIZED = 0.1211
 BENCH_TOLERANCE = 0.0005
-#: 账户对账容差（元）
+#: 账户对账容差（元）：算术恒等式（Σ市值 + 现金 = 总资产、股数 × 现价 = 市值）
 ACCOUNT_TOLERANCE = 0.01
+#: 金额**精确对账**容差（元）：事实源 ↔ 报告的同一笔数字，只许浮点表示噪声
+ACCOUNT_EXACT_TOLERANCE = 1e-6
+#: 账户事实源（**交付件同目录**）：``account_context.json`` —— 期望值的唯一来源
+#: 🔴 真实账户的持仓集合 / 总资产 / 现金**不再写死**（旧值 5 只 / 29854.67 / 15518.87
+#:    是 2026-11-04 的旧账户口径 ⇒ 本轮真实账户是 2026-11-05 口径 ⇒ 写死必红）；
+#:    事实源缺失时相关断言**必定 FAIL**（不许真空 PASS）。
+ACCOUNT_CONTEXT_NAME = "account_context.json"
+#: 账户快照（**交付件同目录**）：``account_snapshot.csv`` —— 逐只持仓的原始口径
+ACCOUNT_SNAPSHOT_NAME = "account_snapshot.csv"
 #: 报告 JSON 必须齐的段落
 REQUIRED_SECTIONS = (
     "meta", "stock_scores", "rank_ic", "etf_scores", "filter_stats",
     "candidates", "current_holdings_diagnosis", "next_rebalance",
     "risk_disclosure", "disclaimer",
 )
-#: 真实账户应持有的 5 只（用户账户口径，不许改数）
-EXPECTED_HOLDINGS = ("512800", "159929", "513330", "513770", "512690")
 #: 密钥泄漏探测用的特征串（只报命中数，不打印内容）
 SECRET_MARKER = "sk-cp-"
+#: 快照目录的标志文件（存在 ⇒ 该目录是**不可变快照**，不许往里写任何东西）
+SNAPSHOT_MANIFEST = "snapshot_manifest.json"
+#: 自检日志的默认文件名（非快照目录时用）
+LOG_NAME = "verify_artifacts.log"
 
 #: 把脚本所在目录放进 sys.path ⇒ 可 import 同目录的 final_rebalance_plan（重放 LLM 原文用）
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -48,6 +64,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from report_fingerprint import report_content_sha1_from_file  # noqa: E402
+import config as C  # noqa: E402  （落点常量单一事实源）
 #: LLM「方向 → 目标权重」语义类别（**精确匹配**，不做子串匹配）：
 #: 「不买」含「买」、「卖出」含「卖」⇒ 子串匹配会把「不买」误判成「要买」。
 #: zero = 明确「不持有」⇒ 目标权重必须 = 0%；
@@ -109,6 +126,50 @@ def _read_json(path: Path) -> Any:
         return None
 
 
+def _load_account_context(run_root: Path) -> tuple[dict | None, str]:
+    """读**交付件同目录**的账户事实源 ``account_context.json``。
+
+    🔴 事实源缺失 / 不可读 ⇒ 返回 ``(None, 原因)`` ⇒ 调用方**必须 FAIL**
+       （不许因为取不到期望值就跳过断言或判 PASS ⇒ 不许真空 PASS）。
+    """
+    path = run_root / ACCOUNT_CONTEXT_NAME
+    if not path.is_file():
+        return None, f"缺账户事实源 {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 —— 事实源损坏必须报出来，不许静默
+        return None, f"账户事实源不可读 {path}：{type(exc).__name__}: {exc}"
+    if not isinstance(payload, dict):
+        return None, f"账户事实源格式非法 {path}（不是 JSON 对象）"
+    return payload, str(path)
+
+
+def _account_expectations(ctx: dict) -> tuple[list[str], float | None, float | None, str]:
+    """从账户事实源派生期望值：(持仓代码集合, 总资产, 现金, 原因)。
+
+    事实源里缺字段 ⇒ 返回 ``None`` + 原因 ⇒ 调用方 FAIL；
+    **绝不**拿写死的旧账户常量兜底（那正是本闸门上一轮变红的根因）。
+    """
+    positions = ctx.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return [], None, None, "账户事实源里没有非空 positions 列表"
+    codes: list[str] = []
+    for item in positions:
+        if not isinstance(item, dict):
+            return [], None, None, "账户事实源 positions 里有非对象元素"
+        code = str(item.get("code") or "").strip()
+        if not code:
+            return [], None, None, "账户事实源 positions 里有缺 code 的行"
+        codes.append(code)
+    total_assets = ctx.get("total_assets")
+    cash = ctx.get("cash")
+    if not isinstance(total_assets, (int, float)) or isinstance(total_assets, bool):
+        return sorted(codes), None, None, "账户事实源缺 total_assets"
+    if not isinstance(cash, (int, float)) or isinstance(cash, bool):
+        return sorted(codes), None, None, "账户事实源缺 cash"
+    return sorted(codes), float(total_assets), float(cash), ""
+
+
 def _calendar_days(run_root: Path) -> tuple[set[str], str]:
     """交易日历并集：qlib 历史日历 ∪ akshare 完整日历。
 
@@ -117,11 +178,11 @@ def _calendar_days(run_root: Path) -> tuple[set[str], str]:
     """
     days: set[str] = set()
     sources: list[str] = []
-    qlib_cal = Path("/mnt/data/siping/datasets/qlib/cn_data/calendars/day.txt")
+    qlib_cal = Path(C.PROVIDER_URI) / "calendars" / "day.txt"
     if qlib_cal.exists():
         days |= {line.strip() for line in qlib_cal.read_text(encoding="utf-8").splitlines() if line.strip()}
         sources.append(str(qlib_cal))
-    ak_cal = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+    ak_cal = C.ETF_DATA_ROOT / "trade_calendar.csv"
     if ak_cal.exists():
         for line in ak_cal.read_text(encoding="utf-8").splitlines()[1:]:
             token = line.strip()
@@ -197,45 +258,101 @@ def _check_benchmark(run_root: Path, backtest: Path | None) -> list[tuple[str, b
     return out
 
 
-def _check_account(run_root: Path) -> list[tuple[str, bool, str]]:
-    """账户对账：Σ市值 + 现金 = 总资产；股数 × 现价 = 市值；5 只持仓齐全。"""
-    snap_path = Path("/tmp/pycharm_project_658d3fc4/manu/etf_rotation/data/account_snapshot.csv")
-    if not snap_path.exists():
-        return [("账户对账", False, f"缺账户快照 {snap_path}")]
+def _read_account_snapshot_csv(path: Path) -> tuple[list[dict[str, str]], str]:
+    """读账户快照 CSV ⇒ (行列表, 错误原因)。"""
     # 🔴 该 CSV 带 **UTF-8 BOM**（`account.py` 用 `encoding="utf-8-sig"` 读）⇒ 这里必须同样剥 BOM，
     #    否则表头变成「\ufeffcode」⇒ 误报「快照缺列」。
-    raw = snap_path.read_text(encoding="utf-8-sig")
+    raw = path.read_text(encoding="utf-8-sig")
     rows = [line.split(",") for line in raw.splitlines() if line.strip()]
+    if not rows:
+        return [], f"账户快照 {path} 是空的"
     header = [c.strip() for c in rows[0]]
     idx = {name: i for i, name in enumerate(header)}
     need = ("code", "name", "shares", "price", "market_value")
     missing_cols = [c for c in need if c not in idx]
     if missing_cols:
-        return [("账户对账", False, f"快照缺列：{missing_cols}")]
+        return [], f"账户快照 {path} 缺列：{missing_cols}"
+    out: list[dict[str, str]] = []
+    for row in rows[1:]:
+        if len(row) < len(header):
+            continue
+        out.append({name: row[idx[name]].strip() for name in need})
+    return out, ""
+
+
+def _check_account(run_root: Path) -> list[tuple[str, bool, str]]:
+    """账户对账：Σ市值 + 现金 = 总资产；股数 × 现价 = 市值；持仓集合与账户事实源精确相等。
+
+    🔴 期望值（现金 / 总资产 / 持仓集合）的**唯一来源** = **交付件同目录**的
+       ``account_context.json``（账户事实源）。旧实现写死
+       ``/tmp/pycharm_project_658d3fc4/manu/etf_rotation/data/account_snapshot.csv``
+       + cash=15518.87 / total_assets=29854.67（2026-11-04 的 5 只旧账户口径）
+       ⇒ 本轮真实账户（2026-11-05 口径：1 只 512800 / 总资产 30035.57 / 现金 23367.37）
+       必然对不上 ⇒ 闸门必红。
+       ⇒ 现在：事实源优先 ⇒ 同目录 ``account_snapshot.csv`` 回落 ⇒ 都没有 ⇒ FAIL（不许真空 PASS）。
+    """
+    ctx, ctx_detail = _load_account_context(run_root)
+    snap_path = run_root / ACCOUNT_SNAPSHOT_NAME
+    snap_rows, snap_err = ([], f"缺同目录 {ACCOUNT_SNAPSHOT_NAME}")
+    if snap_path.is_file():
+        snap_rows, snap_err = _read_account_snapshot_csv(snap_path)
+    if ctx is None:
+        return [("账户对账", False,
+                 f"账户事实源缺失 ⇒ 不许真空 PASS：{ctx_detail}"
+                 f"｜{snap_err}（期望的现金/总资产/持仓集合无从核对）")]
+    exp_codes, exp_total, exp_cash, exp_err = _account_expectations(ctx)
+    if exp_err:
+        return [("账户对账", False,
+                 f"账户事实源不完整 ⇒ 不许真空 PASS：{ctx_detail}：{exp_err}")]
+
     total_mv = 0.0
     worst = 0.0
     codes: list[str] = []
-    for row in rows[1:]:
-        code = row[idx["code"]].strip().zfill(6)
-        codes.append(code)
-        shares = float(row[idx["shares"]])
-        price = float(row[idx["price"]])
-        mv = float(row[idx["market_value"]])
-        total_mv += mv
-        worst = max(worst, abs(shares * price - mv))
-    cash = 15518.87
-    total_assets = 29854.67
-    diff = abs(total_mv + cash - total_assets)
-    ok = diff < ACCOUNT_TOLERANCE and worst < ACCOUNT_TOLERANCE and set(codes) == set(EXPECTED_HOLDINGS)
-    detail = (
-        f"Σ市值 {total_mv:.2f} + 现金 {cash:.2f} = {total_mv + cash:.2f}（总资产 {total_assets:.2f}，差 {diff:.4f}）"
-        f"｜股数×现价 最大偏差 {worst:.4f}｜持仓 {len(codes)} 只 {codes}"
+    source = ""
+    if snap_rows:
+        source = f"{ACCOUNT_SNAPSHOT_NAME}（逐只原始口径）"
+        for row in snap_rows:
+            codes.append(row["code"].zfill(6))
+            shares = float(row["shares"])
+            price = float(row["price"])
+            mv = float(row["market_value"])
+            total_mv += mv
+            worst = max(worst, abs(shares * price - mv))
+    else:
+        source = f"{ACCOUNT_CONTEXT_NAME}（positions 自带市值）"
+        for item in ctx.get("positions") or []:
+            codes.append(str(item.get("code") or "").strip())
+            shares = float(item.get("shares") or 0.0)
+            price = float(item.get("price") or 0.0)
+            mv = float(item.get("market_value") or 0.0)
+            total_mv += mv
+            worst = max(worst, abs(shares * price - mv))
+    diff = abs(total_mv + exp_cash - exp_total)
+    ok = (
+        bool(exp_codes)
+        and sorted(codes) == exp_codes
+        and diff < ACCOUNT_TOLERANCE
+        and worst < ACCOUNT_TOLERANCE
     )
+    detail = (
+        f"口径={ctx_detail}｜市值来源={source}｜"
+        f"Σ市值 {total_mv:.2f} + 现金 {exp_cash:.2f} = {total_mv + exp_cash:.2f}"
+        f"（总资产 {exp_total:.2f}，差 {diff:.4f}）"
+        f"｜股数×现价 最大偏差 {worst:.4f}｜持仓 {len(codes)} 只 {sorted(codes)}"
+        f"｜期望 {exp_codes}（精确相等）"
+    )
+    if snap_err:
+        detail += f"｜注：{snap_err}"
     return [("账户对账（Σ市值+现金=总资产）", ok, detail)]
 
 
-def _check_report(report: dict) -> list[tuple[str, bool, str]]:
-    """分析报告：段落齐全、风险披露非空、持仓诊断 5 只、RankIC 不为空。"""
+def _check_report(report: dict, run_root: Path) -> list[tuple[str, bool, str]]:
+    """分析报告：段落齐全、风险披露非空、持仓诊断与账户事实源一致、RankIC 不为空。
+
+    🔴 持仓诊断的期望值来自**交付件同目录**的 ``account_context.json``（账户事实源）
+       ⇒ 不再写死「5 只 / 29854.67 / 15518.87」（2026-11-04 的旧账户口径）；
+       事实源缺失 ⇒ 该条**必定 FAIL**（不许真空 PASS）。
+    """
     out: list[tuple[str, bool, str]] = []
     missing = [s for s in REQUIRED_SECTIONS if s not in report]
     out.append(("报告段落齐全", not missing, "10 段齐全" if not missing else f"缺：{missing}"))
@@ -265,12 +382,40 @@ def _check_report(report: dict) -> list[tuple[str, bool, str]]:
     out.append(("RankIC N=5 / N=20 可算", ic_ok, "；".join(ic_detail)))
     diag = report.get("current_holdings_diagnosis") or {}
     holdings = diag.get("holdings") or []
-    got = sorted(str(h.get("code")) for h in holdings)
-    out.append((
-        "持仓诊断逐只齐全（5 只）",
-        got == sorted(EXPECTED_HOLDINGS),
-        f"诊断 {got}",
-    ))
+    got = sorted(str(h.get("code") or "").strip() for h in holdings)
+    ctx, ctx_detail = _load_account_context(run_root)
+    if ctx is None:
+        out.append((
+            "持仓诊断逐只齐全（与账户事实源一致）",
+            False,
+            f"账户事实源缺失 ⇒ 不许真空 PASS：{ctx_detail}",
+        ))
+    else:
+        exp_codes, exp_total, exp_cash, exp_err = _account_expectations(ctx)
+        if exp_err:
+            out.append((
+                "持仓诊断逐只齐全（与账户事实源一致）",
+                False,
+                f"账户事实源不完整 ⇒ 不许真空 PASS：{ctx_detail}：{exp_err}",
+            ))
+        else:
+            got_total = diag.get("total_assets")
+            got_cash = diag.get("cash")
+            ok_codes = bool(exp_codes) and got == exp_codes
+            ok_total = (
+                isinstance(got_total, (int, float)) and not isinstance(got_total, bool)
+                and abs(float(got_total) - exp_total) <= ACCOUNT_EXACT_TOLERANCE
+            )
+            ok_cash = (
+                isinstance(got_cash, (int, float)) and not isinstance(got_cash, bool)
+                and abs(float(got_cash) - exp_cash) <= ACCOUNT_EXACT_TOLERANCE
+            )
+            out.append((
+                "持仓诊断逐只齐全（与账户事实源一致）",
+                ok_codes and ok_total and ok_cash,
+                f"口径={ctx_detail}｜诊断持仓 {got}｜期望 {exp_codes}（精确相等）"
+                f"｜总资产 {got_total} vs {exp_total}｜现金 {got_cash} vs {exp_cash}",
+            ))
     funnel = report.get("filter_stats") or {}
     out.append((
         "过滤漏斗计数自洽",
@@ -286,7 +431,7 @@ def _check_next_rebalance(report: dict) -> list[tuple[str, bool, str]]:
     """下一调仓节点：在日历并集内、是当月第一个交易日、距今 >0。"""
     nxt = report.get("next_rebalance") or {}
     target = str(nxt.get("target_date") or "")
-    days, source = _calendar_days(Path("/mnt/data/siping/runs/etf_rotation"))
+    days, source = _calendar_days(C.ETF_RUN_ROOT)
     in_calendar = target in days
     is_first_of_month = bool(target) and target[8:10] == "01"
     # 当月第一个交易日：目标日之前、当月内没有更早的交易日
@@ -760,13 +905,36 @@ def _check_secret_leak(run_root: Path) -> list[tuple[str, bool, str]]:
     return [("受控产物无 API key", hits == 0, f"扫描 {scanned} 个文件，命中 {hits} 处")]
 
 
+def _is_snapshot_dir(root: Path) -> bool:
+    """该目录是不是**不可变快照**（有 manifest ⇒ 是）。"""
+    return (root / SNAPSHOT_MANIFEST).is_file()
+
+
+def _resolve_log_path(run_root: Path, explicit: str = "") -> Path:
+    """自检日志落点：**绝不写进快照目录**（快照跑完即冻结，写进去就破了不变式）。
+
+    优先级：
+    ① ``--log-path`` 显式指定（调用方自己负责不是快照）；
+    ② run-root **不是**快照 ⇒ 旧口径 ``<run-root>/verify_artifacts.log``；
+    ③ run-root **是**快照 ⇒ canonical 根（快照根的上一级）``verify_artifacts_<快照名>.log``。
+    """
+    if explicit:
+        return Path(explicit)
+    if not _is_snapshot_dir(run_root):
+        return run_root / LOG_NAME
+    canonical = run_root.parent.parent if run_root.parent.name == "snapshots" else run_root.parent
+    return canonical / f"verify_artifacts_{run_root.name}.log"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ETF 轮动线产物回归自检")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     ap.add_argument("--backtest", default=None, help="回测产物路径（默认取 run-root 里最新的 etf_rotation_backtest_*.json）")
+    ap.add_argument("--log-path", default="", help="自检日志落点（缺省：快照 ⇒ canonical 根；非快照 ⇒ run-root）")
     args = ap.parse_args()
 
     run_root = Path(args.run_root)
+    log_path = _resolve_log_path(run_root, args.log_path)
     report = _read_json(run_root / "etf_analysis_report.json")
     plan = _read_json(run_root / "final_rebalance_plan.json")
     rec = _read_json(run_root / "rebalance_recommendation.json")
@@ -790,7 +958,7 @@ def main() -> int:
     if not isinstance(report, dict):
         results.append(("分析报告可读", False, "etf_analysis_report.json 缺失或损坏"))
     else:
-        results += _check_report(report)
+        results += _check_report(report, run_root)
         results += _check_next_rebalance(report)
     if not isinstance(plan, dict):
         results.append(("最终计划可读", False, "final_rebalance_plan.json 缺失或损坏"))
@@ -818,10 +986,12 @@ def main() -> int:
     lines.append(f"合计 {len(results)} 项：PASS {len(results) - failed} / FAIL {failed}")
     text = "\n".join(lines)
     print(text)
+    print(f"[INFO] 自检日志落点：{log_path}")
     try:
-        (run_root / "verify_artifacts.log").write_text(text + "\n", encoding="utf-8")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(text + "\n", encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 —— 写日志失败不该掩盖自检结论
-        print(f"[WARN] 写 verify_artifacts.log 失败：{exc}")
+        print(f"[WARN] 写自检日志失败：{exc}")
     return 1 if failed else 0
 
 

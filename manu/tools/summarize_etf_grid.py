@@ -2,7 +2,7 @@
 
 用法（服务器）：
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/summarize_etf_grid.py \
-        --dir /mnt/data/siping/runs/etf_rotation --pattern "etf_rotation_backtest_*.json"
+        --dir <落点根>/runs --pattern "etf_rotation_backtest_*.json"
 
 输出：每个场景一行（年化 / 基准 / 超额 / Sharpe / MDD / 换手 / 成本 / 刹车事件 / H1·H2 分段）。
 口径提醒：超额为**相对口径（几何）**；(1+r_p)/(1+r_b)-1 逐日累计后年化。
@@ -13,6 +13,15 @@ import argparse
 import glob
 import json
 import os
+
+
+#: 🔴 **结果落点根**：单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
+#:    `ETF_ROTATION_RESULTS_ROOT` ⇒ 本工具按**同一个环境变量**取值（两边不会分叉）。
+_RESULTS_ROOT = os.environ.get(
+    "ETF_ROTATION_RESULTS_ROOT", "/mnt/data/siping/runs/etf_rotation_results"
+)
+#: 产物根缺省值（= 结果根；与 `daily_config.RESEARCH_RUN_ROOT` 同口径）
+_DEFAULT_RUN_ROOT = _RESULTS_ROOT
 
 
 def _f(x):
@@ -74,7 +83,7 @@ def render(rows: list[dict]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--dir", default=str(_DEFAULT_RUN_ROOT))
     ap.add_argument("--pattern", default="etf_rotation_backtest_*.json")
     args = ap.parse_args()
     rows = collect(args.dir, args.pattern)

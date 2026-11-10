@@ -102,7 +102,7 @@ def read_calendar_dates(path: Path | str | None) -> list[date]:
     if not p.exists():
         raise FileNotFoundError(
             f"交易日历缺失：`{p}` 不存在 ⇒ 无法判定信号日可达性"
-            f"（服务器路径通常是 /mnt/data/siping/datasets/qlib/cn_data/calendars/day.txt）"
+            f"（服务器路径通常是 $ETF_ROTATION_OUTPUT_ROOT/datasets/qlib/cn_data/calendars/day.txt）"
         )
     out: set[date] = set()
     for raw in p.read_text(encoding="utf-8").splitlines():

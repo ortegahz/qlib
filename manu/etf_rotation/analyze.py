@@ -26,8 +26,8 @@
 【用法（服务器）】
     export PYTHONHASHSEED=0
     python manu/etf_rotation/analyze.py --asof 2026-11-03 \
-        --out-dir /mnt/data/siping/runs/etf_rotation \
-        --account-snapshot /mnt/data/siping/runs/etf_rotation/account_snapshot.csv
+        --out-dir <落点根>/runs \
+        --account-snapshot <落点根>/runs/account_snapshot.csv
 
 【输出】
 - `<out-dir>/etf_analysis_report.json`：结构化（下游机器读）
@@ -55,6 +55,7 @@ import config as C  # noqa: E402
 import signal_policy as SP  # noqa: E402
 import microstructure as MS  # noqa: E402
 import lookahead as LA  # noqa: E402
+import score_smoothing as SS  # noqa: E402
 from engine.features import (  # noqa: E402
     add_relative_strength,
     compute_etf_features,
@@ -350,7 +351,8 @@ def _ensure_hash_seed() -> None:
 #:    **不含未来** ⇒ 单靠它无法推导「下一个自然月的第一个交易日」。
 #:    生成方式（用 `ak` env，🔴 akshare 绝不能装进 `ql` env）：
 #:      /home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/data/fetch_trade_calendar.py
-DEFAULT_TRADE_CALENDAR_CSV = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+#: akshare 交易日历（落点 `<落点根>/datasets/etf/trade_calendar.csv`）
+DEFAULT_TRADE_CALENDAR_CSV = C.ETF_DATA_ROOT / "trade_calendar.csv"
 
 
 def _default_calendar_path() -> Path:
@@ -503,7 +505,7 @@ def _read_calendar(path: Path) -> list[pd.Timestamp]:
         raise FileNotFoundError(
             f"qlib 交易日历缺失：`{path}` 不存在 ⇒ 无法推导下一个调仓节点"
             f"（可用 --calendar 指定路径；服务器上的路径是 "
-            f"/mnt/data/siping/datasets/qlib/cn_data/calendars/day.txt）"
+            f"$ETF_ROTATION_OUTPUT_ROOT/datasets/qlib/cn_data/calendars/day.txt）"
         )
     dates: list[pd.Timestamp] = []
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -933,6 +935,7 @@ def _rebuild_chain(
     entry_ma_window: int | None,
     exit_ma_window: int | None,
     brake_mode: bool = False,
+    alpha_override: pd.DataFrame | None = None,
 ) -> dict:
     """在分析侧重放 `engine/portfolio.build_portfolio` 的过滤链（调用同一批 engine 函数）。
 
@@ -1015,6 +1018,10 @@ def _rebuild_chain(
     )
     cand["alpha_score"] = cand["alpha_score"].astype(float)
     cand["coverage_ok"] = cand["coverage_ok"].eq(True)
+    # ---- 时间平滑（可选）=====
+    # 🔴 与 `engine/portfolio.py` 共用 `score_smoothing.apply_alpha_override` 这一份实现
+    #    ⇒ 分析侧重放与引擎决策**不会漂移**（漂移 ⇒ 报告直接拒绝出报告）。
+    cand = SS.apply_alpha_override(cand, alpha_override)
     bucket_col = "fund_type_bucket" if "fund_type_bucket" in cand.columns else None
     buckets = (
         cand[bucket_col].astype(str)
@@ -1031,12 +1038,21 @@ def _rebuild_chain(
     )
     lookup["alpha_score"] = lookup["alpha_score"].astype(float)
     lookup["coverage_ok"] = lookup["coverage_ok"].eq(True)
+    # 全池视图也要带平滑列（与 `cand` 同一份实现 ⇒ 口径一致）
+    lookup = SS.apply_alpha_override(lookup, alpha_override)
 
     # ---- 池属性口径（e_covered）----
     mode = pool_mode or C.POOL_MODE
     n_before = len(cand)
     if mode == "e_covered":
-        keep_mask = cand["coverage_ok"].eq(True) | cand["is_defensive"].eq(True)
+        # 🔴 **严格口径（2026-11-06）**：coverage 达标才入池。
+        #    「防守资产」（货币 / 黄金 / 商品）**不再走旁路** ⇒ 否则「没有 A 股卷面」的标的
+        #    会靠**自身动量**混进与 E=W×S 真实打分同一张榜单 ⇒ 口径不自洽。
+        #    ⇒ 保留 `POOL_ALLOW_DEFENSIVE_BYPASS=True` 开关以复现 v1 旧行为（回测对照用）。
+        if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False):
+            keep_mask = cand["coverage_ok"].eq(True) | cand["is_defensive"].eq(True)
+        else:
+            keep_mask = cand["coverage_ok"].eq(True)
         dropped = cand[~keep_mask]
         # 🔴 **「算不出 E」有两种完全不同的原因，不能混为一谈**（2026-11-04 夜实测）：
         #    ① 该 ETF 在 `etf_holdings.csv` 里**一行成分都没有** ⇒ 是**数据缺口**
@@ -1079,7 +1095,12 @@ def _rebuild_chain(
             "extra_pool_attribute",
             "附加 · 标的池属性口径（能穿透才入池）",
             "extra",
-            f"POOL_MODE={mode}：coverage ≥ {C.MIN_E_COVERAGE:.0%} 或 属防守资产",
+            (
+                f"POOL_MODE={mode}：coverage ≥ {C.MIN_E_COVERAGE:.0%}"
+                + ("（**或**属防守资产＝v1 旧口径）"
+                   if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False)
+                   else "（**严格口径：防守资产也不旁路**）")
+            ),
             n_before,
             len(cand),
             eliminated_attr,
@@ -1250,7 +1271,11 @@ def _rebuild_chain(
     #    标准化后恰为 z_alpha = 0（中性分，不奖不惩）⇒ 只能靠自身动量入选。
     #    ⚠️ 这是「兜底席」的来源（本次 31 只池里 **16 只**）⇒ 报告已逐只点名、风险披露也点名，
     #    **不许**改成 fillna(0)（那会变成最差分、白白浪费席位），也不许悄悄删掉这条口径。
-    pool["z_alpha"] = _z(pool["alpha_score"].fillna(pool["alpha_score"].mean()))
+    # 🔴 与 `engine/portfolio.py` 同口径：实际参与排序的是 `alpha_score_used`
+    #    （平滑开启 = 平滑分，否则 = 原始分）；原始分 `alpha_score` 永远保留不改。
+    #    穿透为 0 的 ETF 用**池内均值**补 ⇒ 标准化后 z_alpha = 0（中性分，不奖不惩）
+    #    ⇒ 只能靠自身动量入选。**不许**改成 fillna(0)。
+    pool["z_alpha"] = _z(pool["alpha_score_used"].fillna(pool["alpha_score_used"].mean()))
     pool["z_mom"] = _z(pool["momentum_score_trend_adj"])
     w_alpha = C.ALPHA_SCORE_WEIGHT if alpha_weight is None else float(alpha_weight)
     w_mom = C.MOMENTUM_SCORE_WEIGHT if momentum_weight is None else float(momentum_weight)
@@ -1377,6 +1402,10 @@ def _build_candidates(
                 "code": code,
                 "name": str(r.get("name", "")),
                 "e_score": _clean(r.get("alpha_score")),
+                # 时间平滑三件套：原始分 / 平滑分 / 平滑窗口内的得分标准差
+                "raw_score": _clean(r.get("alpha_score")),
+                "smoothed_score": _clean(r.get("smoothed_score")),
+                "score_stability_5d": _clean(r.get("score_stability")),
                 "coverage": _clean(r.get("coverage")),
                 "n_constituents": int(n_constituents.get(code, 0)),
                 "n_constituents_scored": _clean(r.get("n_stocks_scored")),
@@ -1673,6 +1702,43 @@ def _same_theme_calibers(fl: dict) -> list[dict]:
     return out
 
 
+def _w_snapshot_gap_sign(w: dict) -> int | None:
+    """W 快照日 − 信号日（**天**）；``gap_days`` 认不出 ⇒ None（不猜）。
+
+    🔴 口径：``gap_days`` = 快照日 − 信号日 ⇒ **正数 = 快照日晚于信号日（前视）**、
+       **负数 = 快照日早于信号日（已滞后，不构成前视）**。
+    """
+    gap = (w or {}).get("gap_days")
+    if gap is None:
+        return None
+    try:
+        return int(gap)
+    except (TypeError, ValueError):
+        return None
+
+
+def _w_snapshot_gap_phrase(w: dict) -> str:
+    """把 W 快照日与信号日的时间差说成人话（**按符号分叉**，不许把负数说成「晚于」）。
+
+    🔴 2026-11-10（服务器实跑 20261110_120420 实证）：旧措辞**无条件**把 ``gap_days``
+       拼成「晚于信号日共 N 天」⇒ 本轮输出「快照日 2026-11-04 **晚于**信号日 2026-11-09
+       共 **-5 天**」⇒ 与事实**正好相反**（实际是**早于** 5 天 ⇒ W 快照已**滞后**、
+       **不构成前视**）⇒ 交付件自相矛盾 ⇒ 闸门红。
+    ⇒ 修法：``>0`` ⇒ 晚于；``==0`` ⇒ 等于信号日；``<0`` ⇒ 早于（快照已滞后，不构成前视）。
+    """
+    gap = _w_snapshot_gap_sign(w)
+    if gap is None:
+        return ""
+    snap = (w or {}).get("snapshot_date")
+    asof = (w or {}).get("asof")
+    if gap > 0:
+        return f"快照日 **{snap}** 晚于信号日 **{asof}** 共 **{gap} 天**"
+    if gap == 0:
+        return f"快照日 **{snap}** 等于信号日 **{asof}**（同一天，gap=0 天）"
+    return (f"快照日 **{snap}** 早于信号日 **{asof}** 共 **{abs(gap)} 天**"
+            "（快照已滞后，不构成前视）")
+
+
 def _w_lookahead_clause(la: dict | None) -> str:
     """把 W 快照前视的**实测数字**拼成一句可读的话。
 
@@ -1685,11 +1751,10 @@ def _w_lookahead_clause(la: dict | None) -> str:
     eb = la.get("e_bound") or {}
     fl = la.get("flip_test") or {}
     parts: list[str] = []
-    gap = w.get("gap_days")
+    gap = _w_snapshot_gap_sign(w)
     if gap is not None:
-        parts.append(
-            f"🔴 **快照日 {w.get('snapshot_date')} 晚于信号日 {w.get('asof')} 共 {gap} 天**"
-        )
+        # 🔴 只有快照日**晚于**信号日才是前视 ⇒ 负 gap（已滞后）不许再挂 🔴
+        parts.append(f"{'🔴' if gap > 0 else '⚪'} {_w_snapshot_gap_phrase(w)}")
     if w.get("n_snapshot_dates") is not None:
         parts.append(
             f"本地只有 **{w.get('n_snapshot_dates')} 个快照日** ⇒ 成分集漂移**不可直接观测**"
@@ -1993,7 +2058,11 @@ def _risk_disclosure(
             "severity": "medium",
             "detail": (
                 f"标的池口径 POOL_MODE={chain['pool_mode']} ⇒ 只有 coverage ≥ "
-                f"{C.MIN_E_COVERAGE:.0%} 或属防守资产的 ETF 能入池；候选池文件共 {n_universe_rows} 行，"
+                f"{C.MIN_E_COVERAGE:.0%} 的 ETF 能入池"
+                + ("（**或**属防守资产＝v1 旧口径）"
+                   if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False)
+                   else "（**严格口径：防守资产也不旁路**）")
+                + f"；候选池文件共 {n_universe_rows} 行，"
                 f"经流动性/属性过滤后剩 {n_pool} 只 ⇒ **选股范围被人为收窄**，"
                 f"跨类资产（商品 / 跨境 / 货币）的分散收益被系统性放弃。"
             ),
@@ -2006,9 +2075,17 @@ def _risk_disclosure(
             "severity": "high",
             "detail": (
                 f"本次共 {n_etfs_no_e} 只 ETF 的 coverage < {C.MIN_E_COVERAGE:.0%}"
-                f"（美股 / 港股通 / 实物金 / 商品期货等）⇒ 它们的 E = W×S **算不出来**，"
-                f"只能靠**自身动量**入选 ⇒ 等于绕过了个股层建模（违反「不许跳过 E=W×S」的约束）；"
-                f"报告里已逐只标注 coverage，请人工核对是否接受。"
+                f"（美股 / 港股通 / 实物金 / 商品期货 / 货币等）⇒ 它们的 E = W×S **算不出来**，"
+                + (
+                    "在 v1 旧口径下只能靠**自身动量**入选 ⇒ 等于绕过了个股层建模；"
+                    "报告里已逐只标注 coverage，请人工核对是否接受。"
+                    if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False)
+                    else "**严格口径下已全部被剔除出候选池**（含防守资产）⇒ "
+                    "池内每只标的的分数都来自真实的 E=W×S 穿透 ⇒ "
+                    "「没有 A 股卷面的考生」不再与真实打分同榜排名；"
+                    "代价是**跨类资产分散被系统性放弃**（见「池属性限制」项），"
+                    "且**含旁路的旧回测数字已作废**（须以严格口径重跑为准）。"
+                )
             ),
         }
     )
@@ -2236,11 +2313,38 @@ def _render_markdown(rep: dict) -> str:
     add("## 一、数据与参数口径")
     add("")
     params = meta["params"]
+    # 🔴 排序依据注记（平滑开启与否**都**必须说清楚 ⇒ 报告口径可对账）
+    sm = rep.get("score_smoothing") or {}
+    sm_basis = sm.get("ranking_basis") or "瞬态分（未启用平滑）"
+    sm_obs = "、".join(sm.get("observation_dates") or []) or "无"
+    sm_half = sm.get("effective_half_life_trading_days")
+    sm_fallback = sm.get("n_codes_fallback_transient")
+    sm_note = (
+        f"> **排序依据**：{sm_basis}"
+        f"｜最终分 = {params.get('alpha_weight')} × z(平滑穿透分) "
+        f"+ {params.get('momentum_weight')} × z(动量分)"
+        f"｜实际观测日：{sm_obs}"
+        + (f"｜EWMA 半衰期 {sm_half} 个交易日" if sm_half is not None else "")
+        + (f"｜{sm_fallback} 只因历史不足退化成瞬态分" if sm_fallback else "")
+    )
     rows = [
         ["信号日 asof", meta["asof"], "个股分数里最新的一天（可用 --asof 覆盖）"],
         ["标的池口径 pool_mode", params["pool_mode"], "只允许 coverage 达标或防守资产的 ETF 入池"],
         ["α 权重（E）", params["alpha_weight"], "E=W×S 与 ETF 自身动量的合成权重"],
         ["动量权重", params["momentum_weight"], "ETF 自身 20/60/120 日动量分权重"],
+        ["穿透分平滑", (
+            "关闭" if not params.get("score_smoothing_enabled")
+            else f"{params['score_smoothing_method']}"
+                 f"（alpha={params['score_smoothing_alpha']}，"
+                 f"窗口 {params['score_smoothing_window']} 交易日）"
+        ), "排序用平滑后的穿透分（抑制单日噪声 ⇒ 排名更稳、换手更少）；原始分同时披露"],
+        ["平滑半衰期", (
+            f"{params['score_smoothing_half_life_days']} 个交易日"
+            if params.get("score_smoothing_half_life_days") is not None else "-"
+        ), "EWMA 衰减速度；alpha=0.35 ⇒ 约 1.61 日（**不是**需求文档写的 3~5 日）"],
+        ["平滑观测日", (
+            "、".join(params.get("score_smoothing_observation_dates") or []) or "-"
+        ), "实际参与平滑的打分日（打分栅格每 10 个交易日一个点 ⇒ 观测点稀疏）"],
         ["目标只数 topk", params["target_n_holdings"], "组合规模（3~5 只）"],
         ["迟滞缓冲 hold_buffer", params["hold_buffer"], "已持有标的的保位缓冲（压换手）"],
         ["入场破位均线", params["entry_ma_window"], "收盘价跌破 ⇒ 不许新开仓"],
@@ -2372,6 +2476,7 @@ def _render_markdown(rep: dict) -> str:
         + ("；🔴 快照日期**不一致**（部分 code 仍停在更早日期）⇒ 只看最晚会低估滞后"
            if _w_mix else ""))
     add(f"- 有 E 的 ETF {es['n_etfs_with_e']} 只；无 E / coverage 不足 {es['n_etfs_without_e']} 只")
+    add(sm_note)
     add("")
     rows = []
     for row in es["rows"][:30]:
@@ -2380,6 +2485,8 @@ def _render_markdown(rep: dict) -> str:
                 row["code"],
                 row["name"][:18],
                 _num(row.get("e_score"), 4),
+                _num(row.get("smoothed_score"), 4),
+                _num(row.get("score_stability_5d"), 4),
                 str(row.get("e_rank") or "-"),
                 _pct(row.get("coverage")),
                 str(row.get("n_constituents")),
@@ -2388,7 +2495,7 @@ def _render_markdown(rep: dict) -> str:
             ]
         )
     lines.extend(_md_table(
-        ["代码", "名称", "E", "E 排名", "coverage", "成分数", "有分成分数", "可用"],
+        ["代码", "名称", "E（原始）", "平滑分", "稳定度", "E 排名", "coverage", "成分数", "有分成分数", "可用"],
         rows,
     ))
     if len(es["rows"]) > 30:
@@ -2439,6 +2546,8 @@ def _render_markdown(rep: dict) -> str:
     # ---- 六、候选清单 ----
     add("## 六、候选清单（Top-N，供人工核对）")
     add("")
+    add(sm_note)
+    add("")
     rows = []
     for c in rep["candidates"]:
         rows.append(
@@ -2447,6 +2556,8 @@ def _render_markdown(rep: dict) -> str:
                 c["code"],
                 c["name"][:18],
                 _num(c.get("e_score"), 3),
+                _num(c.get("smoothed_score"), 3),
+                _num(c.get("score_stability_5d"), 3),
                 _pct(c.get("coverage")),
                 _pct(c.get("mom20")),
                 _pct(c.get("mom60")),
@@ -2459,8 +2570,8 @@ def _render_markdown(rep: dict) -> str:
             ]
         )
     lines.extend(_md_table(
-        ["#", "代码", "名称", "E", "coverage", "mom20", "mom60", "mom120", "动量分", "总分",
-         "破位", "主题簇", "结论"],
+        ["#", "代码", "名称", "E（原始）", "平滑分", "稳定度", "coverage", "mom20", "mom60",
+         "mom120", "动量分", "总分", "破位", "主题簇", "结论"],
         rows,
     ))
     add("")
@@ -2670,9 +2781,17 @@ def _render_markdown(rep: dict) -> str:
                 f"{e.get('effective_delta_days_vs_asof')} 天 | {e.get('role')} | {flag} | "
                 f"{e.get('used_for')} |")
         add("")
-        if w.get("gap_days") is not None:
-            add(f"- 🔴 **W 快照前视**：快照日 **{w.get('snapshot_date')}** 晚于信号日 "
-                f"**{w.get('asof')}** 共 **{w.get('gap_days')} 天**；"
+        gap = _w_snapshot_gap_sign(w)
+        if gap is not None:
+            # 🔴 标题也按符号分叉：快照日**晚于**信号日才是「W 快照前视」；
+            #    早于 ⇒ 快照已滞后（**不构成前视**），不许再挂「前视」字样。
+            if gap > 0:
+                _head = "🔴 **W 快照前视**"
+            elif gap == 0:
+                _head = "⚪ **W 快照与信号日同日**"
+            else:
+                _head = "⚪ **W 快照滞后（非前视）**"
+            add(f"- {_head}：{_w_snapshot_gap_phrase(w)}；"
                 f"本地只有 **{w.get('n_snapshot_dates')} 个快照日** ⇒ {w.get('unobservable_reason')} "
                 f"⇒ **不可修（fixable=false），只能量化**。")
         if eb.get("max_delta_e_realistic") is not None:
@@ -2759,6 +2878,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha-weight", type=float, default=None, help="E（W×S）的合成权重")
     p.add_argument("--momentum-weight", type=float, default=None, help="ETF 自身动量分的合成权重")
     p.add_argument("--hold-buffer", type=int, default=None, help="迟滞缓冲（默认 config.HOLD_BUFFER）")
+    p.add_argument("--no-smoothing", action="store_true",
+                   help="关闭穿透分的时间平滑（对照用；默认开启）")
+    p.add_argument("--smoothing-method", default=None, choices=list(SS.SMOOTHING_METHODS),
+                   help="平滑方法：ewma（默认）/ rolling")
+    p.add_argument("--smoothing-window", type=int, default=None,
+                   help="滚动窗口（**交易日**；默认 5）")
+    p.add_argument("--smoothing-alpha", type=float, default=None,
+                   help="EWMA 系数 alpha（默认 0.35 ⇒ 半衰期约 1.61 个交易日）")
+    p.add_argument("--smoothing-history-days", type=int, default=None,
+                   help="EWMA 预热历史跨度（**交易日**；默认 30）")
     p.add_argument("--entry-ma-window", type=int, default=None, help="入场破位过滤均线（0=关）")
     p.add_argument("--exit-ma-window", type=int, default=None, help="持仓强制退出均线（0=关）")
     p.add_argument("--nav", type=float, default=None, help="账户实际净值（配合 --nav-peak 判断回撤刹车）")
@@ -2862,6 +2991,40 @@ def main() -> int:
               f"akshare {len(extra_calendar)} 天 ⇒ 合计 {len(calendar)} 天"
               f"（末日 {calendar[-1].date()}）")
     # 部署节奏 = 20 个交易日（月频，铁律 14.9），不是信号日基础步长 10
+    # ---- 穿透分时间平滑（EWMA / 滚动均值）----
+    # 🔴 平滑**只影响排序**：原始 E 永远保留在 `alpha_score` 并对外披露，
+    #    实际参与排序的是 `alpha_score_used`（平滑分）⇒ 口径可对账。
+    smoothing_config = SS.SmoothingConfig(
+        enabled=(not args.no_smoothing) and bool(C.ENABLE_SCORE_SMOOTHING),
+        method=args.smoothing_method or C.SMOOTHING_METHOD,
+        window=(
+            C.SMOOTHING_WINDOW if args.smoothing_window is None else int(args.smoothing_window)
+        ),
+        alpha=(
+            C.SMOOTHING_ALPHA if args.smoothing_alpha is None else float(args.smoothing_alpha)
+        ),
+        history_span_days=(
+            C.SMOOTHING_HISTORY_SPAN_DAYS
+            if args.smoothing_history_days is None
+            else int(args.smoothing_history_days)
+        ),
+    ).validated()
+    # 🔴 交易日轴由**数据本身**派生（ETF 行情日 ∪ 个股打分日）⇒ 分析链与规则链
+    #    的轴必然逐位一致（用「日历」会让两链各用自己的日历 ⇒ 递推步长不同 ⇒
+    #    平滑分不同 ⇒ 规则层与交付层分叉 ⇒ 2026-11-09 闸门 A2 判红）。
+    #    🔴 走**唯一**生产口 ⇒ 与 recommend.py / 引擎同一函数、同一份输入。
+    alpha_override, smoothing_diag = SS.build_alpha_override(
+        holdings, scores, prices, asof, smoothing_config, C.MIN_E_COVERAGE
+    )
+    if smoothing_diag.get("warning"):
+        print(f"[WARN] {smoothing_diag['warning']}")
+    print(
+        f"[INFO] 穿透分平滑：{'关闭' if not smoothing_config.enabled else smoothing_config.method}"
+        f"｜窗口 {smoothing_config.window} 交易日｜alpha {smoothing_config.alpha}"
+        f"｜观测日 {smoothing_diag.get('n_observation_dates')} 个"
+        f"（{', '.join(smoothing_diag.get('observation_dates') or []) or '无'}）"
+        f"｜退化成瞬态分 {smoothing_diag.get('n_codes_fallback_transient')} 只"
+    )
     next_rebalance = _next_rebalance(calendar, asof, C.DEPLOYED_REBALANCE_EVERY_N_DAYS)
 
     account_available = True
@@ -2932,6 +3095,7 @@ def main() -> int:
         entry_ma_window=args.entry_ma_window,
         exit_ma_window=args.exit_ma_window,
         brake_mode=bool(nav_state and nav_state.get("in_brake")),
+        alpha_override=alpha_override,
     )
     portfolio = build_portfolio(
         asof=asof,
@@ -2947,6 +3111,8 @@ def main() -> int:
         nav_state=nav_state,
         entry_ma_window=args.entry_ma_window,
         exit_ma_window=args.exit_ma_window,
+        alpha_override=alpha_override,
+        smoothing_config=smoothing_config,
     )
     engine_selected = sorted(str(h["code"]) for h in portfolio["holdings"])
     if engine_selected != chain["selected_codes"]:
@@ -2988,6 +3154,10 @@ def main() -> int:
                 "code": code,
                 "name": str(r.get("name", "")),
                 "e_score": _clean(r.get("alpha_score")),
+                # 时间平滑三件套：原始分 / 平滑分 / 平滑窗口内的得分标准差
+                "raw_score": _clean(r.get("alpha_score")),
+                "smoothed_score": _clean(r.get("smoothed_score")),
+                "score_stability_5d": _clean(r.get("score_stability")),
                 "coverage": _clean(r.get("coverage")),
                 "coverage_ok": bool(r.get("coverage_ok", False)),
                 "n_constituents": n_constituents.get(code, 0),
@@ -3289,6 +3459,14 @@ def main() -> int:
             "pool_mode": chain["pool_mode"],
             "alpha_weight": chain["weights_used"]["alpha"],
             "momentum_weight": chain["weights_used"]["momentum"],
+            "score_smoothing_enabled": bool(smoothing_config.enabled),
+            "score_smoothing_method": smoothing_config.method if smoothing_config.enabled else None,
+            "score_smoothing_window": smoothing_config.window,
+            "score_smoothing_alpha": smoothing_config.alpha if smoothing_config.enabled else None,
+            "score_smoothing_half_life_days": smoothing_diag.get(
+                "effective_half_life_trading_days"
+            ),
+            "score_smoothing_observation_dates": smoothing_diag.get("observation_dates"),
             "target_n_holdings": C.TARGET_N_HOLDINGS,
             "min_n_holdings": C.MIN_N_HOLDINGS,
             "hold_buffer": chain["hold_buffer"],
@@ -3332,6 +3510,21 @@ def main() -> int:
         "stock_scores": score_stats,
         "rank_ic": rank_ic,
         "etf_scores": etf_scores,
+        # 🔴 穿透分时间平滑的口径与诊断（方法/窗口/alpha/观测日/回退计数/前视偏差披露）
+        "score_smoothing": {
+            **smoothing_diag,
+            "ranking_basis": (
+                f"{smoothing_config.method.upper()} 平滑分（alpha={smoothing_config.alpha}，"
+                f"窗口 {smoothing_config.window} 交易日）"
+                if smoothing_config.enabled
+                else "瞬态分（平滑已关闭）"
+            ),
+            "note": (
+                "🔴 排序用的是**平滑分**（alpha_score_used），原始 E（raw_score / e_score）"
+                "**永远保留并对外披露** ⇒ 两个口径可逐只对账。"
+                "⚠️ 历史 E 用**当前成分股快照**回算 ⇒ 带成分股前视偏差。"
+            ),
+        },
         "filter_stats": filter_stats,
         "candidates": candidates,
         "current_holdings_diagnosis": {

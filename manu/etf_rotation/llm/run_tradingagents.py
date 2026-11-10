@@ -7,7 +7,7 @@
 - 研究上下文 = `ta_research_context.md`（由 `build_ta_context.py` 生成，量化层结论）；
 - 模型 = MiniMax-M3.1-Flash（端点 api.minimaxi.com），`reasoning_effort=max`、
   `max_tokens=32768`（**effort=max 时思考 token 会吃光 max_tokens，4096 会正文 0 字**）；
-- 只跑 **1 次**（一次全图 = 约 11~13 次 LLM 调用），产物落 `/mnt/data/siping/runs/etf_rotation/`。
+- 只跑 **1 次**（一次全图 = 约 11~13 次 LLM 调用），产物落 `<落点根>/runs/`。
 
 【产物】
 - `tradingagents_decision.md`：最终评级 + 研究经理结论 + 多空/风险辩论要点 + Trader 计划；
@@ -27,8 +27,16 @@ import time
 import traceback
 from pathlib import Path
 
+#: 研究链根（`llm/` 不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import config as C  # noqa: E402
+
 DEFAULT_TA_DIR = "/tmp/pycharm_project_658d3fc4/TradingAgents"
-DEFAULT_RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
+#: 产物根（落点 `<落点根>/runs`；与研究链 `config.ETF_RUN_ROOT` 同源）
+DEFAULT_RUN_ROOT = C.ETF_RUN_ROOT
 
 
 #: markdown 表格行（以竖线开头）—— **整块永不裁**（机器解析依赖表格行）。
@@ -60,7 +68,6 @@ def _split_table_blocks(text: str) -> list[tuple[bool, str]]:
 
 #: 散文块被裁剪时，至少保留多少字符（低于这个值就整块丢，不留半截）。
 _MIN_PROSE_KEEP = 300
-
 
 def _head_tail(text: str, limit: int) -> str:
     """头 1/3 + 省略标记 + 尾 2/3（旧的裁剪口径，只用于**散文**）。"""
@@ -98,6 +105,23 @@ def _tail(text: str, limit: int = 4000) -> str:
     used = 0
     kept_text: dict[int, str] = {}
     dropped: set[int] = set()
+    #: 🔴 2026-11-10（M-O 修）**结构分隔块** = 前后邻居**都是表格块**的散文块。
+    #:
+    #:    实测事故（2026-11-09 17:49 那一轮交付 md，`probe_llm_stage_repro` P7/D4 红灯）：
+    #:      源文本里两张表之间是 `"\n### 新目标及候选\n"`（12 字符），
+    #:      旧口径把它当**普通散文** ⇒ 散文预算超支时**整块丢弃** ⇒ 后果有两条：
+    #:        ① 分隔块里的**标题整段消失**（交付件丢内容 ⇒ M-N 同类事故）；
+    #:        ② **两张表首尾相接**（中间没有任何空行）⇒ 在 markdown 渲染器里
+    #:           两张表会被当成**一张表**（第二张表的表头变成第一张表的数据行）
+    #:           ⇒ 用户读的纪要里第二张表**根本没有渲染出来**。
+    #:
+    #:    ⇒ 修法：分隔块**不许整块丢**（丢 ⇒ 两张表粘成一张 ⇒ 表不渲染）；
+    #:      但它**仍受散文预算约束**（超预算 ⇒ 截短，而不是整段保留）。
+    separator_idx = {
+        i
+        for i in prose_idx
+        if 0 < i < len(blocks) - 1 and blocks[i - 1][0] and blocks[i + 1][0]
+    }
     # 从**离中段最近**的散文块开始处理 ⇒ 头尾的可读性保留得最好
     for i in sorted(prose_idx, key=lambda i: (abs((len(blocks) - 1) / 2.0 - i), i)):
         length = prose_len[i]
@@ -112,20 +136,38 @@ def _tail(text: str, limit: int = 4000) -> str:
             #    ⇒ 用户读到的纪要只剩表格、没有观点 ⇒ 与「辩论纪要」的定位不符。
             kept_text[i] = _head_tail(blocks[i][1], remaining)
             used += len(kept_text[i])
-        else:
+        elif i not in separator_idx:
             dropped.add(i)
-    out: list[str] = []
+        else:
+            # 🔴 分隔块**不许整块丢**：散文预算已经见底，但仍要留下**头部**
+            #    （表与表之间的标题通常就在开头）⇒ 两张表之间仍有分隔 ⇒ 不会粘连。
+            kept_text[i] = _head_tail(blocks[i][1], _MIN_PROSE_KEEP)
+    parts: list[tuple[bool, str]] = []
     marker_done = False
     for i, (is_table, block) in enumerate(blocks):
         if is_table:
-            out.append(block)
+            parts.append((True, block))
             continue
         if i in kept_text:
-            out.append(kept_text[i])
+            parts.append((False, kept_text[i]))
             continue
         if not marker_done:
-            out.append("...[中段省略]...")
+            parts.append((False, "...[中段省略]..."))
             marker_done = True
+    # 🔴 2026-11-10（M-O 修）**表格前后都要留空行**：
+    #    ① GFM 规定「表格不能打断段落」⇒ 表格紧跟在散文行后面会被当成
+    #       **段落的延续** ⇒ 那张表**根本不渲染成表格**
+    #       （实测：旧交付 md 里 8 张表有 3 张的前一行是散文/省略标记 ⇒ 3 张表不渲染）；
+    #    ② 两张表之间没有空行 ⇒ 会被当成**一张表**（第二张表的表头变成第一张表的数据行）。
+    out: list[str] = []
+    for is_table, text in parts:
+        if not is_table:
+            out.append(text)
+            continue
+        if out and out[-1].strip():
+            out.append("")
+        out.append(text)
+        out.append("")
     return "\n".join(out)
 
 
@@ -430,7 +472,7 @@ def main() -> int:
         _ta_settle.get_closes = _offline_closes
 
     cfg = dict(DEFAULT_CONFIG)
-    # 缓存/产物一律落 /mnt/data（铁律：不写 /tmp）
+    # 缓存/产物一律落唯一落点根下（铁律：不写 /tmp）
     ta_root = run_root / "ta"
     cfg["results_dir"] = str(ta_root / "results")
     cfg["data_cache_dir"] = str(ta_root / "cache")

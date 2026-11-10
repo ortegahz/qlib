@@ -7,19 +7,27 @@ Qlib 穿透打分 → 组合映射 → 邮件推送）。它与 `manu/etf_rotati
 | | 研究链（`manu/etf_rotation/*.py`） | 每日流水线（`manu/etf_rotation/daily/`） |
 |:--|:--|:--|
 | 触发 | 手工 | cron，**每个 A 股交易日 15:30** |
-| 产物 | 固定交付件（`/mnt/data/siping/runs/etf_rotation/`） | **按日独立**目录（`.../daily/<YYYYMMDD>/`） |
+| 产物 | 固定交付件（`<RESULTS_ROOT>/`） | **按日独立**目录（`<RESULTS_ROOT>/daily/<YYYYMMDD>/`） |
 | 账户口径 | 研究基准（2026-11-04 快照，29,854.67 元） | **实盘基准**（2026-11-05 快照，30,035.57 元，见 `account_state.py`） |
-| LLM | 每次调 | **仅调仓节点日**才调（模式 B） |
+| LLM | 每次调 | **仅调仓节点日**才调 |
 
 🔴 **口径隔离纪律**（铁律〇之三 + 铁律十四的延伸）：
 每日流水线**绝不覆盖**研究链的交付件 ⇒ 研究链的指纹表 / 闸门 / 可复现性全部保持原样。
 每日链路的账户口径写在 `account_state.py`，**不写回** `manu/etf_rotation/account.py`
 （后者是研究链的历史基准，改它会让已归档的交付件与指纹表**假性失配**）。
 
-【所有路径都可被环境变量覆盖】（服务器上 cron 的环境极简 ⇒ 必须能注入）
+【两个落点根（数据集 / 结果分开）】
+    服务器 `huangzhe@192.168.99.40` 是**共享训练机** ⇒ 本项目在服务器上产生的
+    **一切文件**只允许落在这**两个**项目专属根之下（不许再往 `/mnt/data` 根或
+    `/mnt/data/siping/datasets/`、`/mnt/data/siping/runs/` 的公共目录里写）：
+      * `ETF_ROTATION_OUTPUT_ROOT`  **数据集根**（默认 /mnt/data/siping/datasets/manu/etf_rotation）
+        ⇒ 行情/权重/日历/qlib 数据集（`datasets/etf`、`datasets/qlib`）+ 临时工作区 `_work/`
+      * `ETF_ROTATION_RESULTS_ROOT` **结果根**（默认 /mnt/data/siping/runs/etf_rotation_results）
+        ⇒ 产物/快照/报告/日志（研究链 canonical、每日链 `daily/`、`snapshots/`、`logs/`）
+    🔴 **所有路径都可被环境变量覆盖**（服务器上 cron 的环境极简 ⇒ 必须能注入）
     ETF_ROTATION_REPO_ROOT   工程根（默认 /tmp/pycharm_project_658d3fc4）
-    ETF_ROTATION_RUN_ROOT    每日产物根（默认 /mnt/data/siping/runs/etf_rotation/daily）
-    ETF_ROTATION_LOG_DIR     日志目录（默认 <RUN_ROOT>/logs）
+    ETF_ROTATION_RUN_ROOT    每日产物根（默认 <RESULTS_ROOT>/daily）
+    ETF_ROTATION_LOG_DIR     日志目录（默认 <RESULTS_ROOT>/logs）
     ETF_ROTATION_QL_PY       量化层解释器（默认 /home/huangzhe/anaconda3/envs/ql/bin/python）
     ETF_ROTATION_AK_PY       akshare 解释器（默认 /home/huangzhe/anaconda3/envs/ak/bin/python）
     ETF_ROTATION_LLM_PY      TradingAgents 解释器（默认 /home/huangzhe/anaconda3/envs/llm/bin/python）
@@ -27,22 +35,60 @@ Qlib 穿透打分 → 组合映射 → 邮件推送）。它与 `manu/etf_rotati
 """
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
+from datetime import timedelta, timezone
 from pathlib import Path
+
+# =============================================================================
+# 0.0 市场时区（🔴 单一事实源：所有「今天 / 当日 / 收盘时刻」判定都锚这里）
+# =============================================================================
+#: A 股市场时区（东八区）。🔴 **不许**用机器本地时区代替：
+#:   「15:05 收盘定型」「今天是哪一天」是**市场规则**，不是机器规则
+#:   ⇒ 机器跑在 UTC 容器里时，本地时区的「今天」会落后一天、「收盘」会差 8 小时
+#:   ⇒ 典型后果：`fetch_data.drop_unfinalized_bars` 在 UTC 机器上 07:00 (= 15:00 CST)
+#:   仍认为「当日 bar 未定型」⇒ 丢掉**已收盘**的 bar ⇒ 行情底座比信号日差一天
+#:   ⇒ 下游 `_data_freshness_guard` fail-closed ⇒ 整轮白跑（2026-11-10 实测事故）。
+MARKET_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 # =============================================================================
 # 0. 路径（全部可用环境变量覆盖）
 # =============================================================================
+#: 🔴 **数据集落点根**（本项目的**单一事实源 · 数据集侧**）
+#:    服务器 `huangzhe@192.168.99.40` 是**共享训练机** ⇒ 本项目在服务器上产生的
+#:    **一切文件**只允许落在下面**两个**项目专属根之下（数据集根 + 结果根）。
+#:    ⇒ 下面**所有**路径常量都由这两个根派生（不再有第三个字面量）。
+#:    可被环境变量 `ETF_ROTATION_OUTPUT_ROOT` 覆盖（cron 环境极简 ⇒ 必须能注入）。
+ETF_ROTATION_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_OUTPUT_ROOT", "/mnt/data/siping/datasets/manu/etf_rotation"
+    )
+).expanduser()
+#: 🔴 **结果落点根**（本项目的**单一事实源 · 结果侧**）
+#:    产物 / 快照 / 报告 / 日志**留在服务器**，不再拷回 host ⇒ 全部落在这个根之下。
+#:    可被环境变量 `ETF_ROTATION_RESULTS_ROOT` 覆盖。
+ETF_ROTATION_RESULTS_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_RESULTS_ROOT", "/mnt/data/siping/runs/etf_rotation_results"
+    )
+).expanduser()
 #: 工程根（服务器工作副本）
 REPO_ROOT = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_658d3fc4"))
+#: 研究链产物根（每日链路**只读**参照，不写）
+#:    落点 `<RESULTS_ROOT>`（研究链交付件 + 每日链的父目录）
+RESEARCH_RUN_ROOT = ETF_ROTATION_RESULTS_ROOT
 #: 每日链路的产物根（按日期分子目录）
+#:    落点 `<RESULTS_ROOT>/daily`（按日期分子目录）
 RUN_ROOT = Path(
-    os.environ.get("ETF_ROTATION_RUN_ROOT", "/mnt/data/siping/runs/etf_rotation/daily")
+    os.environ.get("ETF_ROTATION_RUN_ROOT", str(RESEARCH_RUN_ROOT / "daily"))
 )
-#: 日志目录（铁律二：cache 落 /mnt/data，**不落 /tmp**）
+#: 日志目录（铁律二：cache 落项目落点根，**不落 /tmp**）
 LOG_DIR = Path(
-    os.environ.get("ETF_ROTATION_LOG_DIR", str(RUN_ROOT / "logs"))
+    os.environ.get("ETF_ROTATION_LOG_DIR", str(ETF_ROTATION_RESULTS_ROOT / "logs"))
 )
+#: **临时工作区**（子进程脚本 / 解压中间产物…）—— 落点 `<OUTPUT_ROOT>/_work`
+WORK_ROOT = ETF_ROTATION_OUTPUT_ROOT / "_work"
 
 #: 三个 conda 解释器（**绝对路径** ⇒ cron 不依赖 shell 初始化）
 QL_PY = os.environ.get("ETF_ROTATION_QL_PY", "/home/huangzhe/anaconda3/envs/ql/bin/python")
@@ -52,7 +98,8 @@ AK_PY = os.environ.get("ETF_ROTATION_AK_PY", "/home/huangzhe/anaconda3/envs/ak/b
 LLM_PY = os.environ.get("ETF_ROTATION_LLM_PY", "/home/huangzhe/anaconda3/envs/llm/bin/python")
 
 #: ETF 数据集目录（服务器持久盘）
-ETF_DATA_ROOT = Path("/mnt/data/siping/datasets/etf")
+#:    落点 `<OUTPUT_ROOT>/datasets/etf`
+ETF_DATA_ROOT = ETF_ROTATION_OUTPUT_ROOT / "datasets" / "etf"
 #: ETF 日线行情（含 ETF 收盘价）
 ETF_PRICES_CSV = ETF_DATA_ROOT / "etf_prices.csv"
 #: ETF 现货快照
@@ -64,12 +111,28 @@ ETF_HOLDINGS_CSV = ETF_DATA_ROOT / "etf_holdings.csv"
 #: A 股交易日历（含未来交易日）
 TRADE_CALENDAR_CSV = ETF_DATA_ROOT / "trade_calendar.csv"
 
-#: 研究链产物根（每日链路**只读**参照，不写）
-RESEARCH_RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
 #: 个股分数 S（上游产物）
 STOCK_SCORES_CSV = RESEARCH_RUN_ROOT / "stock_scores.csv"
+#: 🆕 **快照根**（2026-11-09 架构瘦身）：**每次运行落一个不可变快照目录**
+#:    `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/` ⇒ 交付件 + 上下文 + manifest 同目录。
+#: 🔴 **每日链不再写任何根目录全局文件**（canonical `stock_scores.csv` /
+#:    `tradingagents_decision.*` / `rebalance_recommendation.json` 全部只读或不碰）
+#:    ⇒ canonical 只在「还没有任何快照」时当**一次性只读种子**用一次。
+SNAPSHOT_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_SNAPSHOT_ROOT", str(ETF_ROTATION_RESULTS_ROOT / "snapshots")
+    )
+)
+#: qlib 二进制数据集根目录（换库时会把**整个目录**改名备份，不逐文件改）
+#:    落点 `<OUTPUT_ROOT>/datasets/qlib`
+QLIB_DATASET_ROOT = Path(
+    os.environ.get(
+        "ETF_ROTATION_QLIB_DATASET_ROOT",
+        str(ETF_ROTATION_OUTPUT_ROOT / "datasets" / "qlib"),
+    )
+)
 #: qlib 二进制数据集目录（增量写 bar 用）
-QLIB_CN_DATA = Path("/mnt/data/siping/datasets/qlib/cn_data")
+QLIB_CN_DATA = QLIB_DATASET_ROOT / "cn_data"
 
 #: TradingAgents 工作副本（llm env 侧）
 TRADINGAGENTS_DIR = Path(os.environ.get("ETF_ROTATION_TA_DIR", str(REPO_ROOT / "TradingAgents")))
@@ -90,9 +153,9 @@ CRON_EXPR = "30 15 * * 1-5"
 CRON_TAG = "etf_rotation_daily"
 #: cron 落盘位置
 CRON_FILE = Path(os.environ.get("ETF_ROTATION_CRON_FILE", "/etc/cron.d/etf_rotation_daily"))
-#: 单实例锁（防重入；锁文件落 /mnt/data，不落 /tmp）
+#: 单实例锁（防重入；锁文件落 <OUTPUT_ROOT>，不落 /tmp）
 LOCK_FILE = Path(
-    os.environ.get("ETF_ROTATION_LOCK_FILE", "/mnt/data/siping/runs/etf_rotation/daily/.lock")
+    os.environ.get("ETF_ROTATION_LOCK_FILE", str(RUN_ROOT / ".lock"))
 )
 #: **发信专用**单实例锁（🔴 与 `LOCK_FILE` 分开）
 #: 理由：15:30 的分析可能还没跑完（调仓日要跑 TradingAgents LLM），
@@ -100,7 +163,7 @@ LOCK_FILE = Path(
 LOCK_FILE_SEND = Path(
     os.environ.get(
         "ETF_ROTATION_LOCK_FILE_SEND",
-        "/mnt/data/siping/runs/etf_rotation/daily/.lock.send",
+        str(RUN_ROOT / ".lock.send"),
     )
 )
 
@@ -168,30 +231,47 @@ EXECUTION_LAG_DAYS = 1
 # =============================================================================
 # 5.5 阶段 1（qlib 数据集滚动快照换库）
 # =============================================================================
-#: qlib 数据集根目录（换库时会把**整个目录**改名备份，不逐文件改）
-QLIB_DATASET_ROOT = Path(os.environ.get("ETF_ROTATION_QLIB_DATASET_ROOT", "/mnt/data/siping/datasets/qlib"))
-#: 滚动快照的解压工作区（🔴 **必须落 /mnt/data**，不许落 /tmp：tmpfiles 会清 /tmp）
+#: 滚动快照的解压工作区（🔴 **必须落 <OUTPUT_ROOT>**，不许落 /tmp：tmpfiles 会清 /tmp）
 STAGE1_WORK_ROOT = Path(
     os.environ.get("ETF_ROTATION_STAGE1_WORK", str(QLIB_DATASET_ROOT / "_stage1_work"))
 )
-#: 换库前的旧库备份目录（同一个 /mnt/data 盘 ⇒ 改名是原子操作）
+#: 换库前的旧库备份目录（同一个盘 ⇒ 改名是原子操作）
 STAGE1_BACKUP_DIR = Path(
     os.environ.get("ETF_ROTATION_STAGE1_BACKUP", str(QLIB_DATASET_ROOT / "_backup"))
 )
 #: 滚动快照下载落盘目录（复用 manu/tools/fetch_qlib_dataset.py 的 dest_dir）
 STAGE1_DEST_DIR = QLIB_DATASET_ROOT
+#: 🔴 **自建增量日的派生数据集目录**（上游 `cn_data` 的**派生**，铁律〇之二：只可调用/读取/
+#:    派生到新目录）—— 上游快照滞后时用它兜底（见 `stage1_rolling_increment.py`）。
+#:    🔴 **绝不能把自建日写进上游 `cn_data`**：那会让 `stage1_dataset.compare_calendars`
+#:    的前缀闸门**永远拒绝换库**（fail-closed）。
+QLIB_CN_DATA_LIVE = Path(
+    os.environ.get(
+        "ETF_ROTATION_QLIB_CN_DATA_LIVE", str(QLIB_DATASET_ROOT / "cn_data_live")
+    )
+)
+#: 自建增量日的台账（JSONL：日期 / 来源 / 写入与剔除统计 / 基座与派生日历末日）
+QLIB_INCREMENT_LEDGER = Path(
+    os.environ.get(
+        "ETF_ROTATION_QLIB_INCREMENT_LEDGER",
+        str(QLIB_DATASET_ROOT / "_increment_ledger.jsonl"),
+    )
+)
 
 # =============================================================================
 # 5.8 报告落盘（按需分析 ⇒ 报告回窗口）
 # =============================================================================
-#: **报告归档目录**（仓库内 `manu/report/`）—— 每次分析的 Markdown 报告都落这里，
+#: **报告归档目录** —— 每次分析的 Markdown 报告都落这里，
 #: 文件名带**分析日期**（`report_<YYYYMMDD>.md`）⇒ 便于回看与版本化。
-#: 🔴 用**模块自身位置**推导（不依赖 REPO_ROOT 环境变量）⇒ host / 服务器都指向同一个
-#: 仓库内的 `manu/report/`；REPO_ROOT 在服务器上默认是 `/tmp/pycharm_project_658d3fc4`，
-#: 在 host 上不存在 ⇒ 用它推导会把报告写到错误位置。
-_MANU_ROOT = Path(__file__).resolve().parents[2]
+#: 🔴 2026-11-10 铁律十六（落点双根化）：报告**也是「结果」** ⇒ 必须落
+#:    **结果根** `<RESULTS_ROOT>/reports/`，**不许**再落仓库内 `manu/report/`
+#:    （服务器上那是 `/tmp/pycharm_project_658d3fc4/manu/report` ⇒ 既不在项目
+#:    专属根之下，又会把工程目录变成产物堆放点）。
+#:    ⇒ 报告与快照 / canonical 同属结果根，**默认不回传 host**。
 REPORT_DIR = Path(
-    os.environ.get("ETF_ROTATION_REPORT_DIR", str(_MANU_ROOT / "report"))
+    os.environ.get(
+        "ETF_ROTATION_REPORT_DIR", str(ETF_ROTATION_RESULTS_ROOT / "reports")
+    )
 )
 
 # =============================================================================
@@ -235,6 +315,62 @@ MAX_WALL_SECONDS = float(os.environ.get("ETF_ROTATION_MAX_WALL_SECONDS", "3600")
 #:    （实测：阶段 4 从 15:52 跑到 16:22 被 1800 秒超时打断）。
 #:    ⇒ 默认给到 **5400 秒（90 分钟）**，宁可慢也别把辩论打断在半截。
 LLM_TIMEOUT = float(os.environ.get("ETF_ROTATION_LLM_TIMEOUT", "5400"))
+
+
+# =============================================================================
+# 8. provider 路径对账（每日链 ↔ 研究链单一事实源）
+# =============================================================================
+#: 研究链根（`manu/etf_rotation`）—— provider 单一事实源 `qlib_provider.py` 在这儿
+_RESEARCH_ROOT = Path(__file__).resolve().parent.parent
+
+
+def cross_check_provider_paths() -> dict:
+    """每日链 ↔ 研究链的 **provider 路径字面量对账**（防「第二个字面量」分叉）。
+
+    背景（2026-11-09 实测）：每日链原本**自带一份** provider 选择规则，研究链又**另写一份**
+    ⇒ 两条链会挑到**不同的数据集**（研究链停在基座末日，每日链用派生）⇒ 口径分叉。
+    ⇒ 规则已提到研究链层 `manu/etf_rotation/qlib_provider.py`（单一事实源）；
+    但**路径字面量**仍各有各的（`daily_config.QLIB_CN_DATA` vs 个股线 config 的 `PROVIDER_URI`）
+    ⇒ 本函数把两边**逐条比对**，不一致 ⇒ `ok=False`（**由探针拦**，不静默放过）。
+
+    返回：`{"ok": bool, "items": [{"name","daily","research","ok"}], "error": str|None}`
+    """
+    items: list[dict] = []
+    error: str | None = None
+    try:
+        path = _RESEARCH_ROOT / "qlib_provider.py"
+        spec = importlib.util.spec_from_file_location(
+            "manu_daily_config_qlib_provider", path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"无法加载 provider 模块：{path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(spec.name, None)
+            raise
+        pairs = [
+            ("base", QLIB_CN_DATA, module.base_dir()),
+            ("live", QLIB_CN_DATA_LIVE, module.live_dir()),
+        ]
+        for name, daily_path, research_path in pairs:
+            items.append(
+                {
+                    "name": name,
+                    "daily": str(daily_path),
+                    "research": str(research_path),
+                    "ok": str(daily_path) == str(research_path),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 —— 对账失败本身也是「不一致」
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "ok": bool(items) and error is None and all(item["ok"] for item in items),
+        "items": items,
+        "error": error,
+    }
 
 
 def env_flag(name: str, default: bool = False) -> bool:

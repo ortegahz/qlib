@@ -1,16 +1,20 @@
 #!/usr/bin/env python
-"""ETF 轮动调仓 ·「三项分歧一起选」组合矩阵生成器（2³ = 8 情景）。
+"""ETF 轮动调仓 ·「多项分歧一起选」组合矩阵生成器（2^N 情景，N = 分歧项个数）。
 
 【用途】
-把上一轮 `decision_options_<label>.md` 的**逐项**对照（511880 / 512800 / 563020 三项
-各选 A 或 B）展开成 **8 个组合情景**，逐情景给出**账户后果**：三项的最终股数与金额、
+把上一轮 `decision_options_<label>.md` 的**逐项**对照（N 个分歧项各选 A 或 B）
+展开成 **2^N 个组合情景**，逐情景给出**账户后果**：各分歧项的最终股数与金额、
 期末现金、期末权益金额、权益/现金占比、情景总资产、与账户口径 29,854.67 元的差额、
 破单席清单、整手不可建仓清单、是否现金为负（可执行性）。
 🔴 **只摆事实与后果，不替用户做决定**：全文不出现任何「建议采用 X」式结论。
 
+🔴 **分歧项个数 / 分歧标的集合一律不写死**：N 与分歧码集合都从
+    `decision_options_<label>.json` 的 `divergences` 动态取 ⇒ 分歧标的换人时脚本不用改，
+    也不会与新产物错配；取不到 ⇒ **直接抛中文异常（fail-closed）**，不许退回写死常量蒙混过关。
+
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/make_decision_scenarios.py
-    ... --run-root /mnt/data/siping/runs/etf_rotation --out-dir <目录> --asof-label 20261105
+    ... --run-root <落点根>/runs --out-dir <目录> --asof-label 20261105
 
 【数据来源（全部只读）】
     * <run-root>/final_rebalance_plan.json      —— 规则层动作 / 价格 / 费用率 / 现金台账
@@ -36,10 +40,10 @@
     * 无未来函数：只用已交付产物，不调 LLM、不联网。
 
 【断言（自洽探针；结果写进产物并决定退出码）】
-    1. A/A/A 情景（全采纳规则层）的期末现金 vs 产物 `cash_flow.cash_end`，偏差 < 0.01 元；
-    2. 8 个情景现金均不为负；出现负现金 ⇒ 该情景标「不可执行」且退出码为 1；
-    3. 8 个情景总资产（现金 + 权益）的彼此差异 ≤ 全部费用之和（费用是唯一损耗）；
-    4. 三个分歧项的选项股数 / 金额与 `decision_options_<label>.json` 逐项一致
+    1. 全 A 情景（全采纳规则层）的期末现金 vs 产物 `cash_flow.cash_end`，偏差 < 0.01 元；
+    2. 全部 2^N 个情景现金均不为负；出现负现金 ⇒ 该情景标「不可执行」且退出码为 1；
+    3. 全部情景总资产（现金 + 权益）的彼此差异 ≤ 全部费用之和（费用是唯一损耗）；
+    4. N 个分歧项的选项股数 / 金额与 `decision_options_<label>.json` 逐项一致
        （偏差 < 0.01 元 / 0 股）；
     5. 破单席（权重 > 20%）标记完整性：逐情景独立重算破单席清单并与打标结果比对。
 """
@@ -63,14 +67,14 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import account as A  # noqa: E402
+import config as C  # noqa: E402  （落点常量单一事实源）
 from final_rebalance_plan import LOT  # noqa: E402
 
 #: 产物根默认值（只读输入目录）
-DEFAULT_RUN_ROOT = Path("/mnt/data/siping/runs/etf_rotation")
+#: 产物根（落点 `<落点根>/runs`；与研究链 `config.ETF_RUN_ROOT` 同源）
+DEFAULT_RUN_ROOT = C.ETF_RUN_ROOT
 #: 文件名标签默认值
 DEFAULT_ASOF_LABEL = "20261105"
-#: 三个待拍板分歧项（顺序固定 ⇒ 情景标签与顺序稳定）
-DIVERGENCE_CODES = ("511880", "512800", "563020")
 #: 每个分歧项的选项字母
 OPTION_LETTERS = ("A", "B")
 #: 单席权重上限（%）—— 取自账户口径 `A.TARGET_POSITION_WEIGHT`
@@ -243,9 +247,37 @@ def cross_check_lot(plan: dict) -> int:
 
 
 # ------------------------------------------------------------------ 分歧项选项
+def resolve_divergence_codes(options_ref: dict) -> tuple[str, ...]:
+    """从 `decision_options_<label>.json` 取**分歧标的集合**（按文件里的顺序）。
+
+    🔴 **不写死任何具体代码、不写死分歧项个数** ⇒ 分歧标的换人时脚本不用改，
+    也不会与新产物错配。
+    🔴 取不到 ⇒ 直接抛中文异常（**fail-closed**），**不许**退回写死常量蒙混过关。
+    """
+    divergences = require_field(options_ref, "divergences", "decision_options json")
+    if not isinstance(divergences, list) or not divergences:
+        raise RuntimeError("decision_options json 的 `divergences` 为空或不是列表 ⇒ 无法确定分歧标的集合")
+    codes: list[str] = []
+    for item in divergences:
+        if not isinstance(item, dict):
+            raise RuntimeError(f"decision_options json 的 `divergences` 条目不是对象：{item!r}")
+        code = str(require_field(item, "code", "decision_options json 的 divergences 条目"))
+        if code not in codes:
+            codes.append(code)
+    if not codes:
+        raise RuntimeError("decision_options json 的 `divergences` 里没有可用的分歧标的代码")
+    return tuple(codes)
+
+
+def all_a_label(codes: tuple[str, ...] | list[str]) -> str:
+    """「全 A」组合标签：按分歧码顺序拼接（**不写死任何具体代码**）。"""
+    return ",".join(f"{code}=A" for code in codes)
+
+
 def resolve_divergence_options(plan: dict, actions: dict[str, dict],
-                               total_assets: float) -> dict[str, dict]:
-    """给出三个分歧项的 A / B 两个选项的股数与金额（**独立从 plan 重算**）。
+                               total_assets: float,
+                               codes: tuple[str, ...]) -> dict[str, dict]:
+    """给出各分歧项的 A / B 两个选项的股数与金额（**独立从 plan 重算**）。
 
     * 选项 A = 规则层实际落地（`actions[code].target_shares`）；
     * 选项 B = LLM 最终裁决：原文给了手数就按手数换算，否则按目标权重折整手。
@@ -254,7 +286,7 @@ def resolve_divergence_options(plan: dict, actions: dict[str, dict],
         require_field(plan, "llm_final_decision", "final_rebalance_plan.json"),
         "targets", "final_rebalance_plan.json 的 llm_final_decision")
     options: dict[str, dict] = {}
-    for code in DIVERGENCE_CODES:
+    for code in codes:
         action = actions.get(code)
         if action is None:
             raise RuntimeError(f"分歧标的 `{code}` 不在 final_rebalance_plan.json 的 actions 里")
@@ -328,7 +360,8 @@ def build_scenario(label: str, choices: dict[str, str], actions: dict[str, dict]
                    slot_limit: float) -> dict:
     """推演一个组合情景的账户后果（现金台账 + 权益 + 破单席 + 整手可建仓）。"""
     holdings = {code: act["target_shares"] for code, act in actions.items()}
-    for code in DIVERGENCE_CODES:
+    #: 🔴 分歧码集合 = `choices` 的键（= 分歧项个数 N，**不写死任何具体代码**）
+    for code in choices:
         holdings[code] = options[code][f"option_{choices[code].lower()}"]["shares"]
 
     sell_proceeds = 0.0
@@ -420,7 +453,7 @@ def build_scenario(label: str, choices: dict[str, str], actions: dict[str, dict]
     expected_total = total_assets - price_basis_diff - total_fees
 
     divergence_items = {}
-    for code in DIVERGENCE_CODES:
+    for code in choices:
         opt = options[code][f"option_{choices[code].lower()}"]
         divergence_items[code] = {
             "option": opt["letter"],
@@ -435,7 +468,7 @@ def build_scenario(label: str, choices: dict[str, str], actions: dict[str, dict]
     cash_negative = cash_end < 0.0
     return {
         "label": label,
-        "choices": {code: choices[code] for code in DIVERGENCE_CODES},
+        "choices": dict(choices),
         "divergence_items": divergence_items,
         "positions": positions,
         "trades": trades,
@@ -477,12 +510,13 @@ def build_scenario(label: str, choices: dict[str, str], actions: dict[str, dict]
 
 def build_scenarios(actions: dict[str, dict], options: dict[str, dict],
                     unbuildable_slots: list[dict], cash_begin: float, fee_rate: float,
-                    total_assets: float, slot_limit: float) -> list[dict]:
-    """按 2³ 展开 8 个组合情景（顺序固定 ⇒ 输出稳定）。"""
+                    total_assets: float, slot_limit: float,
+                    codes: tuple[str, ...]) -> list[dict]:
+    """按 2^N 展开全部组合情景（N = 分歧项个数；顺序固定 ⇒ 输出稳定）。"""
     scenarios = []
-    for combo in product(OPTION_LETTERS, repeat=len(DIVERGENCE_CODES)):
-        choices = {code: letter for code, letter in zip(DIVERGENCE_CODES, combo)}
-        label = ",".join(f"{code}={choices[code]}" for code in DIVERGENCE_CODES)
+    for combo in product(OPTION_LETTERS, repeat=len(codes)):
+        choices = {code: letter for code, letter in zip(codes, combo)}
+        label = ",".join(f"{code}={choices[code]}" for code in codes)
         scenarios.append(build_scenario(label, choices, actions, options, unbuildable_slots,
                                          cash_begin, fee_rate, total_assets, slot_limit))
     return scenarios
@@ -493,15 +527,18 @@ def build_assertions(plan: dict, options: dict[str, dict], options_ref: dict,
                      scenarios: list[dict]) -> list[dict]:
     """5 条自洽断言（结果写进产物；任一 FAIL ⇒ 退出码 1）。"""
     assertions: list[dict] = []
+    #: 🔴 分歧码集合 = `options` 的键（**不写死任何具体代码 / 分歧项个数**）
+    codes = list(options.keys())
+    n_scen = len(scenarios)
 
     # --- 断言 1：A/A/A 期末现金 vs 产物 cash_flow.cash_end --------------------
     plan_cash_end = require_number(require_field(plan, "cash_flow", "final_rebalance_plan.json"),
                                    "cash_end", "final_rebalance_plan.json 的 cash_flow")
-    base = next(sc for sc in scenarios if sc["label"] == "511880=A,512800=A,563020=A")
+    base = next(sc for sc in scenarios if sc["label"] == all_a_label(codes))
     diff1 = abs(float(base["cash_end"]) - plan_cash_end)
     assertions.append({
         "id": 1,
-        "name": "A/A/A（全采纳规则层）期末现金与产物 cash_flow.cash_end 一致",
+        "name": "全 A（全采纳规则层）期末现金与产物 cash_flow.cash_end 一致",
         "status": "PASS" if diff1 < TOL_AMOUNT else "FAIL",
         "tolerance": TOL_AMOUNT,
         "expected": rnd(plan_cash_end, 6),
@@ -510,12 +547,12 @@ def build_assertions(plan: dict, options: dict[str, dict], options_ref: dict,
         "detail": f"差 {diff1:.10f} 元（容差 0.01 元）",
     })
 
-    # --- 断言 2：8 个情景现金均不为负 ---------------------------------------
+    # --- 断言 2：全部情景现金均不为负 ---------------------------------------
     negatives = [sc["label"] for sc in scenarios if sc["cash_negative"]]
     min_cash = min(float(sc["cash_end"]) for sc in scenarios)
     assertions.append({
         "id": 2,
-        "name": "8 个情景期末现金均不为负（负现金 ⇒ 不可执行）",
+        "name": f"{n_scen} 个情景期末现金均不为负（负现金 ⇒ 不可执行）",
         "status": "PASS" if not negatives else "FAIL",
         "tolerance": 0.0,
         "expected": "无负现金情景",
@@ -531,25 +568,25 @@ def build_assertions(plan: dict, options: dict[str, dict], options_ref: dict,
     fee_max = max(float(sc["ledger"]["total_fees"]) for sc in scenarios)
     assertions.append({
         "id": 3,
-        "name": "8 个情景总资产（现金 + 权益）的彼此差异 ≤ 全部费用之和",
+        "name": f"{n_scen} 个情景总资产（现金 + 权益）的彼此差异 ≤ 全部费用之和",
         "status": "PASS" if spread <= fee_sum + 1e-9 else "FAIL",
         "tolerance": rnd(fee_sum, 10),
         "expected": rnd(fee_sum, 10),
         "actual": rnd(spread, 10),
         "diff": rnd(spread, 10),
         "detail": (f"最大总资产 {max(totals):.2f} 元、最小 {min(totals):.2f} 元，"
-                   f"最大偏差 {spread:.6f} 元 ≤ 8 情景费用之和 {fee_sum:.6f} 元"
+                   f"最大偏差 {spread:.6f} 元 ≤ {n_scen} 情景费用之和 {fee_sum:.6f} 元"
                    f"（单情景最大费用 {fee_max:.6f} 元亦为上界）"),
     })
 
-    # --- 断言 4：三个分歧项的选项股数 / 金额与 decision_options 逐项一致 -------
+    # --- 断言 4：各分歧项的选项股数 / 金额与 decision_options 逐项一致 -------
     per_code = {str(item["code"]): item for item in
                 require_field(require_field(options_ref, "options", "decision_options json"),
                               "per_code_options", "decision_options json 的 options")}
     mismatches = []
     max_d_shares = 0
     max_d_amount = 0.0
-    for code in DIVERGENCE_CODES:
+    for code in codes:
         ref = per_code.get(code)
         if ref is None:
             raise RuntimeError(f"decision_options json 里没有分歧标的 `{code}` 的选项")
@@ -566,13 +603,14 @@ def build_assertions(plan: dict, options: dict[str, dict], options_ref: dict,
                 mismatches.append(f"{code} 选项 {letter}：股数差 {d_shares} 股 / 金额差 {d_amount:.4f} 元")
     assertions.append({
         "id": 4,
-        "name": "三个分歧项的选项股数 / 金额与 decision_options 逐项一致（< 0.01 元 / 0 股）",
+        "name": (f"{len(codes)} 个分歧项的选项股数 / 金额与 decision_options 逐项一致"
+                 "（< 0.01 元 / 0 股）"),
         "status": "PASS" if not mismatches else "FAIL",
         "tolerance": TOL_AMOUNT,
-        "expected": "6 个选项全部一致",
+        "expected": f"{len(codes) * len(OPTION_LETTERS)} 个选项全部一致",
         "actual": "全部一致" if not mismatches else "；".join(mismatches),
         "diff": None,
-        "detail": (f"6 个选项逐项比对：最大股数差 {max_d_shares} 股、最大金额差 "
+        "detail": (f"{len(codes) * len(OPTION_LETTERS)} 个选项逐项比对：最大股数差 {max_d_shares} 股、最大金额差 "
                    f"{max_d_amount:.6f} 元（容差 0.01 元 / 0 股）；本表数字独立由 "
                    f"final_rebalance_plan.json 重算，decision_options 只作交叉校验"),
     })
@@ -621,10 +659,12 @@ def build_payload(plan: dict, options_ref: dict, snapshot: pd.DataFrame,
     unbuildable_slots = list(require_field(cash_flow, "unbuildable_slots",
                                            "final_rebalance_plan.json 的 cash_flow"))
 
-    options = resolve_divergence_options(plan, actions, total_assets)
+    #: 🔴 分歧标的集合 = 从 `decision_options_<label>.json` 动态取（**不写死代码 / 个数**）
+    codes = resolve_divergence_codes(options_ref)
+    options = resolve_divergence_options(plan, actions, total_assets, codes)
     annotate_option_notes(options, slot_limit)
     scenarios = build_scenarios(actions, options, unbuildable_slots, cash_begin, fee_rate,
-                                total_assets, slot_limit)
+                                total_assets, slot_limit, codes)
     assertions = build_assertions(plan, options, options_ref, scenarios)
 
     fingerprints = {
@@ -639,7 +679,8 @@ def build_payload(plan: dict, options_ref: dict, snapshot: pd.DataFrame,
         "plan_generated_at": str(require_field(plan_meta, "generated_at",
                                                "final_rebalance_plan.json 的 meta")),
         "generator": "manu/etf_rotation/make_decision_scenarios.py",
-        "description": "三个待拍板分歧项（511880 / 512800 / 563020）的 2³ = 8 组合情景账户后果矩阵",
+        "description": (f"{len(codes)} 个待拍板分歧项（{' / '.join(codes)}）的 "
+                        f"2^{len(codes)} = {len(scenarios)} 组合情景账户后果矩阵"),
         "run_root": str(run_root),
         "source_plan": str(run_root / "final_rebalance_plan.json"),
         "source_options": str(run_root / f"decision_options_{asof_label}.json"),
@@ -660,7 +701,7 @@ def build_payload(plan: dict, options_ref: dict, snapshot: pd.DataFrame,
         "price_basis": "actions[].price（asof 2026-11-03 收盘价）；账户快照价不参与股数与市值计算",
         "total_assets_caliber": "情景总资产 = 期末现金 + 期末权益；权重分母统一为账户总资产 29,854.67 元",
         "n_scenarios": len(scenarios),
-        "divergence_codes": list(DIVERGENCE_CODES),
+        "divergence_codes": list(codes),
         "next_rebalance": require_field(plan, "next_rebalance", "final_rebalance_plan.json"),
     }
 
@@ -719,11 +760,14 @@ def summarize_slot_items(scenarios: list[dict], item_type: str) -> str:
 
 
 def render_markdown(payload: dict) -> str:
-    """把 JSON 载荷渲染成 Markdown（8 行情景总表 + 分歧项明细 + 断言 + 口径 + 免责）。"""
+    """把 JSON 载荷渲染成 Markdown（2^N 行情景总表 + 分歧项明细 + 断言 + 口径 + 免责）。"""
     lines: list[str] = []
     add = lines.append
     meta = payload["meta"]
-    add("# ETF 调仓 · 三项分歧组合矩阵（8 情景）")
+    #: 🔴 分歧码集合 / 情景数：**从 payload 动态取**（不写死代码 / 个数）
+    div_codes = list(meta["divergence_codes"])
+    n_scen = int(meta["n_scenarios"])
+    add(f"# ETF 调仓 · {len(div_codes)} 项分歧组合矩阵（{n_scen} 情景）")
     add("")
     add(f"- 数据 asof（价格基准）：{meta['asof']}　｜　文件名标签：{meta['asof_label']}　｜　"
         f"计划件生成时间：{meta['plan_generated_at']}")
@@ -737,16 +781,16 @@ def render_markdown(payload: dict) -> str:
     add("")
 
     # 一、情景总表
-    add("## 一、情景总表（2³ = 8 个组合）")
+    add(f"## 一、情景总表（2^{len(div_codes)} = {n_scen} 个组合）")
     add("")
-    add("| 标签 | 511880 股数 | 512800 股数 | 563020 股数 | 期末现金 | 现金% | 权益金额 | 权益% | "
-        "总资产 | 破单席 | 可执行 |")
-    add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+    add("| 标签 | " + " | ".join(f"{code} 股数" for code in div_codes)
+        + " | 期末现金 | 现金% | 权益金额 | 权益% | 总资产 | 破单席 | 可执行 |")
+    add("|---|" + "---:|" * len(div_codes) + "---:|---:|---:|---:|---:|---|---|")
     for sc in payload["scenarios"]:
         div = sc["divergence_items"]
         breaches = "、".join(f"{p['code']}({float(p['weight_pct']):.2f}%)" for p in sc["slot_breaches"])
-        add(f"| {md_cell(sc['label'])} | {fmt_shares(div['511880']['shares'])} | "
-            f"{fmt_shares(div['512800']['shares'])} | {fmt_shares(div['563020']['shares'])} | "
+        shares_cells = " | ".join(fmt_shares(div[code]["shares"]) for code in div_codes)
+        add(f"| {md_cell(sc['label'])} | {shares_cells} | "
             f"{fmt_amount(sc['cash_end'])} | {float(sc['cash_weight_pct']):.2f}% | "
             f"{fmt_amount(sc['equity_amount'])} | {float(sc['equity_weight_pct']):.2f}% | "
             f"{fmt_amount(sc['total_assets'])} | {md_cell(breaches) if breaches else '—'} | "
@@ -763,7 +807,7 @@ def render_markdown(payload: dict) -> str:
     add("")
 
     # 二、分歧项明细
-    add("## 二、三个分歧项的选项明细")
+    add(f"## 二、{len(div_codes)} 个分歧项的选项明细")
     add("")
     for index, code in enumerate(meta["divergence_codes"], start=1):
         item = payload["divergence_items"][code]
@@ -805,7 +849,7 @@ def render_markdown(payload: dict) -> str:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="生成「三项分歧一起选」的 ETF 调仓组合矩阵（JSON + Markdown）")
+        description="生成「多项分歧一起选」的 ETF 调仓组合矩阵（JSON + Markdown）")
     parser.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT),
                         help="已交付产物所在目录（只读输入，默认 %(default)s）")
     parser.add_argument("--out-dir", default=None,
@@ -836,13 +880,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[decision-scenarios] asof={payload['meta']['asof']} "
           f"（价格基准）｜账户总资产 {payload['meta']['account_total_assets']:,.2f} 元 "
           f"｜单边费率 {payload['meta']['fee_rate_one_way']}｜整手 {payload['meta']['lot_size']} 股")
-    print(f"[decision-scenarios] 三个分歧项 {', '.join(payload['meta']['divergence_codes'])} "
+    print(f"[decision-scenarios] {len(payload['meta']['divergence_codes'])} 个分歧项 "
+          f"{', '.join(payload['meta']['divergence_codes'])} "
           f"× 2 选项 = {payload['meta']['n_scenarios']} 个情景：")
     for sc in payload["scenarios"]:
         div = sc["divergence_items"]
         breaches = "、".join(f"{p['code']}({float(p['weight_pct']):.2f}%)" for p in sc["slot_breaches"])
-        print(f"  {sc['label']}: 511880={div['511880']['shares']}股 512800={div['512800']['shares']}股 "
-              f"563020={div['563020']['shares']}股 | 期末现金 {sc['cash_end']:>10,.2f} 元 "
+        shares_desc = " ".join(f"{code}={div[code]['shares']}股" for code in div)
+        print(f"  {sc['label']}: {shares_desc} | 期末现金 {sc['cash_end']:>10,.2f} 元 "
               f"({float(sc['cash_weight_pct']):.2f}%) | 权益 {sc['equity_amount']:>10,.2f} 元 "
               f"({float(sc['equity_weight_pct']):.2f}%) | 总资产 {sc['total_assets']:>10,.2f} 元 "
               f"| 破单席 {breaches or '无'} | 可执行 {'是' if sc['executable'] else '否'}")

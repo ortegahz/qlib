@@ -11,6 +11,13 @@
 * **不 import 业务模块**（qlib / akshare / TradingAgents 一律不碰）⇒ 可离线单测；
 * 输入只有上游已经算好的结果 dict ⇒ **不反推、不编数字**。
 
+【🔴 两种运行态（唯一的状态维度）】
+* **观察态**（缺省）：执行卡**挂单禁用**、**不发信** ⇒ 报告顶部有警示块，
+  执行卡段落渲染成「观察清单（不可下单）」⇒ 全文**不出现**任何下单指令；
+* **实盘态**（``--live-trade``）：渲染真实挂单清单。
+
+Mode A/B/C 分诊**已下线** ⇒ 只剩**一条**渲染路径（``_render_pipeline``）。
+
 【🔴 数字纪律（铁律，违反即错）】
 1. 缺失 / 非法 / NaN 一律渲染成「—」，**绝不**渲染 ``None`` / ``nan`` / ``N/A``；
 2. **不许反推**：账户缺 ``total_assets`` 就不许用 ``cash + market_value`` 顶替；
@@ -181,142 +188,8 @@ def _account_rows(sources: Sequence[object]) -> list[list[str]]:
     ]
 
 
-def _route_quote(route: object) -> list[str]:
-    """调度说明（来自 `mode_router.route()`；没给就整节不渲染）。"""
-    mode = _get(route, "mode")
-    if mode is None:
-        return []
-    reason = _get(route, "reason")
-    execution_date = _get(route, "execution_date")
-    lines = [f"> 调度：**模式 {mode}**"]
-    if reason:
-        lines.append(">")
-        lines.append(f"> {_cell(reason)}")
-    # 🔴 **模式被显式覆盖时必须披露**（否则读者会误以为这是真实信号日全流程）
-    if _get(route, "mode_override"):
-        eff = _get(route, "effective_mode") or mode
-        lines.append(">")
-        lines.append(
-            f"> ⚠️ **本轮模式 {eff} 是显式 `--mode` 覆盖路由判定的结果**"
-            f"（路由原判 {_get(route, 'mode')}）"
-            f" ⇒ **不是**真实的调仓信号日全流程，结论按「演练/复核」口径读。"
-        )
-    if execution_date:
-        lines.append(">")
-        lines.append(f"> 执行日：{_cell(execution_date)}")
-    return lines
-
-
 # =============================================================================
-# 3. 模式 A —— 日常巡检报告
-# =============================================================================
-def _render_mode_a(result: Mapping, account: object, route: object,
-                   asof: str) -> list[str]:
-    """渲染模式 A 报告。"""
-    lines: list[str] = []
-    status = _get(result, "status")
-    ma = _get(result, "ma")
-    action = _get(result, "action")
-    acc_sources = [_get(result, "account"), account]
-
-    lines.append(f"# ETF 轮动巡检报告 · {asof}（模式 A · 日常巡检）")
-    lines.append("")
-    lines.extend(_route_quote(route))
-    if route:
-        lines.append("")
-
-    # ---- 一句话结论 ----
-    lines.append("## 一句话结论")
-    lines.append("")
-    if status == "ok":
-        lines.append("**趋势完好，守纪律躺平（无动作）。**")
-    elif status == "broken":
-        lines.append("**🔴 已跌破 MA60，需紧急平仓。**")
-    elif status == "insufficient_data":
-        lines.append("**样本不足，不做破位判定。**")
-    else:
-        lines.append(f"**状态：{_cell(status)}**（未识别的状态取值，不编结论）")
-    lines.append("")
-
-    # ---- 账户卡片 ----
-    lines.append("## 账户卡片")
-    lines.append("")
-    lines.extend(_table(["项目", "数值"], _account_rows(acc_sources)))
-    lines.append("")
-    discrepancy = _pick("discrepancy_note", *acc_sources)
-    if discrepancy:
-        lines.append(f"> {_cell(discrepancy)}")
-        lines.append("")
-
-    # ---- 均线安全带 ----
-    lines.append("## 均线安全带")
-    lines.append("")
-    lines.extend(_table(
-        ["指标", "数值"],
-        [
-            ["收盘价（元）", _fmt(_get(ma, "close"), price=True, digits=4)],
-            ["收盘日", _text(_get(ma, "close_date"))],
-            ["MA20（进场准入线，元）", _fmt(_get(ma, "ma20"), price=True, digits=4)],
-            ["MA60（持仓止损线，元）", _fmt(_get(ma, "ma60"), price=True, digits=4)],
-            ["站上 MA20？", _yn(_get(ma, "above_ma20"))],
-            ["站上 MA60？", _yn(_get(ma, "above_ma60"))],
-            ["距 MA60", _fmt(_get(ma, "distance_to_ma60_pct"), pct=True, signed=True)],
-            ["金额安全垫（元）", _fmt(_get(ma, "safety_buffer_amount"), money=True, signed=True)],
-            ["安全垫比例", _fmt(_get(ma, "safety_buffer_pct"), pct=True, signed=True)],
-            ["样本根数", _fmt(_get(ma, "n_obs"), shares=True)],
-        ],
-    ))
-    lines.append("")
-
-    # ---- 行动 ----
-    lines.append("## 行动")
-    lines.append("")
-    if action:
-        lines.append("### 🔴 紧急平仓指令")
-        lines.append("")
-        lines.extend(_table(
-            ["项目", "数值"],
-            [
-                ["触发价（收盘，元）", _fmt(_get(action, "trigger_price"), price=True, digits=4)],
-                ["MA60 止损线（元）", _fmt(_get(action, "ma60"), price=True, digits=4)],
-                ["跌破幅度", _fmt(_get(action, "break_pct"), pct=True, signed=True)],
-                ["清仓股数", _fmt(_get(action, "shares"), shares=True)],
-                ["标的", f"{_cell(_get(action, 'code'))} {_cell(_get(action, 'name'))}"],
-                ["动作", _text(_get(action, "action"))],
-            ],
-        ))
-        lines.append("")
-        instruction = _get(action, "instruction")
-        if instruction:
-            lines.append(f"**指令原文**：{_cell(instruction)}")
-            lines.append("")
-        reason = _get(action, "reason")
-        if reason:
-            lines.append(f"> 触发原因：{_cell(reason)}")
-            lines.append("")
-    else:
-        lines.append(
-            "本轮**不产生任何买卖指令**"
-            "（模式 A 是构造性保证：路径内没有打分 / 选股 / LLM 调用）。"
-        )
-        lines.append("")
-
-    # ---- 数据口径与备注 ----
-    lines.append("## 数据口径与备注")
-    lines.append("")
-    notes = _get(result, "notes")
-    if notes:
-        lines.extend(_bullets(notes))
-    else:
-        lines.append("- （无备注）")
-    generated_at = _get(result, "generated_at")
-    lines.append(f"- 报告生成时间：{_cell(generated_at)}")
-    lines.append("")
-    return lines
-
-
-# =============================================================================
-# 4. 模式 B —— 月度调仓决策卡
+# 3. 统一流水线 —— 月度调仓决策卡（观察态 / 实盘态共用同一条渲染路径）
 # =============================================================================
 def _order_rows(orders: Sequence[Mapping]) -> list[list[str]]:
     """订单表行（代码 / 名称 / 方向 / 股数 / 金额 / 费用 / 滑点 / 说明）。"""
@@ -359,9 +232,90 @@ def _split_orders(orders: Sequence[Mapping]) -> dict[str, list[Mapping]]:
     return buckets
 
 
-def _render_mode_b(result: Mapping, account: object, route: object,
-                   asof: str) -> list[str]:
-    """渲染模式 B 报告。"""
+def _observation_banner(result: Mapping) -> list[str]:
+    """观察态顶部警示块（**结构性挂单禁用**）。"""
+    snapshot_path = _text(_get(_get(result, "snapshot"), "path"))
+    return [
+        "> **[观察态 · 挂单禁用 · 非实盘信号]**",
+        "> 本轮未开 `--live-trade` ⇒ 执行卡不可下单、未发信。",
+        f"> 快照目录：{snapshot_path}",
+        "",
+    ]
+
+
+def _ranking_basis(result: Mapping) -> str:
+    """排序依据口径（**照抄 result 里的真实值**；没有 ⇒「—」，**不写死常量**）。"""
+    raw = None
+    for key in ("score_smoothing", "ranking_basis"):
+        value = _get(result, key)
+        if value is not None:
+            raw = value
+            break
+    if raw is None:
+        return PLACEHOLDER
+    if isinstance(raw, str):
+        return raw.strip() or PLACEHOLDER
+    if not isinstance(raw, Mapping):
+        return _text(raw)
+    basis = _get(raw, "ranking_basis")
+    if isinstance(basis, str) and basis.strip():
+        return basis.strip()
+    method = window = alpha = None
+    for key in ("method", "kind", "type", "name"):
+        if _get(raw, key) is not None:
+            method = _get(raw, key)
+            break
+    for key in ("window", "window_days", "days", "span"):
+        if _get(raw, key) is not None:
+            window = _get(raw, key)
+            break
+    alpha = _get(raw, "alpha")
+    if method is None and window is None and alpha is None:
+        return PLACEHOLDER
+    if method is None:
+        method_text = ""
+    else:
+        method_text = "EWMA" if "ewma" in str(method).lower() else str(method).strip()
+    window_text = "" if window is None else f"{_text(window)} 日"
+    core = f"{window_text} {method_text} 平滑分".strip() or "平滑分"
+    return f"{core}（alpha={_text(alpha) if alpha is not None else PLACEHOLDER}）"
+
+
+def _provenance_rows(result: Mapping, live_trade: bool) -> list[list[str]]:
+    """快照 / 运行态 / ``live_trade`` 的**显式披露**行（缺 ⇒「—」，**不编造**）。"""
+    has_raw_live = isinstance(result, Mapping) and "live_trade" in result
+    raw_live = _get(result, "live_trade")
+    state_text = "实盘态（可下单 · 可发信）" if live_trade else "观察态（挂单禁用 · 不发信）"
+    # 🔴 2026-11-09（P1-5）：`--full` 覆盖掉的 skip 开关**必须**在报告里披露
+    #    （原先只进 manifest ⇒ 交付面看不到 ⇒ 等于静默降级）。
+    _skipped = _get(result, "skipped_switches") or []
+    if isinstance(_skipped, str):
+        _skipped = []
+    _skipped_text = (
+        "；".join(
+            f"{_get(s, 'name')}（{_get(s, 'reason')}）"
+            for s in _skipped
+            if isinstance(s, Mapping)
+        )
+        or "无"
+    )
+    return [
+        ["快照目录", _text(_get(_get(result, "snapshot"), "path"))],
+        ["流水线模式", "unified"],
+        ["本轮状态", state_text],
+        ["live_trade", _yn(raw_live) if has_raw_live else PLACEHOLDER],
+        ["本轮被覆盖的开关", _skipped_text],
+    ]
+
+
+def _render_pipeline(result: Mapping, account: object,
+                     asof: str, live_trade: bool = False) -> list[str]:
+    """渲染统一流水线报告。
+
+    🔴 **观察态 / 实盘态共用同一条渲染路径**（Mode A/B/C 分诊已下线）：
+    * 观察态（``live_trade=False``）：顶部警示块 ＋ 执行卡段落走「观察清单」分支；
+    * 实盘态（``live_trade=True``）：渲染真实挂单清单。
+    """
     lines: list[str] = []
     card = _get(result, "card")
     cash_flow = _get(card, "cash_flow")
@@ -371,11 +325,23 @@ def _render_mode_b(result: Mapping, account: object, route: object,
     execution_date = _pick("execution_date", card, result)
     acc_sources = [_get(card, "account"), _get(result, "account"), account]
 
-    lines.append(f"# ETF 月度调仓决策卡 · {asof} 信号日（模式 B · 六阶段全流程）")
+    if not live_trade:
+        lines.extend(_observation_banner(result))
+    if live_trade:
+        lines.append(f"# ETF 月度调仓决策卡 · {asof} 信号日（统一流水线 · 六阶段全流程）")
+    else:
+        lines.append(
+            f"# [观察态 · 挂单禁用] ETF 月度调仓决策卡 · {asof} 信号日"
+            "（统一流水线 · 挂单禁用 · 非实盘信号）"
+        )
     lines.append("")
-    lines.extend(_route_quote(route))
-    if route:
-        lines.append("")
+    # ---- 快照与运行口径（🔴 不许静默降级 ⇒ 关键口径必须显式披露）----
+    lines.append("## 快照与运行口径")
+    lines.append("")
+    lines.extend(_table(["项目", "数值"], _provenance_rows(result, live_trade)))
+    lines.append("")
+    lines.append(f"> 排序依据：{_ranking_basis(result)}")
+    lines.append("")
 
     # ---- 执行摘要 ----
     lines.append("## 执行摘要")
@@ -473,7 +439,10 @@ def _render_mode_b(result: Mapping, account: object, route: object,
         "代码", "名称", "方向", "当前股数", "目标股数", "增减股数",
         "参考价（元）", "价格日", "预估金额（元）", "预估费用（元）", "预估滑点（元）", "说明",
     ]
-    lines.append("## 买入清单")
+    if live_trade:
+        lines.append("## 买入清单")
+    else:
+        lines.append("## 买入方向（观察 · **不可下单**）")
     lines.append("")
     if buckets["buy"]:
         lines.extend(_table(order_headers, _order_rows(buckets["buy"])))
@@ -481,7 +450,10 @@ def _render_mode_b(result: Mapping, account: object, route: object,
         lines.append("（本轮无买入动作）")
     lines.append("")
 
-    lines.append("## 卖出清单")
+    if live_trade:
+        lines.append("## 卖出清单")
+    else:
+        lines.append("## 卖出方向（观察 · **不可下单**）")
     lines.append("")
     if buckets["sell"]:
         lines.extend(_table(order_headers, _order_rows(buckets["sell"])))
@@ -611,30 +583,62 @@ def _render_mode_b(result: Mapping, account: object, route: object,
         lines.extend(_bullets(notes))
         lines.append("")
 
-    # ---- 挂单清单 ----
-    lines.append("## 挂单清单（次日开盘人工执行）")
-    lines.append("")
-    lines.append(
-        "按本表在券商 App 手工挂单，参考价 = 信号日收盘价，实际成交价可能不同。"
-    )
-    lines.append("")
+    # ---- 挂单清单 / 观察清单 ----
+    # 🔴 **观察态 ⇒ 这一段不许长成「挂单清单」**：
+    #    实测事故（2026-11-06）：观察态报告里出现了
+    #    「## 挂单清单（次日开盘人工执行）」＋「按本表在券商 App 手工挂单」
+    #    ⇒ 顶部有警示块也没用 ⇒ **正文仍在教人下单** ⇒ 违反「结构性不可下单」。
+    #    ⇒ 观察态改成「**观察清单（不可下单）**」：标题、正文提示、每行状态列
+    #    三处都写明**禁用**，让任何人单独截取这张表也不会误当挂单指令。
+    if live_trade:
+        lines.append("## 挂单清单（次日开盘人工执行）")
+        lines.append("")
+        lines.append(
+            "按本表在券商 App 手工挂单，参考价 = 信号日收盘价，实际成交价可能不同。"
+        )
+        lines.append("")
+    else:
+        lines.append("## 观察清单（**不可下单** · 挂单禁用）")
+        lines.append("")
+        lines.append(
+            "🔴 **本表不可下单**：本轮是**观察态**（未开 `--live-trade`）⇒ "
+            "**不产生实盘信号**、**未发信**。下表仅用于**观察**排序与方向的当日演化；"
+            "参考价为**信号日收盘价**（≠ 节点日成交价），**不是**下单指令。"
+        )
+        lines.append("")
     tradable = buckets["buy"] + buckets["sell"]
     if tradable:
-        lines.extend(_table(
-            ["代码", "名称", "方向", "股数", "参考价（元）"],
-            [
+        if live_trade:
+            lines.extend(_table(
+                ["代码", "名称", "方向", "股数", "参考价（元）"],
                 [
-                    _text(_get(o, "code")),
-                    _text(_get(o, "name")),
-                    _text(_get(o, "action")),
-                    _fmt(_get(o, "delta_shares"), shares=True, signed=True),
-                    _fmt(_get(o, "price"), price=True, digits=4),
-                ]
-                for o in tradable
-            ],
-        ))
+                    [
+                        _text(_get(o, "code")),
+                        _text(_get(o, "name")),
+                        _text(_get(o, "action")),
+                        _fmt(_get(o, "delta_shares"), shares=True, signed=True),
+                        _fmt(_get(o, "price"), price=True, digits=4),
+                    ]
+                    for o in tradable
+                ],
+            ))
+        else:
+            lines.extend(_table(
+                ["状态", "代码", "名称", "方向", "股数（观察值）", "参考价（元）"],
+                [
+                    [
+                        "🔴 禁用",
+                        _text(_get(o, "code")),
+                        _text(_get(o, "name")),
+                        _text(_get(o, "action")),
+                        _fmt(_get(o, "delta_shares"), shares=True, signed=True),
+                        _fmt(_get(o, "price"), price=True, digits=4),
+                    ]
+                    for o in tradable
+                ],
+            ))
     else:
-        lines.append("（本轮无挂单动作）")
+        lines.append("（本轮无挂单动作）" if live_trade else "（本轮无动作）")
     lines.append("")
     generated_at = _get(result, "generated_at")
     lines.append(f"- 报告生成时间：{_cell(generated_at)}")
@@ -643,21 +647,44 @@ def _render_mode_b(result: Mapping, account: object, route: object,
 
 
 # =============================================================================
-# 5. 公开 API
+# 4. 公开 API
 # =============================================================================
-def render_report(result: dict, *, account: dict | None = None, route: dict | None = None,
-                  mode: str | None = None, asof: str | None = None) -> str:
+#: 旧 Mode A/B/C 分诊已下线 ⇒ 只剩**一种**模式；``"B"`` 作为旧别名兼容（视作 unified）。
+_MODE_UNIFIED = "unified"
+_LEGACY_MODE_ALIASES = {"B": _MODE_UNIFIED}
+
+
+def _resolve_unified_mode(value: object) -> str:
+    """把 ``mode`` 归一成 ``"unified"``；非法值 ⇒ ``ValueError``（**附迁移提示**）。"""
+    text = value.strip().upper() if isinstance(value, str) else value
+    if text == _MODE_UNIFIED.upper():
+        return _MODE_UNIFIED
+    if isinstance(text, str) and text in _LEGACY_MODE_ALIASES:
+        return _LEGACY_MODE_ALIASES[text]
+    hint = (
+        "Mode A/B/C 分诊**已下线** ⇒ 只剩单一流水线（mode=unified）。"
+        "请改用 CLI 的 `--full`（强制全流程）／`--live-trade`（实盘副作用）／"
+        "`--snapshot-root`（快照目录）；**观察态是缺省行为**（挂单禁用、不发信）。"
+    )
+    if text is None:
+        raise ValueError(f"结果里没有 `mode` 字段：{hint}")
+    raise ValueError(f"模式 {value!r} 已废弃：{hint}")
+
+
+def render_report(result: dict, *, account: dict | None = None,
+                  mode: str | None = None, asof: str | None = None,
+                  live_trade: bool | None = None) -> str:
     """把流水线结果 dict 渲染成 **Markdown 报告**（可直接贴进对话窗口）。
 
     参数
     ----
-    result : 模式 A / 模式 B 的结果 dict（结构见 ``agents_rebalance.run_mode_a``
-        / ``run_mode_b`` 的返回值）。
+    result : 统一流水线的结果 dict（结构见 ``agents_rebalance.run_pipeline`` 的返回值）。
     account: 账户快照（可选）—— 只在 ``result`` 里缺对应键时**兜底取用**，
         **不参与任何计算**（不反推总资产、不重算占比）。
-    route  : ``mode_router.route()`` 的返回值（可选）⇒ 渲染调度说明。
-    mode   : 模式（``"A"`` / ``"B"``）—— 缺省取 ``result["mode"]``。
+    mode   : 只能是 ``"unified"``（旧别名 ``"B"`` 兼容，视作 unified）——
+             缺省取 ``result["mode"]``；``"A"`` / ``"C"`` ⇒ 抛 ``ValueError``（附迁移提示）。
     asof   : 报告日期 —— 缺省取 ``result["asof"]``。
+    live_trade: 实盘态开关 —— 缺省取 ``result["live_trade"]``（缺省 False = **观察态**）。
 
     返回
     ----
@@ -668,20 +695,17 @@ def render_report(result: dict, *, account: dict | None = None, route: dict | No
     if not isinstance(result, Mapping):
         raise TypeError(f"result 必须是 dict，实际是 {type(result).__name__}")
 
-    resolved_mode = mode or _get(result, "mode")
-    if isinstance(resolved_mode, str):
-        resolved_mode = resolved_mode.strip().upper()
-    if resolved_mode not in ("A", "B"):
-        raise ValueError(f"无法判定模式：mode={resolved_mode!r}（result['mode'] 也没有）")
+    _resolve_unified_mode(mode or _get(result, "mode"))
 
     day = asof or _get(result, "asof")
     day_text = _text(day)
 
-    if resolved_mode == "A":
-        lines = _render_mode_a(result, account, route, day_text)
+    if live_trade is None:
+        resolved_live_trade = bool(_get(result, "live_trade", False))
     else:
-        lines = _render_mode_b(result, account, route, day_text)
+        resolved_live_trade = bool(live_trade)
 
+    lines = _render_pipeline(result, account, day_text, resolved_live_trade)
     text = "\n".join(lines).rstrip() + "\n"
     return text
 
@@ -699,7 +723,7 @@ def render_failure_report(*, asof: str, stage: str, error: str,
     """渲染**流水线失败报告**（Markdown）。
 
     🔴 为什么必须有它：邮件已改成「按需 opt-in」⇒ 失败时**默认没有邮件**。
-    但失败**必须**留证据 ⇒ 落一份 Markdown 到 ``manu/report/`` 并打印到 stderr。
+    但失败**必须**留证据 ⇒ 落一份 Markdown 到 ``<RESULTS_ROOT>/reports/`` 并打印到 stderr。
 
     参数
     ----

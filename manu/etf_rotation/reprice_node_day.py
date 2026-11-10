@@ -26,11 +26,11 @@ qlib 个股层（S）⇒ E=W×S ⇒ 规则层 + LLM 层 ⇒ **信号（名单 + 
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/reprice_node_day.py \\
         --node-date 2026-12-01 \\
-        [--plan /mnt/data/siping/runs/etf_rotation/final_rebalance_plan.json] \\
-        [--prices /mnt/data/siping/datasets/etf/etf_prices.csv] \\
+        [--plan <落点根>/runs/final_rebalance_plan.json] \\
+        [--prices <落点根>/datasets/etf/etf_prices.csv] \\
         [--account manu/etf_rotation/data/account_snapshot.csv] \\
         [--cash 15518.87] [--total-assets 29854.67] \\
-        [--out-dir /mnt/data/siping/runs/etf_rotation]
+        [--out-dir <落点根>/runs]
 """
 from __future__ import annotations
 
@@ -202,6 +202,11 @@ def _scenario_overrides(
     """
     llm_targets = ((plan.get("llm_final_decision") or {}).get("targets") or {})
     plan_codes = {str(a.get("code") or "").zfill(6) for a in plan.get("actions") or []}
+    #: 规则层各席位的计划权重（🔴 **不许写死「等权 20%」** —— 幸存只数变 ⇒ 等权值会变）
+    plan_weight_map = {
+        str(a.get("code") or "").zfill(6): float(a.get("target_weight") or 0.0)
+        for a in plan.get("actions") or []
+    }
     overrides: dict[str, dict] = {}
     rows: list[dict] = []
     for code, letter in sorted(choices.items()):
@@ -213,7 +218,8 @@ def _scenario_overrides(
             rows.append({
                 "code": code, "choice": "A", "kind": "rule",
                 "kind_label": "规则层（不覆盖，沿用计划件 target_weight）",
-                "basis": "计划件 actions[].target_weight（等权 20%）",
+                "basis": (f"计划件 actions[].target_weight"
+                          f"（本轮规则层等权 {plan_weight_map.get(code, 0.0) * 100:.1f}%）"),
                 "source": "final_rebalance_plan.json → actions[].target_weight",
             })
             continue
@@ -317,6 +323,9 @@ def _recompute(
         ov = (overrides or {}).get(code)
         scenario_fields: dict = {}
         action_label = act.get("action") or ""
+        #: 🔴 情景模式 = 传了 `--scenario`（`overrides is not None`；全 A 情景 ⇒ 空字典但**不是 None**）
+        #:    ⇒ 默认（纯规则层）路径**完全不受影响**（产物逐字节不变）。
+        scenario_mode = overrides is not None
         if ov:
             kind = ov["kind"]
             if kind == "weight":
@@ -352,8 +361,14 @@ def _recompute(
                 action_label = "卖出"
             else:
                 action_label = "持有"
-            slot_limit = plan_target_weight * total_assets if total_assets else 0.0
-            slot_breach = bool(target_amount > slot_limit + 0.005)
+            # 🔴 2026-11-09 修（生产基线重建轮）：**「单席上限」是账户级 20%，不是规则层席位预算**。
+            #    旧实现拿 `plan_target_weight × total_assets`（= 规则层**等权分配到该席位**的预算，
+            #    本轮幸存 4 只 ⇒ 每只 25% ⇒ 预算 7,463.67 元）当上限 ⇒ 落地 24.78%（7,398 元）
+            #    **不破** ⇒ `slot_breach` 恒 False ⇒ 产品的破单席标记与
+            #    `make_decision_options.py` / `make_decision_scenarios.py` / `probe_node_scenarios.py`
+            #    三处的「落地金额 > 单席上限（5,970.93 元 = 20% × 总资产）」口径**互相矛盾**
+            #    ⇒ 闸门 `probe_node_scenarios` P8（独立重算破单席标记）真红。
+            #    ⇒ 修法：上限口径与全仓统一到**账户级单席上限** `A.TARGET_POSITION_WEIGHT`。
             scenario_fields = {
                 "plan_target_weight": plan_target_weight,
                 "plan_action": act.get("action") or "",
@@ -365,14 +380,38 @@ def _recompute(
                     "basis": ov.get("basis"),
                     "source": ov.get("source"),
                 },
+            }
+        if scenario_mode:
+            # 🔴 2026-11-09 修（生产基线重建轮）：情景模式下**每一行**都要带破单席判定 ——
+            #    旧实现把 `slot_breach` 只写在**被覆盖的行**（`if ov:` 分支内）⇒
+            #    **选项 A（规则层，不覆盖）的那一行根本没有这个字段** ⇒
+            #    聚合件的破单席清单漏掉规则层席位 ⇒ 与「落地金额 > 单席上限（20% × 总资产）」
+            #    的独立重算**对不上** ⇒ 闸门 `probe_node_scenarios` P8 真红。
+            #    ⇒ 修法：情景模式下**全部行**统一按**账户级单席上限**判定
+            #      （默认路径不受影响 ⇒ 零回归产物逐字节不变）。
+            # 🔴 2026-11-09 修（critic 复核轮）：破单席判定改成**落地口径** ——
+            #    旧实现拿 `target_amount`（= **计划**目标金额 = 目标权重 × 总资产）比上限，
+            #    且**不看是否真的建了仓** ⇒ 「计划 25% 但一手买不起（落地 0 股）」的席位
+            #    （典型：场内货基，一手 1.0 万 > 单席 5,970.93 元）会被标成破单席，
+            #    而聚合件的 `positions`（落地持仓全集，`target_shares > 0`）里**没有它**
+            #    ⇒ 探针 P8「独立重算」按落地持仓重算 ⇒ 重算不出这个席位 ⇒ 口径对不上（假红）。
+            #    ⇒ 修法：破单席 ⇔ **落地持仓金额**（落地股数 × 节点日价）> 单席上限，
+            #      宇宙 = 落地持仓（`target_shares > 0`）⇒ 与 `make_decision_options.py`
+            #      / `make_decision_scenarios.py` / `make_node_scenarios.py`
+            #      / `probe_node_scenarios.py` 五处**同口径**。
+            slot_limit = total_assets * float(A.TARGET_POSITION_WEIGHT) if total_assets else 0.0
+            landed_amount = float(target_shares) * float(price) if target_shares > 0 else 0.0
+            slot_breach = bool(landed_amount > slot_limit + 0.005)
+            scenario_fields.update({
                 "slot_limit_amount": round(slot_limit, 6),
+                "slot_landed_amount": round(landed_amount, 6),
                 "slot_breach": slot_breach,
                 "slot_breach_note": (
-                    f"落地金额 {target_amount:.2f} 元 > 单席上限 {slot_limit:.2f} 元"
-                    f"（规则层 {plan_target_weight * 100:.1f}% × 总资产）⇒ 破单席"
+                    f"落地金额 {landed_amount:.2f} 元 > 单席上限 {slot_limit:.2f} 元"
+                    f"（账户级单席权重 {A.TARGET_POSITION_WEIGHT * 100:.0f}% × 总资产）⇒ 破单席"
                     if slot_breach else ""
                 ),
-            }
+            })
         _row = {
             "code": code,
             "name": act.get("name") or "",
@@ -1004,7 +1043,7 @@ def main() -> int:
         import signal_policy as SP
 
         cal_path = Path(str(getattr(C, "PROVIDER_URI", ""))) / "calendars" / "day.txt"
-        extra = Path("/mnt/data/siping/datasets/etf/trade_calendar.csv")
+        extra = C.ETF_DATA_ROOT / "trade_calendar.csv"
         cal = set(SP.read_calendar_dates(cal_path))
         if extra.exists():
             df = pd.read_csv(extra, dtype=str)

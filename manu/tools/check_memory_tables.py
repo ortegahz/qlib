@@ -12,7 +12,7 @@ r"""只读检查 memory 主档里 markdown 表格的**结构**完整性。
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/check_memory_tables.py \
         --project-dir /tmp/pycharm_project_658d3fc4 \
         --files manu/memory/memory.md --files manu/memory/memory_compact.md \
-        --json-out /mnt/data/siping/runs/_memtbl_check/result.json
+        --json-out <落点根>/runs/_memtbl_check/result.json
     （`--files` 可重复传入；相对路径按 `--project-dir` 解析，找不到再按当前工作目录解析。）
 
 判定口径（关键）

@@ -23,7 +23,7 @@
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_data_freshness.py \
-        [--run-root /mnt/data/siping/runs/etf_rotation]
+        [--run-root <落点根>/runs]
 
 【副作用】只读正式产物，不修改；不写任何临时文件。
 """
@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config as C  # noqa: E402  （落点常量单一事实源）
 from analyze import _data_freshness_guard  # noqa: E402
 
 #: 信号日（与正式产物的 asof 一致）
@@ -184,7 +185,7 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
 def main() -> int:
     """跑探针；退出码 0 = 全部断言通过，1 = 有断言失败。"""
     ap = argparse.ArgumentParser(description="数据新鲜度守卫回归探针")
-    ap.add_argument("--run-root", default="/mnt/data/siping/runs/etf_rotation")
+    ap.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
     args = ap.parse_args()
 
     run_root = Path(args.run_root)

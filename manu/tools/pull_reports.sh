@@ -27,7 +27,10 @@ REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_658d3fc4}"
 # 本机 SSHFS 挂载点（只读镜像）；挂不上就退回 ssh + rsync
 SSHFS_MIRROR="${SSHFS_MIRROR:-/home/manu/mnt/pycharm_project_658d3fc4}"
 
-REMOTE_DIR="$REMOTE_ROOT/manu/report"
+# 🔴 2026-11-10 铁律十六：报告的真值已随「落点双根化」搬到**结果根**下的
+#    `reports/`（不再落仓库内 `manu/report/`）⇒ 拉取源改指结果根。
+RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-/mnt/data/siping/runs/etf_rotation_results}"
+REMOTE_DIR="$RESULTS_ROOT/reports"
 LOCAL_DIR="$SRC_REPO/manu/report"
 
 CHECK_ONLY=0
@@ -44,7 +47,8 @@ echo "== 服务器报告目录 : $SSH_HOST:$SSH_PORT$REMOTE_DIR"
 echo "== 本地落点        : $LOCAL_DIR"
 
 REMOTE_READ=""
-if [ -d "$SSHFS_MIRROR/manu/report" ]; then
+# 🔴 结果根不在 SSHFS 的仓库镜像里（镜像只覆盖工程目录）⇒ 一律走 ssh 通道。
+if false; then
   REMOTE_READ="sshfs"
   SRC_DIR="$SSHFS_MIRROR/manu/report"
   echo "== 通道            : SSHFS 只读镜像（$SRC_DIR）"

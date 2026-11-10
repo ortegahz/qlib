@@ -22,7 +22,8 @@
 #   * **不联网、不下载、不打分、不回测、不调 LLM**；
 #   * **只写** reprice_node_day.py 自己的两个新文件（node_reprice_<日期>.json/.md），
 #     且**已存在则拒绝覆盖**（fail-fast）；
-#   * 临时文件落 /mnt/data（**不落 /tmp**）；无 nohup、无后台常驻。
+#   * 临时文件落**唯一落点根**下的 `_work/`（**不落 /tmp**：tmpfs 会清 /tmp）；
+#     无 nohup、无后台常驻。
 #
 # 【用法】
 #   bash manu/etf_rotation/node_day.sh --node-date 2026-12-01
@@ -32,7 +33,15 @@ set -uo pipefail
 
 # ---- 固定口径（路径 / 解释器）------------------------------------------------
 QL_PY="/home/huangzhe/anaconda3/envs/ql/bin/python"
-DEFAULT_RUN_ROOT="/mnt/data/siping/runs/etf_rotation"
+#: 🔴 **结果落点根**（可被环境变量 `ETF_ROTATION_RESULTS_ROOT` 覆盖 ⇒ 整棵树可搬家）
+#:    单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的同名常量。
+RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-/mnt/data/siping/runs/etf_rotation_results}"
+#: 产物根 = 结果根（与 `daily_config.RESEARCH_RUN_ROOT` 同口径）
+DEFAULT_RUN_ROOT="$RESULTS_ROOT"
+#: 🔴 **数据集落点根**（只放**临时工作区**；与 `daily_config.OUTPUT_ROOT` 同口径）
+OUTPUT_ROOT="${ETF_ROTATION_OUTPUT_ROOT:-/mnt/data/siping/datasets/manu/etf_rotation}"
+#: 临时工作区 = 数据集根下的 `_work/`（与 `daily_config.WORK_ROOT` 同口径）
+WORK_ROOT="$OUTPUT_ROOT/_work"
 DEFAULT_REPO_ROOT="/tmp/pycharm_project_658d3fc4"
 
 # ---- 参数默认值 --------------------------------------------------------------
@@ -50,7 +59,7 @@ usage() {
   --node-date YYYY-MM-DD      调仓节点日（如 2026-12-01）；不给 ⇒ 报错退出
 
 可选：
-  --run-root PATH             产物目录（默认 /mnt/data/siping/runs/etf_rotation）
+  --run-root PATH             产物目录（默认 <落点根>/runs）
   --repo-root PATH            工程根目录（默认 /tmp/pycharm_project_658d3fc4）
   --total-assets-basis {plan|node}
                               总资产口径（默认 plan；**透传**给 reprice_node_day.py）
@@ -135,9 +144,11 @@ for _f in manu/etf_rotation/data/preflight_freshness.py manu/etf_rotation/repric
   [ -f "$_f" ] || { echo "🔴 缺文件：$REPO_ROOT/$_f" >&2; exit 1; }
 done
 
-# ---- 临时目录（落 /mnt/data，不落 /tmp；退出时清掉）--------------------------
-TMP_DIR="$(mktemp -d /mnt/data/_node_day_XXXXXX)" || {
-  echo "🔴 建不了临时目录（/mnt/data/_node_day_XXXXXX）" >&2; exit 1; }
+# ---- 临时目录（落落点根的 _work/，不落 /tmp；退出时清掉）--------------------
+mkdir -p "$WORK_ROOT" || {
+  echo "🔴 建不了临时工作目录（$WORK_ROOT）" >&2; exit 1; }
+TMP_DIR="$(mktemp -d "$WORK_ROOT/_node_day_XXXXXX")" || {
+  echo "🔴 建不了临时目录（$WORK_ROOT/_node_day_XXXXXX）" >&2; exit 1; }
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # ---- 各阶段退出码（任一非 0 ⇒ 最终退出码 1）---------------------------------
