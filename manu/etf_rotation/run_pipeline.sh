@@ -207,6 +207,10 @@ say "2.5/16 导出账户事实源（account_context.json + account_snapshot.csv�
 say "3/16 生成 ETF 分析报告"
 ANALYZE_ARGS=(--out-dir "$OUT_DIR" --stock-prices "$OUT_DIR/stock_prices.csv")
 [ -n "$ASOF" ] && ANALYZE_ARGS+=(--asof "$ASOF")
+#: 🔴 2026-11-11：候选池条数与每日链**同口径**（单一事实源 = `config.ANALYZE_TOP_N`）
+#:    ⇒ TA 顺延补位能看到第 16 名以后的候选，且与 run_gates.sh 的 repro 段可比对。
+ANALYZE_TOP_N="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import config; print(config.ANALYZE_TOP_N)" 2>/dev/null || echo 100)"
+ANALYZE_ARGS+=(--top-n "$ANALYZE_TOP_N")
 #: 🔴 平滑参数**两链同组**（分析链 + 规则层）
 ANALYZE_ARGS+=("${SMOOTH_ARGS[@]+"${SMOOTH_ARGS[@]}"}")
 "$QL_PY" manu/etf_rotation/analyze.py "${ANALYZE_ARGS[@]}" 2>&1 | tail -20 | tee -a "$LOG"
@@ -220,7 +224,12 @@ HOLDINGS_ARG="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation');
 if [ -z "$HOLDINGS_ARG" ]; then
   say "WARN: 账户快照读不到持仓权重 ⇒ recommend.py 按空持仓跑（不编造）"
 fi
-RECOMMEND_ARGS=(--out-dir "$OUT_DIR" --pool-mode e_covered --entry-ma-window 20 --exit-ma-window 60)
+#: 🔴 2026-11-11：入场/退场均线**从 config 读**（单一事实源），不再写死字面量
+#:    （写死 20 ⇒ 与 `config.ENTRY_MA_FILTER_WINDOW=60` 分叉 ⇒ 两链不同源）。
+_ENTRY_MA="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import config; print(config.ENTRY_MA_FILTER_WINDOW)" 2>/dev/null || echo 60)"
+_EXIT_MA="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import config; print(config.EXIT_MA_FILTER_WINDOW)" 2>/dev/null || echo 60)"
+say "   均线口径：入场 MA${_ENTRY_MA} / 退场 MA${_EXIT_MA}（取自 config）"
+RECOMMEND_ARGS=(--out-dir "$OUT_DIR" --pool-mode e_covered --entry-ma-window "$_ENTRY_MA" --exit-ma-window "$_EXIT_MA")
 #: 🔴 与 analyze.py **同一组**（不同组 ⇒ 两链分叉 ⇒ 交付与规则不同源）
 RECOMMEND_ARGS+=("${SMOOTH_ARGS[@]+"${SMOOTH_ARGS[@]}"}")
 [ -n "$ASOF" ] && RECOMMEND_ARGS+=(--asof "$ASOF")

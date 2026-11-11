@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smoothing-window", type=int, default=None,
                    help="滚动窗口（交易日；默认 5）")
     p.add_argument("--smoothing-alpha", type=float, default=None,
-                   help="EWMA 系数（默认 0.35）")
+                   help="EWMA 系数（默认取 config.SMOOTHING_ALPHA）")
     p.add_argument("--smoothing-history-days", type=int, default=None,
                    help="EWMA 预热历史跨度（交易日；默认 30）")
     return p.parse_args()
@@ -175,6 +175,17 @@ def main() -> int:
                 "signal_stride_multiplier": C.REBALANCE_STRIDE_MULTIPLIER,
                 "execution_lag_days": C.EXECUTION_LAG_DAYS,
                 "n_holdings": result["n_selected"],
+                # 🔴 2026-11-11（真缺陷 · 交付件自证口径）：现金预留 / 权益预算
+                #    这三个字段**引擎自己已经算出来了**（`engine/portfolio.py` 的
+                #    `cash_weight` / `cash_reserve_ratio` / `equity_budget`，
+                #    分别来自 `config.CASH_RESERVE_RATIO` 与 `1 - CASH_RESERVE_RATIO`）
+                #    ⇒ 但本文件落盘时**只漏了这三个** ⇒ 规则层自己的交付件
+                #       `rebalance_recommendation.json` 里查不到「留 20% 现金」的口径
+                #       （同一份报告的 `etf_analysis_report.json` 有 ⇒ 两件自相矛盾）。
+                #    ⇒ 现在补齐：**规则层自己算的值**，不是外部常量、也不是反推。
+                "cash_weight": result.get("cash_weight"),
+                "cash_reserve_ratio": result.get("cash_reserve_ratio"),
+                "equity_budget": result.get("equity_budget"),
                 "holdings": result["holdings"],
                 "trades": result["trades"],
                 "top_candidates": result["top_candidates"],

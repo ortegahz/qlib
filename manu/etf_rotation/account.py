@@ -8,7 +8,7 @@
 
 【本模块的口径（全部来自用户本人提供的持仓截图，2026-11-04，不许改数）】
 - 总资产 = 现金 + 持仓市值 ⇒ 两边必须对账，偏差 ≥ 0.01 元**直接抛异常**（不许静默通过）；
-- 目标结构：**5 只等权**，每只占总资产 **20%**（≈ 5,970 元）；
+- 目标结构：**5 只等权**，每只占总资产 **16%**（≈ 4,776 元）⇒ 权益合计 80%、**留 20% 现金**；
 - 持仓/成本/盈亏落在 `data/account_snapshot.csv`（UTF-8 BOM，含表头）。
 
 【与 `config.py` 的关系】
@@ -33,10 +33,15 @@ TOTAL_ASSETS = 29_854.67
 CASH = 15_518.87
 #: 目标持仓只数（等权 5 只）
 TARGET_POSITIONS = 5
-#: 每只标的占总资产的目标权重（5 × 20% = 100%）
-TARGET_POSITION_WEIGHT = 0.20
-#: 每只标的的目标金额（元）：TOTAL_ASSETS × TARGET_POSITION_WEIGHT = 5,970.93 ⇒ 取整 5,970.0
-TARGET_POSITION_AMOUNT = 5_970.0
+#: 每只标的占总资产的目标权重 = (1 - 现金预留比例) / 目标只数 = 0.80 / 5 = **0.16**
+#:    🔴 与规则层等权口径一致：**留 20% 现金** ⇒ 权益上限 80% ⇒ 5 只各 16%。
+#:    来源常量：`config.CASH_RESERVE_RATIO`（研究链）与
+#:    `daily/daily_config.CASH_RESERVE_RATIO`（每日链）——本模块**不 import config**
+#:    （保持独立、可单测）⇒ 值**写死**在此，两侧一致性由各链 config 的断言守住。
+TARGET_POSITION_WEIGHT = 0.16
+#: 每只标的的目标金额（元）：TOTAL_ASSETS × TARGET_POSITION_WEIGHT = 4,776.75 ⇒ 取整 4,776.0
+#:    （口径同旧版：**向下取整到元**，不四舍五入）
+TARGET_POSITION_AMOUNT = 4_776.0
 #: 账户快照 CSV（用户真实持仓，2026-11-04）
 ACCOUNT_SNAPSHOT_CSV = Path(__file__).resolve().parent / "data" / "account_snapshot.csv"
 #: **账户快照日**（用户持仓截图日）—— `TOTAL_ASSETS` / `CASH` 的真实时点。
@@ -184,7 +189,7 @@ def account_summary(snapshot: pd.DataFrame | None = None) -> dict:
     - `n_positions`：持仓只数；
     - `total_cost` / `total_pnl` / `total_pnl_pct`：总成本、总盈亏（元）、总盈亏率；
     - `target_positions` / `target_position_weight` / `target_position_amount`：目标结构
-      （5 只等权，每只 20% ≈ 5,970 元）；
+      （5 只等权，每只 16% ≈ 4,776 元；权益合计 80%、留 20% 现金）；
     - `per_position_pnl_pct`：`{code: 盈亏率}`（小数口径，如 0.0608 = +6.08%）。
 
     会校验 `total_assets == cash + market_value`（偏差 ≥ 0.01 元抛异常）。

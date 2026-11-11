@@ -16,7 +16,8 @@
   执行卡段落渲染成「观察清单（不可下单）」⇒ 全文**不出现**任何下单指令；
 * **实盘态**（``--live-trade``）：渲染真实挂单清单。
 
-Mode A/B/C 分诊**已下线** ⇒ 只剩**一条**渲染路径（``_render_pipeline``）。
+「模式」分诊**已彻底下线** ⇒ 只剩**一条**渲染路径（``_render_pipeline``）；
+运行态**只**由 ``live_trade`` 表达（观察态 / 实盘态）。
 
 【🔴 数字纪律（铁律，违反即错）】
 1. 缺失 / 非法 / NaN 一律渲染成「—」，**绝不**渲染 ``None`` / ``nan`` / ``N/A``；
@@ -301,7 +302,6 @@ def _provenance_rows(result: Mapping, live_trade: bool) -> list[list[str]]:
     )
     return [
         ["快照目录", _text(_get(_get(result, "snapshot"), "path"))],
-        ["流水线模式", "unified"],
         ["本轮状态", state_text],
         ["live_trade", _yn(raw_live) if has_raw_live else PLACEHOLDER],
         ["本轮被覆盖的开关", _skipped_text],
@@ -312,7 +312,7 @@ def _render_pipeline(result: Mapping, account: object,
                      asof: str, live_trade: bool = False) -> list[str]:
     """渲染统一流水线报告。
 
-    🔴 **观察态 / 实盘态共用同一条渲染路径**（Mode A/B/C 分诊已下线）：
+    🔴 **观察态 / 实盘态共用同一条渲染路径**（「模式」分诊已下线）：
     * 观察态（``live_trade=False``）：顶部警示块 ＋ 执行卡段落走「观察清单」分支；
     * 实盘态（``live_trade=True``）：渲染真实挂单清单。
     """
@@ -358,6 +358,11 @@ def _render_pipeline(result: Mapping, account: object,
     cash_end = _pick("cash_end", cash_flow)
     if cash_end is None:
         cash_end = _get(post_trade, "cash")
+    #: 🔴 2026-11-10：现金**预留**口径（比例 / 比例下限金额 / 生效下限）—— 全部来自执行卡，**不反推**
+    constraints = _get(card, "constraints")
+    reserve_ratio = _pick("cash_reserve_ratio", post_trade, constraints)
+    reserve_required = _get(post_trade, "cash_reserve_required")
+    buf_min_eff = _pick("cash_buffer_min_eff", constraints)
     buy_codes = "、".join(str(_get(o, "code")) for o in buckets["buy"]) or "无"
     sell_codes = "、".join(str(_get(o, "code")) for o in buckets["sell"]) or "无"
     unbuildable = _get(cash_flow, "unbuildable_slots") or []
@@ -370,7 +375,13 @@ def _render_pipeline(result: Mapping, account: object,
             ["价格口径", _text(_get(card, "price_basis_note"))],
             ["调仓后现金（元）", _fmt(cash_end, money=True)],
             ["可行性", feasible_text],
-            ["现金缓冲达标？", _yn(_get(post_trade, "cash_buffer_ok"))],
+            ["现金预留比例", _fmt(reserve_ratio, pct=True)],
+            ["现金预留下限（元）", _fmt(reserve_required, money=True)],
+            [
+                "现金缓冲达标？",
+                f"{_yn(_get(post_trade, 'cash_buffer_ok'))}"
+                f"（生效下限 {_fmt(buf_min_eff, money=True)} 元）",
+            ],
         ],
     ))
     lines.append("")
@@ -381,6 +392,146 @@ def _render_pipeline(result: Mapping, account: object,
         f"不可建仓 {len(unbuildable)} 只。"
     )
     lines.append("")
+
+    # ---- 🛡 TA 合规筛选（否决 / 顺延）----
+    # 🔴 2026-11-10：TA 只做**一票否决 + 顺延**，数字全部来自计划件
+    #    （`plan["ta_screening"]` ⇒ `result["ta_screening"]`）⇒ 本模块**不反推、不编造**。
+    ta_screen = _get(result, "ta_screening") or {}
+    if isinstance(ta_screen, Mapping) and ta_screen:
+        rejected = ta_screen.get("rejected") or []
+        substituted = ta_screen.get("substituted") or []
+        screen_pairs = ta_screen.get("screen_pairs") or []
+        no_reason = ta_screen.get("no_substitute_reason")
+        held_not_touched = bool(ta_screen.get("held_not_touched"))
+        lines.append("## 🛡 TA 合规筛选（否决 / 顺延）")
+        lines.append("")
+        lines.append(
+            "**定位**：TradingAgents 只做「合规陪审团」——有**一票否决权**，"
+            "但**不能凭空选股**；被否决 ⇒ **规则层顺延**挑下一个**不同主题**的资产。"
+        )
+        lines.append("")
+        if rejected:
+            lines.append("### 被 TA 否决的候选")
+            lines.append("")
+            lines.extend(_table(
+                ["代码", "名称", "否决理由", "原文出处"],
+                [
+                    [
+                        _text(_get(r, "code")),
+                        _text(_get(r, "name")),
+                        _text(_get(r, "reason")),
+                        _text(_get(r, "source_section")),
+                    ]
+                    for r in rejected
+                ],
+            ))
+            lines.append("")
+        else:
+            lines.append("**本轮无 TA 否决**（候选池全部通过合规审查）。")
+            lines.append("")
+        if substituted:
+            lines.append("### 顺延补位记录")
+            lines.append("")
+            lines.extend(_table(
+                ["代码", "名称", "替补对象", "最终分", "主题", "顺延理由"],
+                [
+                    [
+                        _text(_get(s, "code")),
+                        _text(_get(s, "name")),
+                        _text(_get(s, "substituted_for")),
+                        _fmt(_get(s, "final_score")),
+                        _text(_get(s, "theme")),
+                        _text(_get(s, "reason")),
+                    ]
+                    for s in substituted
+                ],
+            ))
+            lines.append("")
+        if no_reason:
+            lines.append(f"**无顺延补位**：{_text(no_reason)}")
+            lines.append("")
+        orphans = ta_screen.get("orphaned_holdings") or []
+        if held_not_touched:
+            lines.append(
+                "ℹ️ **被否决的标的本来就在持仓里** ⇒ 只从候选池剔除，"
+                "**持仓不动**（不强制卖出）；该席位在计划里保留为「维持」行"
+                "（目标权重 = **当前权重**）⇒ 市值仍计入权益口径。"
+            )
+            lines.append("")
+        if orphans:
+            lines.append(
+                f"**孤儿持仓（被否决但仍在仓）**：{'、'.join(str(c) for c in orphans)}"
+                " ⇒ 保留为「维持」行，不买不卖。"
+            )
+            lines.append("")
+        equity_cap = _get(ta_screen, "equity_cap")
+        equity_cap_eff = _get(ta_screen, "equity_cap_effective")
+        cap_recommend = _get(ta_screen, "equity_cap_ta_recommendation") or {}
+        cap_skipped = _get(ta_screen, "cap_skipped")
+        breach = _get(ta_screen, "equity_cap_breach")
+        if equity_cap is not None:
+            lines.append(
+                f"**权益上限**：规则层硬上限 {_fmt(equity_cap, pct=True)}"
+                f"（= 1 − 现金预留比例）"
+                + (f"｜**本轮生效上限 {_fmt(equity_cap_eff, pct=True)}**"
+                   if equity_cap_eff is not None else "")
+                + "｜顺延补位因超限被跳过："
+                f"{_yn(bool(cap_skipped))}｜权益超配额：{_fmt(breach, pct=True)}"
+            )
+            lines.append("")
+            # 🔴 2026-11-11（Beta 避险落地）：TA 建议压降权益上限被**规则层采纳** ⇒
+            #    日报必须让用户看见「TA 建议多少 / 规则层按多少落地 / 原文依据」。
+            if isinstance(cap_recommend, Mapping):
+                _rec_pct = _get(cap_recommend, "pct")
+                _rec_ev = str(_get(cap_recommend, "evidence") or "").strip()
+                _rec_reason = str(_get(cap_recommend, "reason") or "")
+                if _rec_pct is not None:
+                    lines.append(
+                        f"**Beta 避险（TA 权益上限建议）**：TA 建议 "
+                        f"{_fmt(_rec_pct, pct=True)}（{_rec_reason}）"
+                        + (f" ⇒ **本轮生效上限 {_fmt(equity_cap_eff, pct=True)}**"
+                           if _rec_reason == "accepted" and equity_cap_eff is not None
+                           else " ⇒ **未采纳**（只许压降、不许抬高）")
+                        + (f"｜原文依据：{_rec_ev[:160]}" if _rec_ev else "")
+                    )
+                    lines.append("")
+                elif _rec_reason == "not_a_target":
+                    # 🔴 2026-11-11（审计缺陷 D）：TA 提到了权益数字但**不是目标口径**
+                    #    （陈述/预测句，如「回升至 56%」）⇒ 规则层**未压降**
+                    #    ⇒ **必须让用户看见**，否则「TA 明明说了 ⇒ 却按 80% 执行」无从追查。
+                    lines.append(
+                        "**Beta 避险（TA 权益上限建议）**：TA 提到的权益数字"
+                        "**不是目标口径**（陈述/预测句）⇒ 规则层**未压降**"
+                        f"（仍按硬上限 {_fmt(_get(cap_recommend, 'base_cap'), pct=True)} 执行）"
+                        + (f"｜原文依据：{_rec_ev[:160]}" if _rec_ev else "")
+                    )
+                    lines.append("")
+        if screen_pairs:
+            # 🔴 2026-11-11：TA 已被明确授权可**据此点名否决**（合规陪审团）
+            #    ⇒ 标题不再写「仅供审查参考」；规则层**硬拦口径本身不变**（仍只拦重叠 ≥ 0.90 / corr120 ≥ 0.95）。
+            lines.append(
+                "### 候选池高重合预警对（**TA 可据此点名否决**；规则层硬拦口径不变）"
+            )
+            lines.append("")
+            lines.extend(_table(
+                ["标的 A", "标的 B", "成分重叠度", "120 日相关性", "同族"],
+                [
+                    [
+                        f"{_get(p, 'a')} {_get(p, 'a_name')}",
+                        f"{_get(p, 'b')} {_get(p, 'b_name')}",
+                        _fmt(_get(p, "weight_overlap")),
+                        _fmt(_get(p, "corr120")),
+                        _yn(_get(p, "same_theme")),
+                    ]
+                    for p in screen_pairs
+                ],
+            ))
+            lines.append("")
+        else:
+            lines.append(
+                f"**高重合预警对**：{_text(ta_screen.get('screen_note')) or '无'}"
+            )
+            lines.append("")
 
     # ---- 六阶段流水线状态 ----
     lines.append("## 六阶段流水线状态")
@@ -533,6 +684,9 @@ def _render_pipeline(result: Mapping, account: object,
     # ---- 现金流对账 ----
     lines.append("## 现金流对账")
     lines.append("")
+    #: 🔴 2026-11-10：现金预留口径进对账表（预留比例 / 预留金额 / 实得现金占比）
+    total_assets = _get(_get(card, "account"), "total_assets")
+    cash_ratio = (cash_end / total_assets) if (cash_end is not None and total_assets) else None
     lines.extend(_table(
         ["项目", "数值"],
         [
@@ -543,6 +697,9 @@ def _render_pipeline(result: Mapping, account: object,
             ["买入费用（元）", _fmt(_get(cash_flow, "buy_fees"), money=True)],
             ["滑点估算（元）", _fmt(_get(cash_flow, "slippage"), money=True)],
             ["期末现金（元）", _fmt(_get(cash_flow, "cash_end"), money=True)],
+            ["实得现金占比", _fmt(cash_ratio, pct=True)],
+            ["现金预留比例", _fmt(reserve_ratio, pct=True)],
+            ["现金预留金额（元）", _fmt(reserve_required, money=True)],
             ["缺口（元）", _fmt(_get(cash_flow, "deficit"), money=True)],
             ["盈余（元）", _fmt(_get(cash_flow, "surplus"), money=True)],
             ["买入前可用现金（元）", _fmt(_get(cash_flow, "available_before_buy"), money=True)],
@@ -649,30 +806,8 @@ def _render_pipeline(result: Mapping, account: object,
 # =============================================================================
 # 4. 公开 API
 # =============================================================================
-#: 旧 Mode A/B/C 分诊已下线 ⇒ 只剩**一种**模式；``"B"`` 作为旧别名兼容（视作 unified）。
-_MODE_UNIFIED = "unified"
-_LEGACY_MODE_ALIASES = {"B": _MODE_UNIFIED}
-
-
-def _resolve_unified_mode(value: object) -> str:
-    """把 ``mode`` 归一成 ``"unified"``；非法值 ⇒ ``ValueError``（**附迁移提示**）。"""
-    text = value.strip().upper() if isinstance(value, str) else value
-    if text == _MODE_UNIFIED.upper():
-        return _MODE_UNIFIED
-    if isinstance(text, str) and text in _LEGACY_MODE_ALIASES:
-        return _LEGACY_MODE_ALIASES[text]
-    hint = (
-        "Mode A/B/C 分诊**已下线** ⇒ 只剩单一流水线（mode=unified）。"
-        "请改用 CLI 的 `--full`（强制全流程）／`--live-trade`（实盘副作用）／"
-        "`--snapshot-root`（快照目录）；**观察态是缺省行为**（挂单禁用、不发信）。"
-    )
-    if text is None:
-        raise ValueError(f"结果里没有 `mode` 字段：{hint}")
-    raise ValueError(f"模式 {value!r} 已废弃：{hint}")
-
-
 def render_report(result: dict, *, account: dict | None = None,
-                  mode: str | None = None, asof: str | None = None,
+                  asof: str | None = None,
                   live_trade: bool | None = None) -> str:
     """把流水线结果 dict 渲染成 **Markdown 报告**（可直接贴进对话窗口）。
 
@@ -681,8 +816,6 @@ def render_report(result: dict, *, account: dict | None = None,
     result : 统一流水线的结果 dict（结构见 ``agents_rebalance.run_pipeline`` 的返回值）。
     account: 账户快照（可选）—— 只在 ``result`` 里缺对应键时**兜底取用**，
         **不参与任何计算**（不反推总资产、不重算占比）。
-    mode   : 只能是 ``"unified"``（旧别名 ``"B"`` 兼容，视作 unified）——
-             缺省取 ``result["mode"]``；``"A"`` / ``"C"`` ⇒ 抛 ``ValueError``（附迁移提示）。
     asof   : 报告日期 —— 缺省取 ``result["asof"]``。
     live_trade: 实盘态开关 —— 缺省取 ``result["live_trade"]``（缺省 False = **观察态**）。
 
@@ -694,8 +827,6 @@ def render_report(result: dict, *, account: dict | None = None,
     """
     if not isinstance(result, Mapping):
         raise TypeError(f"result 必须是 dict，实际是 {type(result).__name__}")
-
-    _resolve_unified_mode(mode or _get(result, "mode"))
 
     day = asof or _get(result, "asof")
     day_text = _text(day)

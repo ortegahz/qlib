@@ -13,7 +13,7 @@
 | **定时触发** | ❌ **已取消**。2026-11-05 已把服务器用户 crontab 里的 **5 条**（3 流水线 + 2 看门狗）**全部卸载**，只剩系统默认两行（`SHELL` / `PATH`） |
 | **邮件推送** | ❌ **不再是默认动作**。保留为**显式 opt-in**（`--send-email`）；通道仍通（见 §7） |
 | **host 关机 / 会话交接** | ❌ **不再考虑**。服务器不关机，重活一律在服务器侧自主执行 |
-| **架构形态** | **单一无状态流水线 + 快照制**（2026-11-09 架构瘦身）：**无「模式 A/B/C」分诊**；每次运行落一个**不可变快照目录**；副作用只由 `--live-trade` 决定 |
+| **架构形态** | **单一无状态流水线 + 快照制**（2026-11-09 架构瘦身）：**无「模式」分诊**；每次运行落一个**不可变快照目录**；副作用只由 `--live-trade` 决定 |
 
 🔴 **本文件描述的是「怎么跑」，不是「项目现在处于什么状态」** —— 后者属事实层，见 `manu/memory/memory.md`。
 🔴 **本轮改造（2026-11-09 架构瘦身）尚未实跑验证** —— 本文涉及快照制的新行为一律是**设计口径**，
@@ -54,7 +54,7 @@
 | **5 规则层约束对账** | 等权 5 份（单只 ≤ **6,000 元**）；**100 股整手向下取整**；场内货基碎屑（一手 ~10,000 元 > 6,000 上限）**拦截不买、归现金**；强制预留 **200~300 元**现金缓冲 | `manu/etf_rotation/final_rebalance_plan.py` ＋ `reprice_node_day.py` | ~1 min |
 | **6 执行卡 + 报告** | 产出执行卡 `execution_card_<YYYYMMDD>.json` ＋ **终端/窗口直出的 Markdown 报告**；次日 09:25 在券商 App 集合竞价 / 开盘**人工挂单** | `daily/main.py` ＋ `daily/agents_rebalance.py` | ~5 s |
 
-**这条链现在是「单一流水线」**（2026-11-09 架构瘦身）：**没有**「模式 A / 模式 B / 模式 C」三模式分诊。
+**这条链现在是「单一流水线」**（2026-11-09 架构瘦身）：**没有**「模式」分诊（旧形态的三条分诊链已合并为一条）。
 唯一的入口永远是 `daily/main.py`；**跑哪几段**由 `--full` ＋ skip 开关决定，
 **要不要动真格**由 `--live-trade` 决定。
 
@@ -234,7 +234,7 @@
 python manu/etf_rotation/daily/main.py [选项]
 ```
 
-🔴 **入口只有一个**。**没有**「模式 A / B / C」—— 那是 2026-11-09 已废除的旧形态。
+🔴 **入口只有一个**。**没有**「模式」分诊 —— 那是 2026-11-09 已废除的旧形态。
 跑哪几段 = `--full` ＋ skip 开关；要不要动真格 = `--live-trade`。
 
 | 选项 | 默认 | 语义 |
@@ -258,7 +258,7 @@ python manu/etf_rotation/daily/main.py [选项]
 | `--wait-seconds` | `1800.0` | `--send-only` 时等待草稿出现的秒数 |
 | `--no-increment` / `--increment-dry-run` / `--increment-apply` | 见 §2.3b | 阶段 1 自建增量日的写入口径 |
 | `--llm-timeout` / `--reasoning-effort` | 见 `main.py` | LLM 阶段参数 |
-| ~~`--mode A\|B\|C\|auto`~~ | — | 🔴 **已删除**。仍传 ⇒ **退出码 2** ＋ stderr 打印迁移提示（指向 `--full` / `--live-trade` / 快照制） |
+| ~~`--mode`~~ | — | 🔴 **已删除**（连参数本身都已删除，旧取值一并作废）。仍传 ⇒ **退出码 2** ＋ stderr 打印迁移提示（指向 `--full` / `--live-trade` / 快照制） |
 
 **默认行为**：渲染 Markdown 报告 ⇒ 落盘 `manu/report/report_<YYYYMMDD>.md` **＋** 快照目录内一份 `report_<YYYYMMDD>.md`
 ⇒ **同时打印到 stdout**（主 agent 直接把 stdout 贴回窗口）。**默认不发邮件。**
@@ -319,7 +319,7 @@ python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-email
 python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only
 ```
 
-🔴 **老命令会被拒**：`--mode A` / `--mode B` / `--mode C` 一律**退出码 2** ＋ stderr 迁移提示。
+🔴 **老命令会被拒**：`--mode`（连参数本身都已删除，旧取值一并作废）一律**退出码 2** ＋ stderr 迁移提示。
 新旧对照表见 `manu/docs/snapshot_architecture.md` §9。
 
 ### 退出码
@@ -475,7 +475,7 @@ python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only
 |:--|:--|
 | `main.py` | **唯一入口**：六阶段编排、CLI、flock 守卫、退出码、报告渲染、失败兜底（**无模式分流**） |
 | `snapshot.py` | **快照层**：建快照目录 / 写件 / 登记 `stages`·`skipped`·`notes` / `finalize()` 写 manifest / 解析 S 层底座 / 根目录全局文件指纹（只读审计） |
-| `daily_config.py` | **全部常量的单一事实源**（路径、账户口径、组合约束、均线窗口、节点日、SMTP、阈值）；**`SNAPSHOT_ROOT` 在此**（`SHADOW_ROOT` 已随 Mode C 废除删除） |
+| `daily_config.py` | **全部常量的单一事实源**（路径、账户口径、组合约束、均线窗口、节点日、SMTP、阈值）；**`SNAPSHOT_ROOT` 在此**（`SHADOW_ROOT` 已随影子推演链废除删除） |
 | `calendar_gate.py` | 交易日历门（**fail-closed**） |
 | `fetch_data.py` | 盘后增量：ETF 日线（shell out 到 akshare env）、**W 只读**（陈旧度由 `main.py` 登记进 `w_holdings` 阶段 ＋ 报告 notes）、qlib 二进制可选增量（默认 dry-run） |
 | `run_qlib_score.py` | S 层**新鲜度判定**（默认只读）＋ 可选刷新 |
@@ -484,7 +484,7 @@ python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only
 | `account_state.py` | **实盘账户基准**（30,035.57 元口径）＋ 三道校验 ＋ `DISCREPANCY_NOTE` |
 | `tests/` | pytest 单测（`conftest.py` 把 `daily/` 挂进 `sys.path`） |
 
-🔴 **模式判定不再是每日链的一环**：「模式 A / B / C」三模式分诊已废除（2026-11-09 架构瘦身），
+🔴 **模式判定不再是每日链的一环**：「模式」分诊已废除（2026-11-09 架构瘦身），
 `--mode` 被拒（退出码 2）；「跑哪几段」由 `--full` ＋ skip 开关决定，「要不要动真格」由 `--live-trade` 决定。
 
 ---

@@ -36,7 +36,7 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d)}"   #: 本轮标签（默认今天）⇒ 每
 LOG_DIR="$RUN/_overnight_$RUN_TAG"
 LOG="$LOG_DIR/overnight.log"
 SUMMARY="$LOG_DIR/summary.md"
-#: 统一流水线的信号日（最新可用交易日；与今天 15:16 那次 Mode C 实跑同口径）
+#: 统一流水线的信号日（最新可用交易日；与今天 15:16 那次影子推演实跑同口径）
 ASOF_PIPE="${ASOF_PIPE:-2026-11-09}"
 #: 研究链基线的 asof（**不许动**：文件名/日历下标不变 ⇒ 指纹表登记项集合恒定）
 ASOF_BASE="${ASOF_BASE:-2026-11-03}"

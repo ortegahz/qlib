@@ -18,6 +18,7 @@
 #     bash manu/etf_rotation/rebuild_baseline.sh [--asof 2026-11-03] [--label 20261105]
 #                                               [--out-dir <结果根>]
 #                                               [--provider-uri DIR]
+#                                               [--reuse-decision]
 #
 #   退出码：0 = 编排器与两个生成器全过；非 0 = 编排器失败（优先），其次生成器失败。
 #
@@ -43,6 +44,11 @@ QL_PY="${QL_PY:-/home/huangzhe/anaconda3/envs/ql/bin/python}"
 #: 🔴 2026-11-09 新增：qlib **provider 覆盖**（默认空 = 上游基座 ⇒ **零回归**）。
 #:    显式指定时**原样透传**给 run_pipeline.sh ⇒ 重建用的数据源与每日链一致。
 PROVIDER_URI="${ETF_ROTATION_QLIB_PROVIDER_URI:-}"
+#: 🔴 2026-11-11：**复用已落盘的 TradingAgents 决策**（不重跑 LLM）。
+#:    场景：本轮决策件刚由真跑 LLM 生成（同一代），基线重建只需要重跑「决策之后」
+#:    那几步（计划 / 校验 / 探针 / 分歧件）⇒ 再跑一次 LLM 只会得到**另一份**意见，
+#:    反而让「已落盘产物」与「基线」不同代。
+REUSE_DECISION=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +56,7 @@ while [ $# -gt 0 ]; do
     --label) LABEL="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; OUT_DIR_EXPLICIT=1; shift 2 ;;
     --provider-uri) PROVIDER_URI="$2"; shift 2 ;;
+    --reuse-decision) REUSE_DECISION=1; shift ;;
     -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -138,6 +145,11 @@ cd "$PROJ" || { say "FATAL: 工作目录不存在：$PROJ"; exit 1; }
 PIPE_PROVIDER_ARGS=()
 [ -n "$PROVIDER_URI" ] && PIPE_PROVIDER_ARGS+=(--provider-uri "$PROVIDER_URI")
 [ -n "$PROVIDER_URI" ] && say "   provider 覆盖：$PROVIDER_URI"
+# 🔴 2026-11-11：--reuse-decision ⇒ 复用本轮已落盘的决策件（**不重跑 LLM**）
+if [ "$REUSE_DECISION" -eq 1 ]; then
+  PIPE_PROVIDER_ARGS+=(--reuse-decision)
+  say "   复用已落盘的 TradingAgents 决策（--reuse-decision；不重跑 LLM）"
+fi
 bash manu/etf_rotation/run_pipeline.sh --asof "$ASOF" --out-dir "$OUT_DIR" \
      --skip-scores --skip-prices "${PIPE_PROVIDER_ARGS[@]}" \
      2>&1 | tee -a "$LOG"

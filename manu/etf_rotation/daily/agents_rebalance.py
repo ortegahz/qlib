@@ -1,7 +1,7 @@
 """agents_rebalance.py —— **统一流水线**的执行器（单一入口，无模式分诊）。
 
-【2026-11-09 架构瘦身：Mode A / B / C ⇒ 一条流水线 + 不可变快照】
-旧形态有三个模式（A 日常巡检 / B 调仓节点 / C 影子推演）⇒ 三套分支、三套产物根、
+【2026-11-09 架构瘦身：三条按用途分诊的链 ⇒ 一条流水线 + 不可变快照】
+旧形态有三条按用途分诊的链（日常巡检 / 调仓节点 / 影子推演）⇒ 三套分支、三套产物根、
 三套语义 ⇒「忘了加 if」就会漏出新仓位指令，也会污染生产金标（历史事故）。
 新形态：
 
@@ -20,9 +20,9 @@
    + 先备份 + 再按 ``(date, instrument)`` **合并**（keep=last）回**快照目录**。
 
 【组合构造约束（研究链里没有的硬约束，本模块新增）】
-* 目标资产**等权 5 份**，单只标的**金额上限 6,000 元**；
+* 目标资产**等权 5 份**（权益上限 80% ⇒ 每只 16%），单只标的**金额上限 6,000 元**；
 * 买卖数量**向下取整**到 100 股（手）的整数倍；
-* 调仓后**必须保留 200~300 元现金缓冲**；
+* 调仓后**必须保留现金**：生效下限 = 「绝对下限 400 元」与「比例下限（总资产 × 20%）」**取大者**；
 * **货基碎屑过滤**：场内货基（511880/511990 单价约 100 元/份，一手需 10,000 元）
   超出单标的 6,000 元限额 ⇒ **严禁下单**，自动归入可用现金躺平。
 
@@ -53,7 +53,7 @@ if str(_HERE) not in sys.path:
 import account_state  # noqa: E402
 import daily_config as DC  # noqa: E402
 import snapshot as snap_mod  # noqa: E402
-import mode_router  # noqa: E402
+import run_paths  # noqa: E402
 
 #: 研究链根目录（``manu/etf_rotation``）—— 导入研究链模块时按**绝对路径**加载
 _RESEARCH_ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +73,21 @@ OBSERVATION_DISCLAIMER = snap_mod.OBSERVATION_DISCLAIMER
 STEP_RULES = "3b/8 recommend.py（阶段3b 规则层调仓建议）"
 STEP_EXPORT_PRICES = "2/8 export_qlib_prices.py（阶段2 个股日线导出）"
 STEP_ANALYZE = "3/8 analyze.py（阶段3 E=W×S 穿透 + 均线过滤）"
+
+#: 🔴 2026-11-11（审计缺陷 C）：analyze.py 的 ``--top-n`` 决定报告 JSON 里
+#:    ``candidates`` 的长度 ⇒ ``final_rebalance_plan`` 的**顺延池**只能看到前 N 名
+#:    ⇒ 池内第 N+1 名以后**不可见** ⇒ 会误报「候选池里没有合格的顺延者」。
+#:    🔴 报告 JSON **没有**「完整候选池」字段（只有 ``candidates``（= Top-N）与
+#:    ``filter_stats.n_candidate_pool``（= 池子**总数**））⇒ 只能把 ``--top-n`` 调大。
+#:    🔴 **数值的单一事实源 = 研究链 `config.ANALYZE_TOP_N`**（不在本文件另写一份）
+#:    ⇒ 其余调用 analyze.py 的入口（研究链 / repro 重跑段）必须用同一个值，
+#:    否则各链产出的报告不可比。
+def _analyze_top_n() -> int:
+    """顺延池所需的 ``--top-n``（= 研究链 `config.ANALYZE_TOP_N`；取不到 ⇒ 兜底 100）。"""
+    try:
+        return int(getattr(_research_config(), "ANALYZE_TOP_N", 100))
+    except Exception:  # noqa: BLE001 —— 研究链 config 不可得 ⇒ 用兜底值（不静默失败）
+        return 100
 STEP_CONTEXT = "4/8 build_ta_context.py（阶段4 上下文）"
 STEP_TRADINGAGENTS = "5/8 run_tradingagents.py（阶段4 多智能体辩论）"
 STEP_PLAN = "6/8 final_rebalance_plan.py（阶段5 规则层对账）"
@@ -378,7 +393,7 @@ def _check_holding_discipline(*, asof: str, prices_csv: str | Path | None,
     返回 ``{"status", "code", "close", "ma60", "distance_pct", "action"}``；
     ``status`` ∈ ``ok`` / ``broken`` / ``insufficient_data``。
     """
-    day = mode_router.normalize_date(asof) or str(asof)
+    day = run_paths.normalize_date(asof) or str(asof)
     effective_account, acc_warnings = _resolve_account(account)
     notes.extend(acc_warnings)
     holding = _primary_holding(effective_account)
@@ -818,9 +833,108 @@ def _smoothing_args() -> list[str]:
     return [
         "--smoothing-method", str(getattr(cfg, "SMOOTHING_METHOD", "ewma")),
         "--smoothing-window", str(getattr(cfg, "SMOOTHING_WINDOW", 5)),
-        "--smoothing-alpha", str(getattr(cfg, "SMOOTHING_ALPHA", 0.35)),
+        "--smoothing-alpha", str(getattr(cfg, "SMOOTHING_ALPHA", 0.20)),  # 🔴 文档口径 0.20
         "--smoothing-history-days", str(getattr(cfg, "SMOOTHING_HISTORY_SPAN_DAYS", 30)),
     ]
+
+
+def _sha1_of_file(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+
+
+def _contexts_equivalent(a: Path, b: Path) -> bool:
+    """两个 `ta_research_context.md` **内容是否等价**。
+
+    🔴 2026-11-11：context 正文末行嵌了**本快照的绝对路径**
+       ⇒ 同一个数据源在两个快照里生成的 context **只差这一行** ⇒ sha1 必然不同。
+    ⇒ 比对时**只把各自的快照目录归一化成占位符**，其余**逐字**比。
+    ⚠️ 归一化**只限「自己的快照目录」这一段** ⇒ 任何其它差异（分数变了、结论变了……）
+       都判不等价。
+    """
+
+    def _norm(path: Path) -> str:
+        txt = Path(path).read_text(encoding="utf-8")
+        return txt.replace(str(Path(path).absolute().parent), "<SNAPSHOT>")
+
+    try:
+        return _norm(a) == _norm(b)
+    except OSError:
+        return False
+
+
+def _carry_context_trio(src_snap: Path, dst_snap: Path, cur_context: Path,
+                        decision_json: Path | None = None) -> tuple[bool, str]:
+    """把**来源快照**的 `ta_research_context.md` 搬到本快照（跨快照复用决策件的必要条件）。
+
+    🔴 2026-11-11 修（**跨快照复用决策件 ⇒ sha1 链断裂 ⇒ 闸门 4 阶段假红**）：
+       决策件记录的是**它当初吃到的 context** 的 sha1（`meta.context_sha1`）；
+       闸门（`verify_artifacts` 第二环 / `probe_llm_stage_repro` P4）校验的是
+       「**本快照** context md 的 sha1 == 决策件记录的 context_sha1」。
+       ⇒ 只复制决策件（不复制它那份 context）⇒ 链必然断
+       ⇒ 交付件被判「LLM 意见已过期」⇒
+         `verify_artifacts` / `probe_verify_guards` / `probe_llm_stage_repro` /
+         `probe_reproducibility` **4 个阶段假红**（实测快照 `20261111_161126`）。
+       ⇒ 修法：**上下文跟着决策件走**（`final_rebalance_plan.py` 早写明这条不变量）。
+
+    🔴 **只搬 context md，不搬 `ta_context_meta.json`**：
+       meta 记的是「**本快照**这份报告 → 本快照这份上下文」的链接
+       （`report_md_sha1` / `report_content_sha1` / `recommendation_sha1`），
+       必须留在本快照 ⇒ 搬来源的会与本快照报告对不上（**第一环**反而断）。
+       ⚠️ 报告内容指纹本身**含快照路径**（`current_holdings_diagnosis.snapshot_path`
+          在报告**正文**里，不在易变 meta 里）⇒ **跨快照必然不等**
+          ⇒ 跨快照的「数据没变」判定**不能**用它 ⇒ 改用**上下文逐字等价**
+          （context 由报告生成 ⇒ context 等价 ⇔ 报告等价）。
+
+    ⚠️ 判定三条全过才搬：
+      ① 来源 context 存在；
+      ② sha1(来源 context) == 来源决策件 `meta.context_sha1`（它自己自洽）；
+      ③ 来源 context 与**本快照现算的** context **逐字等价**（仅路径行不同）
+         ⇒ 证明来源决策件基于**本轮这份数据**。
+
+    🔴 2026-11-11（审计 P1-2）：③ 必须是 **fail-closed**。
+       旧写法 `if Path(cur_context).is_file() and not _contexts_equivalent(...)`：
+       **本轮 context 文件不存在**时条件直接为假 ⇒ 跳过 ③ ⇒ 在**没有「本轮数据没变」证明**
+       的情况下把来源 context 搬过来（**fail-open**）⇒ 来源决策件可能是**别的数据**的
+       ⇒ sha1 链看似接上、实则结论过期。
+       ⇒ 现在：**本轮 context 缺失 ⇒ 不搬**（宁可让链保持断口 ⇒ 闸门红 ⇒ 需人工介入）。
+       ⚠️ 现网该分支**不可达**（`build_ta_context.py` 先跑，失败即抛 `RuntimeError`
+          ⇒ 本轮 context 必然存在）⇒ 本修复**不改变已交付快照的行为**。
+    """
+    src_ctx = Path(src_snap) / "ta_research_context.md"
+    if not src_ctx.is_file():
+        return False, "来源快照缺 ta_research_context.md ⇒ 无从让 sha1 链接上 ⇒ 不搬"
+    if decision_json is not None and Path(decision_json).is_file():
+        try:
+            _d = json.loads(Path(decision_json).read_text(encoding="utf-8"))
+            _rec = str(((_d.get("meta") or {}).get("context_sha1")) or "")
+        except Exception as exc:  # noqa: BLE001
+            return False, f"来源决策件不可解析（{type(exc).__name__}: {exc}）⇒ 不搬"
+        if not _rec:
+            return False, "来源决策件没有 meta.context_sha1 ⇒ 无从证明它吃的是哪份 context ⇒ 不搬"
+        _actual = _sha1_of_file(src_ctx)
+        if _actual != _rec:
+            return False, (
+                f"来源快照的 context md 与它自己的决策件**对不上**"
+                f"（{_actual[:8]} vs 决策件记录 {_rec[:8]}）⇒ 它自己就是断链的 ⇒ 不搬"
+            )
+    _cur_ctx = Path(cur_context)
+    if not _cur_ctx.is_file():
+        return False, (
+            "本轮快照缺 ta_research_context.md ⇒ **无法证明**来源决策件基于**本轮数据**"
+            "（fail-closed：宁可不搬 ⇒ sha1 链保持断口 ⇒ 闸门会红 ⇒ 需人工介入）"
+        )
+    if not _contexts_equivalent(src_ctx, _cur_ctx):
+        return False, (
+            "来源上下文与本轮现算的上下文**不等价**（不只是路径行不同）"
+            "⇒ 来源决策件基于**别的数据** ⇒ 不搬（链保持断口 ⇒ 闸门会红 ⇒ 需人工介入）"
+        )
+    shutil.copy2(src_ctx, Path(dst_snap) / "ta_research_context.md")
+    return True, (
+        "来源 context 与本轮现算的上下文**逐字等价**（仅快照路径行不同）"
+        "⇒ 已随决策件搬入本快照（sha1 链可校验）"
+    )
 
 
 def _run_rules_layer(run_path: Path, notes: list[str], *, analysis_asof: str,
@@ -907,9 +1021,9 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
 
     返回
     ----
-    dict，键见模块契约（``mode="unified"`` / ``live_trade`` / ``snapshot`` / …）。
+    dict，键见模块契约（``live_trade`` / ``snapshot`` / …）。
     """
-    signal_date = mode_router.normalize_date(asof) or DC.NEXT_SIGNAL_DATE
+    signal_date = run_paths.normalize_date(asof) or DC.NEXT_SIGNAL_DATE
     notes: list[str] = []
 
     # ---- 快照（本轮唯一产物根）--------------------------------------------
@@ -956,7 +1070,6 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
             "（快照目录已建但**空**）⇒ 仅做前置判定"
         )
         return {
-            "mode": "unified",
             "live_trade": bool(live_trade),
             "asof": signal_date,
             "execution_date": execution_date,
@@ -1063,6 +1176,8 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
         "--universe", str(universe_path),
         "--scores", str(scores_path),
         "--out-dir", str(run_path),
+        # 🔴 2026-11-11（缺陷 C）：顺延池必须是**完整候选池** ⇒ 不能用默认的 Top-15
+        "--top-n", str(_analyze_top_n()),
     ] + (["--stock-prices", str(stock_prices_path)] if stock_prices_path else [])
         + _smoothing_args(), step=STEP_ANALYZE)
     notes.append(f"✅ 分析报告已产出：{report_json}（分析日 = {analysis_asof}）")
@@ -1095,17 +1210,51 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
     )
 
     # ---- 3/4. TradingAgents 阶段 ----
+    # 🔴 2026-11-11 修（**真缺陷**）：**TA 上下文与 LLM 调用是两件事**
+    #    `build_ta_context.py` 是**本地确定性计算**（拥挤度 / 重合度 / 3.5 节），**不调 API**；
+    #    旧口径把它塞在 `else`（真 LLM）分支里 ⇒ `--skip-llm` 复跑时快照**缺**
+    #    `ta_research_context.md` / `ta_context_meta.json` ⇒ 快照**结构不完整**
+    #    ⇒ 闸门「取最新 LLM 完整快照」会**跳过**它 ⇒ 这一轮白跑（实测 2026-11-11 15:08）。
+    #    ⇒ 现在上下文**永远**构建；`--skip-llm` 只跳过 **LLM 调用**（决策件复用既有落盘件）。
+    _run_cmd([
+        DC.QL_PY, str(_RESEARCH_ROOT / "llm" / "build_ta_context.py"),
+        "--run-root", str(run_path),
+        # 🔴 2026-11-11（审查发现 3.5）：**显式**把与规则层同源的本轮有效行情
+        #    喂给 TA 上下文 ⇒ 避免 build_ta_context 回落到 canonical 旧行情，
+        #    导致 corr120 / 拥挤度与规则层对不上。
+        "--prices", str(prices_path),
+    ], step=STEP_CONTEXT)
+    notes.append(f"✅ TA 上下文已产出：{run_path / 'ta_research_context.md'}")
     llm_status = "skipped"
     if skip_llm:
         reused_from = None
         if not decision_json.exists():
             # 🔴 2026-11-10：按 **asof** 挑底座（不是按目录名＝墙钟创建序）
             #    ⇒ 复用别个信号日的 LLM 决策件 ⇒ 交付件里嵌的是**另一个信号日**的意见
-            prev = snap_mod.latest_snapshot(snap_root, exclude=run_path, asof=signal_date)
-            prev_json = prev / "tradingagents_decision.json" if prev is not None else None
-            if prev_json is not None and prev_json.is_file():
-                shutil.copy2(prev_json, decision_json)
-                reused_from = prev_json
+            # 🔴 2026-11-11（真机跑批事故）：旧口径只取「最新一份快照」⇒
+            #    若那份是**被中断的不完整快照**（没有决策件）⇒ 复制不到任何决策件
+            #    ⇒ 本轮**静默变成「无 TA 意见」**（「本轮无 TA 否决」、合规筛选整节失效）。
+            #    ⇒ 改用「**最新且确实有决策件**」的那份（asof 语义不变）。
+            # 🔴 2026-11-11（第九轮续）：候选**从新到旧**逐个试，
+            #    只接受「决策件 + 它自己的上下文三件套**互相自洽**」的那份
+            #    （实测 `20261111_161126`：它自己就是断链的 ⇒ 必须被跳过）。
+            _cands = snap_mod.snapshots_with_file(
+                snap_root, "tradingagents_decision.json",
+                exclude=run_path, asof=signal_date)
+            for _cand in _cands:
+                _cand_json = _cand / "tradingagents_decision.json"
+                _ok, _why = _carry_context_trio(
+                    _cand, run_path, run_path / "ta_research_context.md", _cand_json)
+                if not _ok:
+                    notes.append(f"⚠️ 候选复用快照 {_cand.name} 被跳过：{_why}")
+                    continue
+                shutil.copy2(_cand_json, decision_json)
+                reused_from = _cand_json
+                notes.append(
+                    f"ℹ️ 跨快照复用决策件（来源快照 {_cand.name}）⇒ "
+                    f"上下文三件套已随决策件一起搬入本快照：{_why}"
+                )
+                break
         if decision_json.exists():
             _run_cmd([
                 DC.LLM_PY, str(_RESEARCH_ROOT / "llm" / "run_tradingagents.py"),
@@ -1127,11 +1276,6 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
                 "ℹ️ skip_llm=True 且**没有**可复用的决策件 ⇒ 本轮无 LLM 第二意见（只有规则层）"
             )
     else:
-        _run_cmd([
-            DC.QL_PY, str(_RESEARCH_ROOT / "llm" / "build_ta_context.py"),
-            "--run-root", str(run_path),
-        ], step=STEP_CONTEXT)
-        notes.append(f"✅ TA 上下文已产出：{run_path / 'ta_research_context.md'}")
         _run_cmd([
             DC.LLM_PY, str(_RESEARCH_ROOT / "llm" / "run_tradingagents.py"),
             "--ta-dir", str(DC.TRADINGAGENTS_DIR),
@@ -1233,7 +1377,6 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
     notes.append(f"✅ 执行卡片已落盘：{card_path}")
 
     return {
-        "mode": "unified",
         "live_trade": bool(live_trade),
         "asof": signal_date,
         "execution_date": card.get("execution_date"),
@@ -1258,6 +1401,11 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
         #    ⇒ `daily/report.py::_ranking_basis()` 才不会渲染成「—」
         #    （口径事实源 = 分析报告里的 `score_smoothing` 段，**不复制参数**）。
         "score_smoothing": _smoothing,
+        # 🔴 2026-11-10：TA 合规筛选（否决 / 顺延）结果**透传**给交付面报告
+        #    ⇒ `daily/report.py` 能渲染「🛡 TA 合规筛选」小节（**只透传，不改数字**）
+        "ta_screening": (plan_payload.get("ta_screening") or {})
+        if isinstance(plan_payload, dict)
+        else {},
         "holding_discipline": discipline,
         "analysis_asof": analysis_asof,
         "scores_max_date": analysis["scores_max_date"],
@@ -1344,8 +1492,10 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
       并记 ``capped=True`` + ``cap_note``；
     * **货基碎屑过滤**：一手金额 > 上限且当前无持仓 ⇒ ``action="不可建仓"``、
       目标股数归 0、计入 ``cash_flow.unbuildable_slots``、**不进下单清单**；
-    * **现金缓冲守卫**：调仓后现金必须 ≥ ``cash_buffer_min`` ⇒ 不够就从**金额最大的
+    * **现金缓冲守卫**：调仓后现金必须 ≥ **生效下限** ⇒ 不够就从**金额最大的
       买入单**开始减；减完仍不够 ⇒ ``feasible=False`` + 明确 reason。
+      🔴 2026-11-10：生效下限 = ``max(现金缓冲绝对下限, 总资产 × 现金预留比例)``
+      （比例下限 ⇒ **权益上限 = 1 - 预留比例**）⇒ 规则层留现金、执行层也留现金。
 
     参数
     ----
@@ -1388,6 +1538,26 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
     if market_value is None and total_assets is not None and cash is not None:
         market_value = total_assets - cash
 
+    # 🔴 2026-11-10：**生效的现金下限** = 「绝对下限」与「比例下限」**取大者**
+    #    （比例下限 = 总资产 × 现金预留比例 ⇒ 权益上限 = 1 - 预留比例 = 80%）。
+    #    旧口径只看绝对 200 元 ⇒ 允许权益配到 100%（不留现金）⇒ 与规则层不一致。
+    reserve_req = (total_assets * float(DC.CASH_RESERVE_RATIO)) if total_assets else None
+    buf_min_eff = max(buf_min, reserve_req) if reserve_req is not None else buf_min
+    #: 生效下限的**可读说明**（绝对下限 vs 比例下限）⇒ 告警文案里必须能看出是哪一个在起作用
+    if reserve_req is None:
+        buf_min_note = f"绝对下限 {buf_min:.2f} 元（账户缺 total_assets ⇒ 比例下限不参与）"
+    elif reserve_req > buf_min:
+        buf_min_note = (
+            f"生效下限 {buf_min_eff:.2f} 元"
+            f"（比例下限 {reserve_req:.2f} 元 = 总资产 × {DC.CASH_RESERVE_RATIO:.0%}"
+            f" > 绝对下限 {buf_min:.2f} 元 ⇒ 取比例下限）"
+        )
+    else:
+        buf_min_note = (
+            f"生效下限 {buf_min_eff:.2f} 元"
+            f"（绝对下限 {buf_min:.2f} 元 ≥ 比例下限 {reserve_req:.2f} 元 ⇒ 取绝对下限）"
+        )
+
     orders: list[dict] = []
     unbuildable: list[dict] = []
 
@@ -1401,6 +1571,38 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         if price is None:
             price, fallback_date = _price_of(prices, code)
             price_date = price_date or fallback_date
+        # 🔴 2026-11-11（审计缺陷 A·**缺价角落**）：「维持」行（TA 一票否决但仍在持仓）
+        #    **必须**先于「缺价」分支处理：
+        #      旧顺序（缺价在前）⇒ 本行落进缺价分支 ⇒ `target_shares=None`
+        #      ⇒ positions 循环先 `covered.add(code)` 再 `if shares is None: continue`
+        #      ⇒ 该代码**被标记 covered 却不进 positions**；账户持仓兜底循环又因 covered 跳过
+        #      ⇒ 它的市值在 `post_trade.equity_amount` 里**彻底消失**（权益口径失真）。
+        #    ⇒ 修法：ta_rejected 分支提前；**缺价时用账户快照价/市值兜底**
+        #      ⇒ 仍是「维持、delta=0、不下单」，且市值**计入权益**。
+        if act.get("ta_rejected"):
+            _acc_mv = None
+            for _p in (acc.get("positions") or []):
+                if str(_p.get("code") or "").strip().zfill(6) == code:
+                    _acc_mv = _f(_p.get("market_value"))
+                    break
+            target_shares = current_shares
+            target_amount = (current_shares * price) if price is not None else _acc_mv
+            delta_shares = 0
+            est_amount = 0.0
+            orders.append({
+                "code": code, "name": name, "action": "维持",
+                "current_shares": current_shares, "price": price,
+                "price_date": price_date,
+                "target_shares": target_shares, "delta_shares": delta_shares,
+                "target_amount": target_amount, "est_amount": est_amount,
+                "est_fee": 0.0, "est_slippage": 0.0,
+                "capped": False,
+                "cap_note": "🛡️ TA 一票否决 ⇒ 保持现仓，**不下单**",
+                #: 🔴 缺价时按**账户快照市值**兜底 ⇒ positions 循环据此计入权益（不蒸发）
+                "market_value": _acc_mv,
+                "reason": str(act.get("reason") or ""),
+            })
+            continue
         if price is None:
             warnings.append(
                 f"{code} {name}：缺价格（动作件与 prices 里都没有）⇒ 该行不参与金额/费用计算"
@@ -1522,9 +1724,9 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         available = (cash + agg["sell_proceeds"] - agg["sell_fees"] - agg["sell_slippage"])
         required = agg["buy_amount"] + agg["buy_fees"] + agg["buy_slippage"]
         cash_end = available - required
-        if cash_end < buf_min - 1e-9:
-            # ---- 现金缓冲守卫：从金额最大的买入单开始减，直到现金 ≥ 下限 ----
-            budget = max(0.0, available - buf_min)
+        if cash_end < buf_min_eff - 1e-9:
+            # ---- 现金缓冲守卫：从金额最大的买入单开始减，直到现金 ≥ **生效下限** ----
+            budget = max(0.0, available - buf_min_eff)
             for order in sorted(orders, key=lambda o: -(o["est_amount"] or 0.0)):
                 if (order["delta_shares"] or 0) <= 0:
                     continue
@@ -1544,7 +1746,7 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
                     order["est_slippage"] = abs(order["est_amount"]) * float(DC.SLIPPAGE_RATE)
                     order["action"] = "买入" if new_delta > 0 else "持有"
                     order["reason"] = (
-                        order["reason"] + "；现金缓冲守卫：本轮缩减买入").strip("；")
+                        order["reason"] + f"；现金缓冲守卫（{buf_min_note}）：本轮缩减买入").strip("；")
                     scaled.append({
                         "code": order["code"], "name": order["name"],
                         "cut": True, "reduced_shares": reduced,
@@ -1556,19 +1758,26 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             cash_end = available - required
         deficit = max(0.0, required - available)
         surplus = max(0.0, available - required)
-        feasible = bool(deficit <= 1e-9 and cash_end >= buf_min - 1e-9)
+        feasible = bool(deficit <= 1e-9 and cash_end >= buf_min_eff - 1e-9)
         if not feasible:
             reasons = []
             if deficit > 1e-9:
                 reasons.append(f"现金缺口 {deficit:.2f} 元")
-            if cash_end < buf_min - 1e-9:
+            if cash_end < buf_min_eff - 1e-9:
                 reasons.append(
-                    f"调仓后现金 {cash_end:.2f} 元 < 缓冲下限 {buf_min:.2f} 元")
+                    f"调仓后现金 {cash_end:.2f} 元 < {buf_min_note}")
             warnings.append("🔴 执行卡**不可行**：" + "；".join(reasons))
         if cash_end > buf_max + 1e-9:
+            # 🔴 2026-11-10：现金里**有一部分是规则要求的预留**（不是「多余资金」）
+            #    ⇒ 告警必须把这两部分分开说，否则每张卡都在报假警。
+            _reserve_note = (
+                f"｜其中现金预留 {reserve_req:.2f} 元"
+                f"（总资产 × {DC.CASH_RESERVE_RATIO:.0%}）是**规则要求**，不属于多余资金"
+                if (reserve_req is not None and cash_end >= reserve_req - 1e-9) else ""
+            )
             warnings.append(
                 f"ℹ️ 调仓后现金 {cash_end:.2f} 元 > 缓冲上限 {buf_max:.2f} 元"
-                f" ⇒ 多余资金躺平（**不为了花完现金而强行建仓**）"
+                f" ⇒ 多余资金躺平（**不为了花完现金而强行建仓**）{_reserve_note}"
             )
         cash_flow = {
             "cash_begin": cash,
@@ -1596,7 +1805,11 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         shares = order["target_shares"]
         if shares is None:
             continue
-        market = shares * order["price"]
+        #: 🔴 2026-11-11（缺陷 A·缺价角落）：「维持」行可能**缺价**
+        #    ⇒ 没有行情价 ⇒ 用动作件里带的**账户快照市值**兜底
+        #    ⇒ 市值照常计入权益（不许蒸发、也不许编价）。
+        _price = order.get("price")
+        market = (shares * _price) if _price is not None else (_f(order.get("market_value")) or 0.0)
         positions.append({
             "code": code,
             "name": order["name"],
@@ -1637,8 +1850,8 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
 
     cash_end_value = _f(cash_flow.get("cash_end"))
     card = {
-        "asof": mode_router.normalize_date(asof),
-        "execution_date": mode_router.normalize_date(execution_date),
+        "asof": run_paths.normalize_date(asof),
+        "execution_date": run_paths.normalize_date(execution_date),
         "execution_lag_days": int(DC.EXECUTION_LAG_DAYS),
         "execution_basis": EXECUTION_BASIS,
         "price_basis_note": PRICE_BASIS_NOTE,
@@ -1656,7 +1869,14 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             "positions": positions,
             "cash_buffer": cash_end_value,
             "cash_buffer_ok": (
-                cash_end_value >= buf_min - 1e-9 if cash_end_value is not None else None
+                cash_end_value >= buf_min_eff - 1e-9 if cash_end_value is not None else None
+            ),
+            # 🔴 2026-11-10：现金**预留**口径（比例 / 比例下限金额 / 是否达标）
+            "cash_reserve_ratio": float(DC.CASH_RESERVE_RATIO),
+            "cash_reserve_required": (round(reserve_req, 2) if reserve_req is not None else None),
+            "cash_reserve_ok": (
+                cash_end_value >= reserve_req - 1e-9
+                if (cash_end_value is not None and reserve_req is not None) else None
             ),
         },
         "cash_flow": cash_flow,
@@ -1668,6 +1888,9 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             "lot_size": lot,
             "cash_buffer_min": buf_min,
             "cash_buffer_max": buf_max,
+            # 🔴 2026-11-10：**生效下限**（绝对 vs 比例取大者）+ 现金预留比例
+            "cash_buffer_min_eff": buf_min_eff,
+            "cash_reserve_ratio": float(DC.CASH_RESERVE_RATIO),
             "commission_rate": float(DC.COMMISSION_RATE),
             "min_commission": float(DC.MIN_COMMISSION),
             "stamp_duty_rate": float(DC.STAMP_DUTY_RATE),

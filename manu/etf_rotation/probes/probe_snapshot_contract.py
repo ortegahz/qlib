@@ -3,7 +3,7 @@
 """**快照契约**闸门探针（S1~S10）—— 钉死「单一无状态流水线 ＋ 不可变快照目录」的不变式。
 
 【为什么要有这个探针】
-2026-11-09 架构瘦身把「Mode A/B/C 分诊 ＋ 影子推演」换成「**每次运行 = 一个快照目录**」。
+2026-11-09 架构瘦身把「按模式分诊 ＋ 影子推演」换成「**每次运行 = 一个快照目录**」。
 旧形态把产物写进**根目录全局共享文件**（canonical ``stock_scores.csv`` /
 ``tradingagents_decision.*`` / ``rebalance_recommendation.json``）⇒ 跨链路污染、无法 diff、
 「不写全局文件」只能靠 if 分支守。新形态的不变式（契约 §0）：
@@ -570,7 +570,7 @@ def _disabled_marker_keys(card: Any) -> set[str]:
     for key in ("order_enabled", "trade_enabled", "can_order"):
         if key in card and card[key] is False:
             keys.add(key)
-    for key in ("disabled", "order_disabled", "observation_only", "shadow_only"):
+    for key in ("disabled", "order_disabled", "observation_only"):
         if card.get(key) is True:
             keys.add(key)
     for key in ("watermark", "notice"):

@@ -300,7 +300,7 @@ cd /tmp/pycharm_project_658d3fc4 && bash manu/etf_rotation/run_pipeline.sh --aso
 
 > 🔴 **交付形态（2026-11-05 用户改口，当前唯一形态）**：**按需分析** —— 用户在窗口喊「分析」⇒ 主 agent 在服务器跑流程 ⇒ **Markdown 报告直接回窗口**。
 > ❌ **服务器 crontab 已无本工程任何条目**（5 条定时任务已全部卸载）；❌ **邮件不再是默认动作**（保留为显式 `--send-email` 的 opt-in）。
-> 🔴 **架构形态（2026-11-09 架构瘦身）**：**单一流水线 + 快照制** —— **没有**「模式 A / B / C」分诊；
+> 🔴 **架构形态（2026-11-09 架构瘦身）**：**单一流水线 + 快照制** —— **没有**「模式」分诊；
 > **每次运行落一个不可变快照目录** `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/`；**副作用只由 `--live-trade` 决定**。
 > 六阶段全流程：**盘后取数 → S 层 Alpha 推断 → E=W×S 穿透 + 均线过滤 → TradingAgents 辩论 → 规则层对账 → 执行卡 + 报告**。
 > 用法详见 `manu/etf_rotation/daily/README.md`；架构说明见 `manu/docs/snapshot_architecture.md`；铁律见 `manu/memory/rules.md §十五`。
@@ -389,8 +389,8 @@ cd /media/manu/1TB-Volume/workspace/qlib
 #    /home/huangzhe/anaconda3/envs/ql/bin/python -m pytest manu/etf_rotation/daily/tests -q
 ```
 
-> 🔴 **老命令会被拒**：`--mode A` / `--mode B` / `--mode C` 一律**退出码 2** ＋ stderr 迁移提示
-> （Mode A/B/C 三模式分诊已废除；跑哪几段 = `--full` ＋ skip 开关，要不要动真格 = `--live-trade`）。
+> 🔴 **老命令会被拒**：`--mode`（连参数本身都已删除）一律**退出码 2** ＋ stderr 迁移提示
+> （模式分诊已废除 ⇒ 单一流水线；跑哪几段 = `--full` ＋ skip 开关，要不要动真格 = `--live-trade`）。
 > 新旧对照表见 `manu/docs/snapshot_architecture.md` §9。
 > 🔴 **重活开关**：`--refresh-scores`（重跑 S 层，约 **27 分钟**）与 `--update-qlib-bin`（刷新 qlib 数据集）
 > **默认开启**，`--full` 会强制为开 ⇒ **重活须用户当轮授权**（铁律一）。

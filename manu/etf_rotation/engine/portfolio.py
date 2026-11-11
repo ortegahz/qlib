@@ -14,7 +14,8 @@
 - **防守开关**：若**没有任何**权益 ETF 通过绝对动量 ⇒ 组合切到黄金 ETF / 国债 ETF。
 
 【权重】
-默认**等权**（3~5 只 ⇒ 20%~33%/只），单只上限 40%（防集中）。
+先按 `config.CASH_RESERVE_RATIO` **切出现金预留**（2026-11-10 起 = 20% ⇒ 权益上限 80%），
+剩余预算再**等权**（3~5 只 ⇒ 16%~26.7%/只），单只上限 **20%**（文档 §二.4，防集中）。
 """
 from __future__ import annotations
 
@@ -281,19 +282,24 @@ def build_portfolio(
     selected = pool[pool["selected"]].copy().sort_values("final_score", ascending=False)
     defensive_mode = bool(len(equity[equity["mom120"] > C.ABSOLUTE_MOMENTUM_THRESHOLD]) == 0)
 
-    # ---- 目标权重：等权 + 单只上限 ----
+    # ---- 目标权重：先切现金预算，再等权 + 单只上限 ----
     n = len(selected)
-    cap = 0.40
+    #: 🔴 2026-11-11（文档 §二.4）：单只上限由**行内字面量 40%** 改为**显式常量 20%**
+    #:   （「严格等权分配（单标的 20% 上限）」）⇒ 5 席各 16% 时不触发；席位少时**更早**收敛。
+    cap = float(getattr(C, "MAX_SINGLE_WEIGHT", 0.20))
+    #: 🔴 2026-11-10：权益预算 = 1 - 现金预留比例（= 0.80）⇒ **先切现金再等权**
+    #:    （改前是「满仓等权」，改后 5 只 ⇒ 每只 16%、合计 80%、现金 20%）
+    equity_budget = max(0.0, 1.0 - float(C.CASH_RESERVE_RATIO))
     if n == 0:
         target: dict[str, float] = {}
     else:
-        w = min(1.0 / n, cap)            # 等权，但单只不超过 40%
+        w = min(equity_budget / n, cap)  # 预算内等权，但单只不超过 cap（20%）
         # 🔴 `Series.items()` 迭代的是 (索引, 值)，索引不是行 ⇒ 不能用 r["code"] 取代码
         target = {
             str(row["code"]): float(w)
             for _, row in selected.iterrows()
         }
-    #: 权重上限导致未配满的部分 = 现金（不外借、不加杠杆）
+    #: 权重上限 / 现金预留导致未配满的部分 = 现金（不外借、不加杠杆）
     cash_weight = float(max(0.0, 1.0 - sum(target.values())))
 
     # ---- 手工操作清单 ----
@@ -370,6 +376,9 @@ def build_portfolio(
         "relaxed_absolute_momentum_filter": relaxed,
         "n_selected": n,
         "cash_weight": round(cash_weight, 6),
+        # 🔴 2026-11-10：现金预留口径**随产物一起披露**（不靠外部记忆）
+        "cash_reserve_ratio": float(C.CASH_RESERVE_RATIO),
+        "equity_budget": round(equity_budget, 6),
         "weights_used": {"alpha": w_alpha, "momentum": w_mom},
         "hold_buffer": buf,
         "stats": stats,

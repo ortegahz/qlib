@@ -65,6 +65,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from report_fingerprint import report_content_sha1_from_file  # noqa: E402
 import config as C  # noqa: E402  （落点常量单一事实源）
+import direction_vocab as _DV  # noqa: E402  （LLM 方向词表单一事实源）
 #: LLM「方向 → 目标权重」语义类别（**精确匹配**，不做子串匹配）：
 #: 「不买」含「买」、「卖出」含「卖」⇒ 子串匹配会把「不买」误判成「要买」。
 #: zero = 明确「不持有」⇒ 目标权重必须 = 0%；
@@ -89,26 +90,18 @@ import config as C  # noqa: E402  （落点常量单一事实源）
 #:   NEUTRAL  = **不设约束**（持有 / 保留 / 维持 / 不卖 / Hold / Neutral）
 #:   REDUCE   = 目标权重必须 **< 当前权重**（减 / 减持 / 减仓 / Underweight）
 #:   INCREASE = 目标权重必须 **> 当前权重**（增 / 加 / Increase）
-LLM_DIRECTION_ZERO = frozenset({
-    "不买", "清仓", "清掉", "清", "卖出", "卖", "退出", "Sell",
-})
-LLM_DIRECTION_POS = frozenset({
-    "买", "买入", "加仓", "增持", "建仓", "Buy", "Overweight",
-})
-LLM_DIRECTION_NEUTRAL = frozenset({
-    "不卖", "持有", "保留", "维持", "持", "留", "Hold", "Neutral", "Keep",
-})
-LLM_DIRECTION_REDUCE = frozenset({
-    "减持", "减仓", "减", "Reduce", "Underweight",
-})
-LLM_DIRECTION_INCREASE = frozenset({
-    "增", "加", "Increase", "Add",
-})
+#: 🔴 2026-11-11（critic 审计 · 高危）：本组词表与解析器
+#:    `final_rebalance_plan._ZERO_DIR_WORDS` **原本是两份分叉的副本**
+#:    ⇒ 解析器吐得出的「清」「Sell」不在解析器 ZERO 档（⇒ 只被守卫拦死、不被强制归零），
+#:      而「卖掉/清零/不建仓」在解析器侧是死条目。
+#:    ⇒ 现在两边都引用 `direction_vocab`（**单一事实源**）；本模块的公开名保持不变。
+LLM_DIRECTION_ZERO = _DV.ZERO
+LLM_DIRECTION_POS = _DV.POS
+LLM_DIRECTION_NEUTRAL = _DV.NEUTRAL
+LLM_DIRECTION_REDUCE = _DV.REDUCE
+LLM_DIRECTION_INCREASE = _DV.INCREASE
 #: 全部已分类的方向词（供「未分类」判定用）
-LLM_DIRECTION_ALL = (
-    LLM_DIRECTION_ZERO | LLM_DIRECTION_POS | LLM_DIRECTION_NEUTRAL
-    | LLM_DIRECTION_REDUCE | LLM_DIRECTION_INCREASE
-)
+LLM_DIRECTION_ALL = _DV.ALL
 #: LLM 分歧门槛（pp）——必须与 final_rebalance_plan.py 建计划时的 `> 2.0` 保持一致
 LLM_DIVERGENCE_PP = 2.0
 
@@ -601,10 +594,24 @@ def _check_final_plan(plan: dict, plan_md: str, rec: dict, run_root: Path) -> li
     # ⇒ 只比「目标侧」：交付层里 target_weight > 0 的那些。
     rec_codes = sorted(str(h.get("code")) for h in (rec.get("holdings") or []))
     plan_codes = sorted(str(a.get("code")) for a in actions if float(a.get("target_weight") or 0.0) > 0.0)
+    # 🔴 2026-11-11：TA 合规筛选（**一票否决 + 顺延补位**）会**合法地**改变交付层名单 ⇒
+    #    「同源」的口径必须**扣掉被否决的、补上顺延的、加上保留为「维持」的孤儿持仓**；
+    #    否则一次正确的 TA 否决会被误判成「规则层与交付层不同源」。
+    ta = plan.get("ta_screening") or {}
+    _rejected = {str(r.get("code")) for r in (ta.get("rejected") or []) if r.get("code")}
+    _substituted = {str(s.get("code")) for s in (ta.get("substituted") or []) if s.get("code")}
+    _orphans = {str(c) for c in (ta.get("orphaned_holdings") or []) if c}
+    _expected = (set(rec_codes) - _rejected) | _substituted | _orphans
+    _same = set(plan_codes) == _expected
+    _ta_note = (
+        f"｜TA 否决 {sorted(_rejected)}｜顺延 {sorted(_substituted)}｜维持席位 {sorted(_orphans)}"
+        if (_rejected or _substituted or _orphans)
+        else "｜本轮无 TA 否决/顺延"
+    )
     out.append((
-        "规则层与交付层入选同源",
-        rec_codes == plan_codes,
-        f"规则层 {rec_codes}｜交付层 {plan_codes}",
+        "规则层与交付层入选同源（TA 否决/顺延已对账）",
+        _same,
+        f"规则层 {rec_codes}｜交付层 {plan_codes}｜期望 {sorted(_expected)}{_ta_note}",
     ))
     conflicts = plan.get("llm_conflicts") or []
     has_llm_view = bool((plan.get("tradingagents_view") or "").strip())
@@ -750,10 +757,21 @@ def _check_llm_direction_semantics(plan: dict) -> tuple[bool, str]:
             if target_pct <= 0.0:
                 bad.append(f"{tag} 方向「{direction}」⇒ 目标权重必须 >0%，实为 {target_pct}%")
         elif direction in LLM_DIRECTION_REDUCE:
-            if current_pct is not None and target_pct >= current_pct - 1e-9:
+            # 🔴 2026-11-11（服务器实跑 20261111_100742 实测红灯 · 假阳性）：
+            #    `current_pct == 0.0` 表示「**账户里没这只**」（`_resolve_current_pct`：
+            #    有账户真值时，字典里没有的代码 = 未持有 ⇒ 0%），**不是**「持有 0%」。
+            #    ⇒ 账户相对约束（目标 < 当前）在「未持有」上**没有可比基准**
+            #      （LLM 的「减 11.17%→6%」是相对**研究基线组合**说的）。
+            #    实测事故：159929 不在本账户（账户只持 512800）⇒ 守卫误报
+            #      「主视图[159929] 方向「减」⇒ 目标权重必须 < 当前权重 0.0%，实为 6.0%」。
+            #    ⇒ 修法：`current_pct` 为 None（未知）或 <= 0.0（未持有 ⇒ 无可比基准）
+            #      时**跳过**这两档约束；其余档（ZERO/POS）**不受影响**，继续严查。
+            if (current_pct is not None and current_pct > 0.0
+                    and target_pct >= current_pct - 1e-9):
                 bad.append(f"{tag} 方向「{direction}」⇒ 目标权重必须 < 当前权重 {current_pct}%，实为 {target_pct}%")
         elif direction in LLM_DIRECTION_INCREASE:
-            if current_pct is not None and target_pct <= current_pct + 1e-9:
+            if (current_pct is not None and current_pct > 0.0
+                    and target_pct <= current_pct + 1e-9):
                 bad.append(f"{tag} 方向「{direction}」⇒ 目标权重必须 > 当前权重 {current_pct}%，实为 {target_pct}%")
         # NEUTRAL（持有 / 保留 / 维持 / 不卖）：**不设约束**
     detail = f"{len(rows)} 行 LLM 意见逐行校验｜异常 {len(bad)} 条"

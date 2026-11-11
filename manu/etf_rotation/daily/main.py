@@ -1,7 +1,7 @@
 """main.py —— **ETF 轮动分析流水线**（单一入口 ＋ 不可变快照 ＋ 一个副作用开关）。
 
-【2026-11-09 架构瘦身：Mode A / B / C ⇒ 一条流水线】
-旧形态：三个模式分诊（A 日常巡检 / B 调仓节点 / C 影子推演）＋ 根目录全局共享文件
+【2026-11-09 架构瘦身：三条按用途分诊的链 ⇒ 一条流水线】
+旧形态：三条按用途分诊的链（日常巡检 / 调仓节点 / 影子推演）＋ 根目录全局共享文件
 ⇒ 三套分支、三套产物根、三套语义 ⇒「忘了加 if」就会漏出新仓位指令、也会污染生产金标。
 新形态：
 
@@ -49,6 +49,8 @@ import argparse
 import fcntl
 import json
 import logging
+import os
+import socket
 import sys
 import time
 import traceback
@@ -66,14 +68,13 @@ import snapshot as snap_mod  # noqa: E402
 _LOG_FORMAT = "%(asctime)s | %(levelname)-5s | %(name)-14s | %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
-#: 🔴 **`--mode` 已废除**（2026-11-09）—— 传了就拒，并给迁移提示
-_MODE_MIGRATION_HINT = (
-    "🔴 **`--mode` 已废除**（2026-11-09 架构瘦身：Mode A/B/C ⇒ 单一流水线 + 快照制）。\n"
-    "   迁移对照：\n"
-    "     --mode B            →  **直接去掉**（缺省就是完整六阶段流水线）\n"
-    "     --mode A            →  **直接去掉**（日常巡检已并入流水线，不再单独分流）\n"
-    "     --mode C            →  **直接去掉**（影子推演已废除 ⇒ 缺省即观察态）\n"
-    "   新参数：`--full`（强制全流程）/ `--live-trade`（实盘副作用）/ `--dry-run`（观察态）\n"
+#: 🔴 **旧「模式」参数已下线**（2026-11-09 架构瘦身 ⇒ 单一流水线；2026-11-10 起参数本身也删除）
+#:    —— 传了就拒（退出码 2）＋ 迁移提示。**提示里不再列举任何模式名**（模式概念已彻底下线）。
+_LEGACY_MODE_ARG_HINT = (
+    "🔴 **`--mode` 已下线**（架构瘦身 ⇒ **单一流水线**，模式分诊已彻底下线）。\n"
+    "   当前只有**一个**副作用开关：`--live-trade`（发信 / 下单）。\n"
+    "   **缺省即观察态**：跑完落快照 + 报告，执行卡结构性挂单禁用、不发信。\n"
+    "   其余参数：`--full`（强制全流程）/ `--dry-run`（显式声明观察态）\n"
     "            / `--snapshot-root`（快照根，缺省 daily_config.SNAPSHOT_ROOT）\n"
     "   产物：每次运行落 `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/`（自包含、可 diff）\n"
 )
@@ -111,8 +112,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "（与 --live-trade 互斥）"
                         "｜🔴 观察态**本来就是缺省行为** ⇒ 本开关**不改变任何行为**，"
                         "只为了让脚本自解释（别把它当成「不产出产物」的预演）")
-    p.add_argument("--mode", default=None,
-                   help="🆑 **已废除**（保留只为给出迁移提示）")
     p.add_argument("--report-md", default=None,
                    help="报告落盘路径（缺省 = <RESULTS_ROOT>/reports/report_<YYYYMMDD>.md）")
     p.add_argument("--send-email", action="store_true",
@@ -220,12 +219,148 @@ def setup_logging(log_path: Path) -> logging.Logger:
     return root
 
 
+def _proc_start_ticks(pid: int) -> int | None:
+    """`/proc/<pid>/stat` 的 starttime（进程**启动时刻**指纹）—— 拿不到 ⇒ `None`。
+
+    🔴 为什么需要它：**PID 会被复用** ⇒ 光看「pid 在不在」判不出「还是不是原来那个进程」
+       ⇒ 进程被 kill 之后 PID 很可能被别人拿走 ⇒ 必须再比一次「启动时刻」。
+    🔴 解析坑：`comm` 字段可能含空格/括号 ⇒ 必须从**最后一个 `)`** 之后开始切字段。
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    cut = raw.rfind(")")
+    if cut < 0:
+        return None
+    fields = raw[cut + 2:].split()
+    #: stat 第 3 字段起算 ⇒ starttime（第 22 字段）= 切分后第 19 个
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """pid **当前**是否还活着（只判「在不在」；PID 复用判定要靠 starttime）。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # 存在但不属于当前用户 ⇒ 还活着
+    except OSError:
+        return True   # 拿不准 ⇒ 按活着处理（保守 ⇒ 宁可误拦）
+    return True
+
+
 class _RunLock:
-    """单实例守卫（`fcntl.flock`）—— 防同一时刻重复跑。"""
+    """单实例守卫（`fcntl.flock`）—— 防同一时刻重复跑。
+
+    🔴 2026-11-11 缺陷修（实测事故：手动 kill 掉跑批后，锁文件只剩一行裸时间戳）：
+       旧实现**只写一行时间戳** ⇒ 现场既查不出「是谁在跑」，也判不出「是不是陈旧」，
+       残留锁看着像「一直有人在跑」⇒ 后续跑批被误拦、运维只能手动 rm。
+       ⇒ 现在锁文件自带**持有者身份**：pid / host / 启动时刻 / 进程启动时刻（/proc starttime）
+         ⇒ ① 被拦时能点名「谁在跑」；② 持锁进程已被 kill 时**可判定陈旧并接管**（带 WARNING）。
+
+    🔴 **安全红线：宁可误拦，也不误并发写**
+       · **「谁能跑」只由内核 `flock` 决定**：抢不到 ⇒ 一律拒（不推翻内核）；
+       · 锁记录**只用于判陈旧 + 写诊断**，**绝不放行任何可能还活着的持有者**
+         （记录说「还活着」⇒ 反而要拒）；
+       · 判陈旧必须**有可靠证据**：同机 + pid 已消失（或 pid 被复用且启动时刻对不上）
+         ⇒ 才算陈旧；跨机 ⇒ 本机验不了 ⇒ **保守按还活着处理（继续拦）**。
+    """
+
+    #: 锁记录状态：持有中 / 已正常释放
+    _STATE_RUNNING = "running"
+    _STATE_RELEASED = "released"
+
+    #: 旧记录持有者判定结果
+    _ALIVE = "alive"
+    _DEAD = "dead"
+    _UNKNOWN = "unknown"
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._fh = None
+
+    # ---- 锁记录（JSON：pid / host / 启动时刻 / 进程启动时刻 / 状态）------------
+    def _read_record(self) -> dict:
+        """读旧锁记录（尽力而为；读不出/旧格式 ⇒ `{}` ⇒ 没有可判定的持有者）。"""
+        try:
+            self._fh.seek(0)
+            raw = self._fh.read() or ""
+        except OSError:
+            return {}
+        raw = raw.strip()
+        if not raw:
+            return {}
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            return {}
+        return rec if isinstance(rec, dict) else {}
+
+    def _write_record(self, state: str) -> None:
+        """把**本次持有者**写进锁文件（谁在跑 / 从什么时候开始跑）。"""
+        rec = {
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "start_ticks": _proc_start_ticks(os.getpid()),
+            "script": sys.argv[0] if sys.argv else "",
+            "state": state,
+        }
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    @staticmethod
+    def _describe(rec: dict) -> str:
+        """把锁记录渲染成一句人话（异常消息 / 日志用）。"""
+        if not rec:
+            return "锁记录为空或旧格式（无持有者信息）"
+        return (
+            f"pid={rec.get('pid')} host={rec.get('host')} "
+            f"启动于={rec.get('started_at')} 状态={rec.get('state')}"
+        )
+
+    def _classify_holder(self, rec: dict) -> str:
+        """判定旧记录的持有者：`alive` / `dead` / `unknown`（**保守优先**）。"""
+        host = str(rec.get("host") or "")
+        if host and host != socket.gethostname():
+            return self._UNKNOWN      # 跨机 ⇒ 本机验不了 ⇒ 不猜（保守 ⇒ 继续拦）
+        try:
+            pid = int(rec.get("pid"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return self._UNKNOWN      # 旧格式（裸时间戳）/ 残缺 ⇒ 拿不准
+        if not _pid_alive(pid):
+            return self._DEAD
+        rec_ticks = rec.get("start_ticks")
+        if rec_ticks is not None:
+            try:
+                expected = int(rec_ticks)
+            except (TypeError, ValueError):
+                return self._UNKNOWN
+            now_ticks = _proc_start_ticks(pid)
+            if now_ticks is not None and now_ticks != expected:
+                return self._DEAD        # PID 被复用 ⇒ 原持有者已死
+        return self._ALIVE
+
+    def _release(self) -> None:
+        """放掉内核锁并关文件（**不删锁文件** ⇒ 避免「删文件换 inode」的并发窗口）。"""
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
 
     def __enter__(self) -> "_RunLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,22 +368,46 @@ class _RunLock:
         try:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            hint = self._describe(self._read_record())
             self._fh.close()
             self._fh = None
-            raise LockError(f"已有实例在跑（锁文件 {self.path}）") from exc
-        self._fh.seek(0)
-        self._fh.truncate()
-        self._fh.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')}\n")
-        self._fh.flush()
+            raise LockError(f"已有实例在跑（锁文件 {self.path}；{hint}）") from exc
+
+        # ---- 已拿到内核锁 ⇒ 此刻**没有**别的持锁者（flock 由内核托管） ----------
+        rec = self._read_record()
+        if rec and str(rec.get("state") or "") != self._STATE_RELEASED:
+            verdict = self._classify_holder(rec)
+            if verdict == self._DEAD:
+                logging.getLogger("etf_rotation_daily").warning(
+                    "清理了陈旧锁：上次持有者 pid=%s host=%s 启动于 %s 的进程已不存在"
+                    " ⇒ 已接管并重写锁记录",
+                    rec.get("pid"), rec.get("host"), rec.get("started_at"),
+                )
+            elif verdict == self._ALIVE:
+                # 记录说持有者**还活着**，但内核锁已释放 ⇒ 多半是「锁文件被删后重建」
+                # ⇒ 那个实例还可能在下写 ⇒ 宁可误拦，也不误并发写
+                self._release()
+                raise LockError(
+                    f"锁记录显示持有者仍在运行（{self._describe(rec)}）"
+                    f" ⇒ 拒绝并发跑批（宁可误拦，也不误并发写）"
+                )
+            else:
+                # 跨机记录 ⇒ 本机验不了 ⇒ 保守按「还活着」处理（继续拦）
+                self._release()
+                raise LockError(
+                    f"无法判定锁记录持有者是否已死（{self._describe(rec)}）"
+                    f" ⇒ 保守按「还活着」处理，拒绝并发跑批"
+                )
+        self._write_record(self._STATE_RUNNING)
         return self
 
     def __exit__(self, *exc_info) -> None:
         if self._fh is not None:
             try:
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-            finally:
-                self._fh.close()
-                self._fh = None
+                self._write_record(self._STATE_RELEASED)
+            except OSError:
+                pass
+            self._release()
 
 
 def _today_str() -> str:
@@ -666,8 +825,7 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
 
     for note in result.get("notes", []) or []:
         log_stage.info("%s", note)
-    log_stage.info("统一流水线计算完成：mode=%s live_trade=%s",
-                   result.get("mode"), result.get("live_trade"))
+    log_stage.info("统一流水线计算完成：live_trade=%s", result.get("live_trade"))
     # 🔴 2026-11-10：接住「失败阶段清单」⇒ --full 下据此硬失败（见本函数末尾）
     failed_stages = _record_pipeline_stages(
         snap, result, flags=flags, refresh_scores=refresh_scores
@@ -722,7 +880,7 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
         ]
     try:
         markdown = report.render_report(
-            result, account=account, mode="unified", asof=asof, live_trade=live_trade,
+            result, account=account, asof=asof, live_trade=live_trade,
         )
     except Exception as exc:
         raise StageError("report", exc) from exc
@@ -1013,17 +1171,20 @@ def _handle_failure(asof: str, stage: str, tb: str, exc: BaseException,
 
 def main(argv: list[str] | None = None) -> int:
     """流水线入口。返回进程退出码。"""
-    args = parse_args(argv)
-
-    # 🔴 **`--mode` 已废除** ⇒ 拒 + 迁移提示（退出码 2）
-    if getattr(args, "mode", None):
-        sys.stderr.write(_MODE_MIGRATION_HINT)
+    # 🔴 **旧「模式」参数已下线**（2026-11-10 起连参数本身也删了）⇒ 传了就拒（退出码 2）
+    #    🔴 必须在 `parse_args` **之前**判：参数已不在 parser 里 ⇒ 否则 argparse 先报
+    #    「unrecognized arguments」（退出码同样是 2，但提示对用户没用）。
+    _raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--mode" in _raw_argv:
+        sys.stderr.write(_LEGACY_MODE_ARG_HINT)
         return 2
+
+    args = parse_args(argv)
 
     # 🔴 **`--send-only` 与 `--full` 互斥**（2026-11-09 独立审计发现）
     #    `--send-only` 整条流水线不跑 ⇒ `--full` 会被**静默忽略**
     #    （`resolve_stage_flags` 根本不被调用、无快照、无 manifest、退出码 0）
-    #    ⇒ 与 `--mode` / `--dry-run --live-trade` 同款处理：直接拒，给退出码 2。
+    #    ⇒ 与旧 `--mode` / `--dry-run --live-trade` 同款处理：直接拒，给退出码 2。
     if getattr(args, "send_only", False) and getattr(args, "full", False):
         sys.stderr.write(
             "🔴 **`--send-only` 与 `--full` 互斥**：`--send-only` 只发已持久化的草稿、"

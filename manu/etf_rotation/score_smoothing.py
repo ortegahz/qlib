@@ -21,10 +21,10 @@
 * 全局一个历史观测点都没有 ⇒ 打印 ``WARNING: Fallback to transient score``；
 * 稳定性算不出来（有效点 < 2）⇒ 写 ``None``（**不写 0**）。
 
-【EWMA 的半衰期（别照抄需求文档里的数字）】
-``half_life = ln(0.5) / ln(1-α)``。``α=0.35`` ⇒ **1.60 个交易日**，
-而需求文档写的是「3~5 个交易日」（那需要 ``α≈0.21``）。本模块**按实际算出来的值披露**，
-不把文档措辞当成结论。
+【EWMA 的半衰期（按实际 alpha 披露，别照抄文档措辞）】
+``half_life = ln(0.5) / ln(1-α)``。默认 ``α`` 取 ``config.SMOOTHING_ALPHA``
+（**唯一事实源**，本模块不写字面量副本）⇒ 半衰期随之变化。
+本模块**按实际算出来的值披露**，不把文档措辞当成结论。
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config as _C  # noqa: E402  —— 🔴 单一事实源（alpha 只有一个地方定义）
 from engine.weights import map_scores_to_etfs  # noqa: E402
 
 #: 支持的平滑方法
@@ -51,8 +52,10 @@ DEFAULT_SMOOTHING_METHOD = "ewma"
 #: 默认滚动窗口（交易日）；需求指定 5 ⇒ 覆盖一个完整交易周
 DEFAULT_SMOOTHING_WINDOW = 5
 
-#: 默认 EWMA 系数；需求指定 0.35（实际半衰期约 1.60 个交易日，见模块 docstring）
-DEFAULT_SMOOTHING_ALPHA = 0.35
+#: 默认 EWMA 系数 —— 🔴 **绑定 `config.SMOOTHING_ALPHA`**（唯一事实源，**不许**再写字面量副本）
+#:   （2026-11-11 按架构文档对齐为 **0.20** ⇒ 半衰期 ≈ 3.10 个交易日）
+DEFAULT_SMOOTHING_ALPHA = float(_C.SMOOTHING_ALPHA)
+assert 0.0 < DEFAULT_SMOOTHING_ALPHA < 1.0, "SMOOTHING_ALPHA 必须落在 (0,1)"
 
 #: 默认取多少个**交易日**的历史做 EWMA 预热（够 EWMA 收敛 ⇒ 结果与「无限历史」一致）
 DEFAULT_HISTORY_SPAN_DAYS = 30

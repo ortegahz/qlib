@@ -214,14 +214,62 @@ def evaluate(plan: dict, md_text: str, cal: list[str]) -> list[tuple[str, bool, 
     out.append((f"P11 每笔费用 = 金额 ×（佣金 {meta.get('commission_bp')}bp + 滑点 {meta.get('slippage_bp')}bp）", ok,
                 f"费率 {fee_rate * 1e4:.2f}bp｜异常 {len(fee_bad)} 条{'：' + ', '.join(fee_bad[:3]) if fee_bad else ''}"))
 
-    # ---- P12 Σ目标权重 == 1 ----
-    ok = abs(w_target - 1.0) <= TOL_WEIGHT
-    out.append(("P12 Σ目标权重 = 1", ok, f"实测 {w_target:.6f}"))
+    # ---- P12 计划权重口径：Σ目标权重 + 计划现金权重 = 1，且计划现金权重 ≥ 现金预留比例 ----
+    #: 🔴 2026-11-10：现金预留比例**从常量读**（研究链 `config.CASH_RESERVE_RATIO`），
+    #:    **不许写死 0.2** ⇒ 口径改了探针跟着改，不靠人记得改数字。
+    reserve_ratio = float(C.CASH_RESERVE_RATIO)
+    #: 计划现金权重 —— 口径 = `final_rebalance_plan.py` 的 `cash_flow.target_cash_weight`
+    #: （= 1 - 计划权益权重；权益部分含「不可建仓 / 整手取整」缺口 ⇒ 权重归现金）
+    plan_cash_weight = _f(cf.get("target_cash_weight"), 0.0)
+    sum_ok = abs(w_target + plan_cash_weight - 1.0) <= TOL_WEIGHT
+    reserve_ok = plan_cash_weight >= reserve_ratio - TOL_WEIGHT
+    out.append((
+        "P12 Σ目标权重 + 计划现金权重 = 1（且计划现金权重 ≥ 现金预留比例）",
+        bool(sum_ok and reserve_ok),
+        f"Σ目标权重 {w_target:.6f} + 计划现金权重 {plan_cash_weight:.6f}"
+        f" = {w_target + plan_cash_weight:.6f}（{'✔' if sum_ok else '✘'}）"
+        f"｜现金预留比例（常量 C.CASH_RESERVE_RATIO）{reserve_ratio:.6f}"
+        f" ⇒ 计划现金权重 {'≥' if reserve_ok else '<'} 预留比例"
+        f"｜Σ权重归现金 {w_cash:.6f}（不可建仓 / 削减席位；>0 ⇒ 上面恒等式按同额偏大）",
+    ))
 
-    # ---- P13 Σ有效权重 + Σ归现金权重 = 1 ----
-    ok = abs(w_eff + w_cash - 1.0) <= TOL_WEIGHT
-    out.append(("P13 Σ有效权重 + Σ权重归现金 = 1", ok,
-                f"有效 {w_eff:.6f} + 归现金 {w_cash:.6f} = {w_eff + w_cash:.6f}"))
+    # ---- P12b 权益权重不许超配（≤ 1 - 现金预留比例）----
+    equity_cap = 1.0 - reserve_ratio
+    ok = w_target <= equity_cap + TOL_WEIGHT
+    out.append((
+        f"P12b 权益权重（Σ目标权重）≤ 1 - 现金预留比例（{reserve_ratio:.6f} ⇒ 上限 {equity_cap:.6f}）",
+        bool(ok),
+        f"Σ目标权重 {w_target:.6f} vs 上限 {equity_cap:.6f}（差 {w_target - equity_cap:+.6f}）",
+    ))
+
+    # ---- P13 Σ有效权重 + Σ权重归现金 = 1（口径：归现金 = 计划现金权重）----
+    #: 🔴 2026-11-11（口径升级「留 CASH_RESERVE_RATIO 现金」）：**旧口径已过期**。
+    #:    旧口径的「Σ权重归现金」= Σ `actions[].weight_to_cash`（**只**统计「不可建仓 /
+    #:    削减席位」的席位缺口），**不含**「刻意留出的现金预留」
+    #:    ⇒ 在新架构下恒等式**必然**不成立（0.542010 + 0.000000 = 0.542010 ≠ 1）
+    #:    ⇒ 这是**断言口径过期**，不是产物账不平。
+    #: 新口径：「权重归现金」= **计划现金权重**（`cash_flow.target_cash_weight`）。
+    #:    生产口径（`final_rebalance_plan.py`）：`invested_weight = Σ target_weight_effective`
+    #:    ⇒ `target_cash_weight = 1 − invested_weight`
+    #:    ⇒ 这个桶**已经含**「刻意留出的现金预留」**和**「席位缺口」
+    #:       （不可建仓席位 `target_weight_effective = 0` ⇒ 它的权重自然落进这个桶）。
+    #: ⚠️ 桶里**不能**把 Σ`weight_to_cash` **再加一遍**（生产已算进去 ⇒ 重复计 ⇒
+    #:    「不可建仓」场景会假红）⇒ 改为**断言分解式**（等价于「逐席 effective + gap = planned」）：
+    #:      归现金桶 == 未分配权重(1 − Σ目标权重) + 席位缺口(Σ weight_to_cash)
+    #:    再叠「Σ有效 + 归现金 = 1」⇒ **比旧口径更强**：旧口径只覆盖「席位缺口」，
+    #:    新口径连「刻意留现金」也被恒等式覆盖（任何一处账不平都会被抓出来）。
+    cash_bucket = plan_cash_weight
+    p13_sum_ok = abs(w_eff + cash_bucket - 1.0) <= TOL_WEIGHT
+    p13_decomp_ok = abs(cash_bucket - ((1.0 - w_target) + w_cash)) <= TOL_WEIGHT
+    out.append((
+        "P13 Σ有效权重 + Σ权重归现金 = 1（归现金 = 计划现金权重：未分配 + 席位缺口）",
+        bool(p13_sum_ok and p13_decomp_ok),
+        f"有效 {w_eff:.6f} + 归现金 {cash_bucket:.6f} = {w_eff + cash_bucket:.6f}"
+        f"（{'✔' if p13_sum_ok else '✘'}）｜归现金分解："
+        f"未分配权重(1 − Σ目标权重) {1.0 - w_target:.6f}"
+        f" + 席位缺口(Σ weight_to_cash) {w_cash:.6f} = {(1.0 - w_target) + w_cash:.6f}"
+        f"（{'✔' if p13_decomp_ok else '✘'}）",
+    ))
 
     # ---- P14 不可建仓席位 ----
     ok = not unbuildable_bad
@@ -338,6 +386,22 @@ def main() -> int:
                 a["target_shares"] = int(a["target_shares"]) + 50
                 break
 
+    def _n7(p2, _m):
+        # 🔴 变异反证：把「计划现金权重」改坏 ⇒ P13 的恒等式（Σ有效 + 归现金 = 1）必须转红。
+        #    （改的是**现金桶的总量** ⇒ 恒等式与分解式同时被抓 ⇒ 证明 P13 不是「非空即 PASS」）
+        p2["cash_flow"]["target_cash_weight"] = 0.5
+
+    def _n8(p2, _m):
+        # 🔴 变异反证：把某条 action 的「权重归现金（席位缺口）」改坏
+        #    ⇒ P13 的分解式（归现金桶 = 未分配权重 + 席位缺口）必须转红。
+        #    优先挑非「不可建仓」行，避免连带触发 P14 ⇒ 单独证明分解式这一半是活的。
+        acts8 = p2.get("actions") or []
+        tgt8 = next((a for a in acts8 if str(a.get("action")) != "不可建仓"), None)
+        if tgt8 is None and acts8:
+            tgt8 = acts8[0]
+        if tgt8 is not None:
+            tgt8["weight_to_cash"] = _f(tgt8.get("weight_to_cash"), 0.0) + 0.01
+
     negatives = [
         ("N1 篡改「实际落地权益金额」⇒ P1/P2 必须 FAIL", _n1, ["P1 实际落地权益金额（独立重算 Σ 目标股数×执行价）",
                                                             "P2 实际落地权益权重 = 实际金额 ÷ 总资产"]),
@@ -348,6 +412,10 @@ def main() -> int:
                                                       "P8 期末现金恒等式（期初+卖出-费用-买入-费用）"]),
         ("N5 目标股数改成非整手 ⇒ P15 必须 FAIL", _n5, ["P15 目标股数必须是整手（100 的整数倍）"]),
         ("N6 md 删掉「实际落地权益」行 ⇒ P17 必须 FAIL", None, ["P17 交付件 md 必须披露「实际落地权益」金额与权重（不许只报计划值）"]),
+        ("N7 篡改「计划现金权重」⇒ P13 必须 FAIL", _n7,
+         ["P13 Σ有效权重 + Σ权重归现金 = 1（归现金 = 计划现金权重：未分配 + 席位缺口）"]),
+        ("N8 篡改某条 action 的「权重归现金」⇒ P13 必须 FAIL", _n8,
+         ["P13 Σ有效权重 + Σ权重归现金 = 1（归现金 = 计划现金权重：未分配 + 席位缺口）"]),
     ]
     for title, fn, expect_fail in negatives:
         p2 = copy.deepcopy(plan)

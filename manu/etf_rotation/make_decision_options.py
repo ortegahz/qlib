@@ -371,6 +371,22 @@ def identify_divergences(plan: dict) -> tuple[list[dict], list[dict]]:
         final_pct = None
         if isinstance(final, dict):
             final_pct = final.get("target_pct")
+        final_caliber = "llm_final_decision（Trader 最终裁决原文）"
+        used_conflict_fallback = False
+        if final_pct is None and conflict.get("llm_target_pct") is not None:
+            # 🔴 2026-11-11（真实决策 md 实跑实证）：Trader 把目标权重写在**不带代码**的
+            #    句子里 —— 实测原文：「将当前22.54%的仓位降至**基准约10%、硬上限10%**
+            #    的战术观察仓」⇒ 这句没有代码 ⇒ 最终裁决层的**句级归属**拿不到标的
+            #    ⇒ `target_pct=None` ⇒ 旧口径把该标的判成「抽不出数字」
+            #    ⇒ **真实分歧被静默丢掉**（规则层 20% vs LLM 10% 本该进 A/B 待拍板表）
+            #    ⇒ 「待拍板分歧 0 项」⇒ `make_decision_scenarios` 直接抛错 ⇒ 重建链转红。
+            #    ⇒ 现在回退到 **`llm_conflicts[code].llm_target_pct`**：
+            #       它本来就是**按代码归档**的（不是从散文里猜归属）⇒ 没有误挂风险；
+            #       并把**口径**显式写进产物（**不冒充**「最终裁决原文」）。
+            final_pct = float(conflict["llm_target_pct"])
+            used_conflict_fallback = True
+            final_caliber = ("llm_conflicts（多头/空头表格口径）｜"
+                             "Trader 最终裁决原文未抽到目标权重（数字写在不带代码的句子里）")
         if not isinstance(final, dict) or final_pct is None:
             # 🔴 2026-11-05 10:0x（M-Q 修）：**最终裁决没提这个标的**（或提了但抽不出数字）
             #    ⇒ 旧实现直接 `RuntimeError` ⇒ **整张对照表生成不出来**。
@@ -426,9 +442,10 @@ def identify_divergences(plan: dict) -> tuple[list[dict], list[dict]]:
                     "converted": shares_from_weight(conflict_pct, price, total_assets),
                 },
                 "final_decision": {
-                    "caliber": "llm_final_decision（Trader 最终裁决原文）",
+                    "caliber": final_caliber,
                     "target_pct": rnd(final_pct, 4),
-                    "target_pct_source": final.get("target_pct_source"),
+                    "target_pct_source": (final_caliber if used_conflict_fallback
+                                          else final.get("target_pct_source")),
                     "direction": final.get("direction"),
                     "cap_pct": final.get("cap_pct"),
                     "floor_pct": final.get("floor_pct"),

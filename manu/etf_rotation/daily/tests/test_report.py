@@ -9,7 +9,8 @@
 * 百分比按小数口径渲染（``+3.93%``），金额带千分位（``30,035.57``）；
 * **观察态**（``live_trade=False``）的报告**不许**出现任何下单指令；
 * **实盘态**（``live_trade=True``）的挂单清单**一行都不许退化**；
-* Mode A/B/C 分诊**已下线** ⇒ ``"A"`` / ``"C"`` 必须抛 ``ValueError``（附迁移提示）。
+* 「模式」概念**已彻底下线**（2026-11-10）⇒ ``render_report`` **不许**再收 ``mode`` 参数、
+  结果 dict 里**不许**再有 ``mode`` 键、报告里**不许**再出现「流水线模式」字段。
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ import report  # noqa: E402
 # =============================================================================
 # 合成数据
 # =============================================================================
-def _pipeline_result(live_trade: bool = False) -> dict:
+def _pipeline_result(live_trade: bool = False, ta_screening=None) -> dict:
     """统一流水线 · 完整执行卡（数值取自 2026-11-04 dry 实测口径）。"""
     orders = [
         {
@@ -116,8 +117,7 @@ def _pipeline_result(live_trade: bool = False) -> dict:
             "cash_buffer_min": 200.0, "cash_buffer_max": 300.0,
         },
     }
-    return {
-        "mode": "unified",
+    _result = {
         "live_trade": live_trade,
         "asof": "2026-11-04",
         "execution_date": "2026-11-05",
@@ -147,6 +147,9 @@ def _pipeline_result(live_trade: bool = False) -> dict:
         "execution_lag_days": 1,
         "generated_at": "2026-11-04T16:02:44",
     }
+    if ta_screening is not None:
+        _result["ta_screening"] = ta_screening
+    return _result
 
 
 # =============================================================================
@@ -208,27 +211,33 @@ def test_unified_report_card_missing_does_not_crash():
     assert "nan" not in text
 
 
-def test_unknown_mode_raises():
-    """🔴 2026-11-09：Mode A/B/C 分诊**已下线** ⇒ ``"A"`` / ``"C"`` 与乱填的
-    ``"X"`` 一样是**非法值**；错误文案必须给**迁移提示**（不许写「未知模式」）。"""
-    for bad in ("A", "C", "X"):
-        with pytest.raises(ValueError) as excinfo:
-            report.render_report({"mode": bad})
-        message = str(excinfo.value)
-        assert "未知模式" not in message
-        assert "--live-trade" in message
-        assert "--full" in message
-    # 结果里根本没有 mode ⇒ 同样非法（统一流水线只有一种模式）
-    with pytest.raises(ValueError):
-        report.render_report({})
+def test_mode_concept_is_fully_removed():
+    """🔴 2026-11-10（rm modeC 收口）：「模式」概念**彻底下线** ⇒
+
+    * ``render_report`` **不许**再收 ``mode`` 参数（运行态**只**由 ``live_trade`` 表达）；
+    * 结果 dict 里**不许**再有 ``mode`` 键（多余键一律忽略，但绝不许渲染出来）；
+    * 报告里**不许**再出现「流水线模式」这类模式字段。
+    """
+    import inspect
+
+    sig = inspect.signature(report.render_report)
+    assert "mode" not in sig.parameters, "render_report 不许再有 mode 参数"
+    with pytest.raises(TypeError):
+        report.render_report(_pipeline_result(live_trade=True), mode="B")  # type: ignore[call-arg]
+
+    text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
+    assert "流水线模式" not in text
+    assert "unified" not in text
+
+    # 结果里带 mode 键 ⇒ 不炸、也不渲染（多余键忽略）
+    stale = _pipeline_result(live_trade=True)
+    stale["mode"] = "legacy-mode-value"
+    stale_text = report.render_report(stale, live_trade=True)
+    assert "legacy-mode-value" not in stale_text
+
+    # 非 dict 仍然是类型错误
     with pytest.raises(TypeError):
         report.render_report(None)  # type: ignore[arg-type]
-
-
-def test_legacy_mode_b_alias_is_treated_as_unified():
-    """旧别名 ``"B"`` 兼容 ⇒ 视作 unified（不抛异常）。"""
-    text = report.render_report(_pipeline_result(live_trade=True), mode="B")
-    assert "# ETF 月度调仓决策卡" in text
 
 
 def test_observation_mode_report_marks_order_disabled():
@@ -349,3 +358,60 @@ def test_ranking_basis_reads_score_smoothing_ranking_basis() -> None:
 def test_ranking_basis_missing_is_placeholder_not_invented() -> None:
     """没有平滑段 ⇒ 渲染「—」（**不许编造**口径）。"""
     assert report._ranking_basis({}) == report.PLACEHOLDER
+
+
+# =============================================================================
+# 🔴 2026-11-11（审计缺陷 D）：日报「Beta 避险（TA 权益上限建议）」段
+# =============================================================================
+def _ta_screening(*, reason: str, pct, evidence: str = "") -> dict:
+    """TA 筛选披露夹具（字段名 = `final_rebalance_plan` 真实产出）。"""
+    return {
+        "equity_cap": 0.8,
+        "equity_cap_effective": 0.36 if reason == "accepted" else 0.8,
+        "equity_cap_breach": 0.0,
+        "equity_cap_ta_recommendation": {
+            "pct": pct,
+            "pct_display": None if pct is None else round(pct * 100, 2),
+            "evidence": evidence,
+            "reason": reason,
+            "base_cap": 0.8,
+            "effective_cap": 0.36 if reason == "accepted" else 0.8,
+        },
+        "equity_cap_scale": {"factor": 0.45},
+        "rejected": [],
+        "substituted": [],
+        "orphaned_holdings": [],
+        "held_not_touched": [],
+        "cap_skipped": [],
+        "no_substitute_reason": "",
+    }
+
+
+def test_report_renders_beta_avoidance_section_when_accepted():
+    """TA 建议被采纳 ⇒ 日报必须写清「建议多少 / 生效多少 / 原文依据」。"""
+    scr = _ta_screening(reason="accepted", pct=0.36,
+                        evidence="- 组合层权益由48.02%适度降至约 **36%**")
+    text = report.render_report(_pipeline_result(live_trade=True, ta_screening=scr),
+                                live_trade=True)
+    assert "Beta 避险" in text, text[:4000]
+    assert "36" in text, text[:4000]
+    assert "原文依据" in text, text[:4000]
+    assert "None" not in text, text[:4000]
+
+
+def test_report_renders_beta_avoidance_not_a_target_branch():
+    """🔴 TA 提了权益数字但**不是目标口径** ⇒ 日报必须**显式说明未压降**
+    ⇒ 否则「TA 明明说了 ⇒ 却按 80% 执行」无从追查。"""
+    scr = _ta_screening(reason="not_a_target", pct=None,
+                        evidence="- 组合层权益将回升至 **56%**")
+    text = report.render_report(_pipeline_result(live_trade=True, ta_screening=scr),
+                                live_trade=True)
+    assert "Beta 避险" in text, text[:4000]
+    assert "未压降" in text, text[:4000]
+    assert "None" not in text, text[:4000]
+
+
+def test_report_beta_avoidance_section_is_optional():
+    """没有 TA 建议 ⇒ **不许**凭空渲染这一段（不许编数据）。"""
+    text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
+    assert "Beta 避险" not in text, text[:4000]

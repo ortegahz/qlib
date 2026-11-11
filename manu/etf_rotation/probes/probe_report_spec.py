@@ -172,6 +172,108 @@ def _get(report: dict, path: str, default=None):
     return node
 
 
+def _c1_candidates_verdict(report: dict) -> tuple[bool, str]:
+    """C1：candidates 条数 == **min(params.top_n, 过滤后候选池存活数)**。
+
+    🔴 2026-11-11 实测修（服务器快照 20261111_094103）：
+       `config.ANALYZE_TOP_N` 由 15 提到 **100**，而**过滤后候选池实测只有 21 只**
+       ⇒ 老断言「len(candidates) == params.top_n」在 ``top_n > 池存活数`` 时**恒错**
+       （实测 top_n=100｜实得=21｜`filter_stats.n_candidate_pool`=21）。
+    ⇒ 正确口径 = **min(top_n, 池存活数)**，且池存活数**必须从产物读**
+      （`filter_stats.n_candidate_pool`）⇒ 不许写死 21、不许靠猜、不许「非空即 PASS」。
+    ⇒ 池被抽干（``len < top_n``）**不是缺陷** ⇒ 允许；但池存活数**缺失** ⇒ 判 FAIL
+      （算不出来 ≠ 一致）。
+    """
+    cands = _get(report, "candidates", []) or []
+    top_n = _get(report, "meta.params.top_n")
+    pool_n = _get(report, "filter_stats.n_candidate_pool")
+    n_got = len(cands)
+    if not (isinstance(top_n, int) and not isinstance(top_n, bool) and top_n > 0):
+        return False, f"params.top_n 缺失/非法（{top_n!r}）⇒ 无法判定候选条数"
+    if not (isinstance(pool_n, int) and not isinstance(pool_n, bool) and pool_n >= 0):
+        return False, (
+            f"filter_stats.n_candidate_pool 缺失/非法（{pool_n!r}）"
+            "⇒ 池存活数算不出来 ⇒ 不许拿 top_n 猜（写死/猜都不许）"
+        )
+    expect = min(top_n, pool_n)
+    ok = n_got == expect
+    # 🔴 2026-11-11 措辞修（审计：老措辞把两种形态混成一句「池被抽干」）：
+    #    ① **池 > top_n**（截断形态）⇒ 必须给满 top_n 条 ⇒ 少给就是「**静默截断**」；
+    #    ② **池 ≤ top_n**（抽干形态）⇒ 池里就只有那么多 ⇒ 少给是**合法形态**。
+    #    ⚠️ 老措辞还把解释指向「F2 的 filter_stats.stages 逐道计数」——
+    #       但 **F2 只遍历 `per_net` 三张网**，根本不读 `filter_stats.stages`
+    #       ⇒ 运维被指向一条**查不到该问题**的检查 ⇒ 现在改成指向真正的独立计数
+    #       （`filter_stats.stages[extra_exit_ma].n_out`，见 C1b）。
+    if pool_n > top_n:
+        if n_got < top_n:
+            why = (f"池 {pool_n} > top_n {top_n} ⇒ 必须给满 {top_n} 条，实得 {n_got}"
+                   f" ⇒ **静默截断**（少给 {top_n - n_got} 条）")
+        else:
+            why = f"池 {pool_n} > top_n {top_n} ⇒ 候选清单按 top_n 截断（实得 {n_got} 条，**没少给**）"
+    elif n_got < top_n:
+        why = (f"池 {pool_n} ≤ top_n {top_n} ⇒ 池被抽干（实得 {n_got} < top_n {top_n}）"
+               f" ⇒ **合法形态**（池里就只有 {pool_n} 只）；池子条数请对 "
+               "filter_stats.stages[extra_exit_ma].n_out（见 C1b）")
+    else:
+        why = f"池 {pool_n} ≤ top_n {top_n} ⇒ 候选清单未截断（池全量给出）"
+    return ok, (
+        f"top_n={top_n}｜池存活 n_candidate_pool={pool_n}｜期望 min(top_n, 池)={expect}"
+        f"｜实得={n_got}｜{why}"
+    )
+
+
+def _c1b_pool_count_verdict(report: dict) -> tuple[bool, str]:
+    """C1b：`filter_stats.n_candidate_pool` 必须与**产物里的另一个独立计数**对账。
+
+    🔴 为什么必须有（C1 的盲区，审计实测）：
+       C1 只比 `len(candidates)` 与 `min(top_n, n_candidate_pool)` ⇒ 这**两个数自洽地
+       一起改**就能骗过它（实测形态：top_n=100 / pool=10 / cands=10 ⇒ C1 PASS，
+       而真实池子是 21 只 ⇒ 假绿）。
+    ⇒ 同一份产物里另有两个**独立计数**可以对账：
+       ① `filter_stats.stages[stage=extra_exit_ma].n_out`
+          —— 「附加 · 持仓强制退出（MA60）」这道**过滤道**走完后的**池子条数**
+          （`apply_theme_cap` 只打 `selected` 标记、**不删行** ⇒ 该段 n_out == len(pool)
+          == `n_candidate_pool`；见 `analyze.py::_build_filter_chain`）；
+       ② `etf_scores.n_candidate_pool_total`（池内 ETF 行数）⇒ **存在时**互证。
+    🔴 口径：算不出来 ≠ 一致 ⇒ 必需的段缺失/非法一律判 FAIL（fail-closed）。
+    """
+    pool_n = _get(report, "filter_stats.n_candidate_pool")
+    stages = _get(report, "filter_stats.stages") or []
+    stage_out = None
+    stage_found = False
+    for st in stages:
+        if isinstance(st, dict) and str(st.get("stage") or "") == "extra_exit_ma":
+            stage_out = st.get("n_out")
+            stage_found = True
+            break
+    total = _get(report, "etf_scores.n_candidate_pool_total")
+    problems: list[str] = []
+    if not (isinstance(pool_n, int) and not isinstance(pool_n, bool) and pool_n >= 0):
+        problems.append(f"filter_stats.n_candidate_pool 缺失/非法（{pool_n!r}）")
+    if not stage_found:
+        problems.append("filter_stats.stages 里没有 stage=extra_exit_ma 这一段")
+    elif not (isinstance(stage_out, int) and not isinstance(stage_out, bool) and stage_out >= 0):
+        problems.append(f"filter_stats.stages[extra_exit_ma].n_out 非法（{stage_out!r}）")
+    if total is not None and not (isinstance(total, int) and not isinstance(total, bool)
+                                  and total >= 0):
+        problems.append(f"etf_scores.n_candidate_pool_total 非法（{total!r}）")
+    if not problems:
+        if pool_n != stage_out:
+            problems.append(
+                f"n_candidate_pool={pool_n} ≠ stages[extra_exit_ma].n_out={stage_out}"
+                "（两个独立计数打架 ⇒ 池子条数被自洽篡改过）")
+        if total is not None and pool_n != total:
+            problems.append(
+                f"n_candidate_pool={pool_n} ≠ etf_scores.n_candidate_pool_total={total}")
+    ok = not problems
+    detail = (
+        f"n_candidate_pool={pool_n!r}｜stages[extra_exit_ma].n_out={stage_out!r}"
+        f"｜etf_scores.n_candidate_pool_total={total!r}"
+        + ("｜问题：" + "；".join(problems) if problems else "｜三者一致 ✓")
+        + ("" if total is not None else "｜注：etf_scores.n_candidate_pool_total 缺失 ⇒ 互证项跳过")
+    )
+    return ok, detail
+
 def run_checks(report: dict, calendar: list[str],
                account: dict | None = None) -> list[tuple[str, str, bool, str]]:
     """对报告跑全部规格断言，返回 [(id, 名称, 是否通过, 细节)]。
@@ -362,10 +464,15 @@ def run_checks(report: dict, calendar: list[str],
 
     # ---------- §6 candidates ----------
     cands = _get(report, "candidates", []) or []
-    top_n = params.get("top_n")
-    checker.add("C1", "candidates 数量 == params.top_n（默认 15）",
-                isinstance(top_n, int) and len(cands) == top_n,
-                f"top_n={top_n}｜实得={len(cands)}")
+    # 🔴 2026-11-11：口径改成 min(top_n, 池存活数) ⇒ 池存活数从产物读（不许写死 21）。
+    _c1_ok, _c1_detail = _c1_candidates_verdict(report)
+    checker.add("C1", "candidates 数量 == min(params.top_n, filter_stats.n_candidate_pool)",
+                _c1_ok, _c1_detail)
+    # 🔴 2026-11-11 新增 C1b：堵「n_candidate_pool 与 len(candidates) **自洽篡改**」的假绿
+    _c1b_ok, _c1b_detail = _c1b_pool_count_verdict(report)
+    checker.add("C1b", "filter_stats.n_candidate_pool 与 stages[extra_exit_ma].n_out 对账"
+                       "（etf_scores.n_candidate_pool_total 互证）",
+                _c1b_ok, _c1b_detail)
     bad_c = []
     for row in cands:
         code = row.get("code")
@@ -697,6 +804,50 @@ def main() -> int:
             holdings.append(target)
         target["reject_reason"] = ""
 
+    def _break_pool_vs_candidates(rep: dict) -> None:
+        """把「池存活数 ↔ 候选清单条数」的关系改坏 ⇒ C1 必须 FAIL。
+
+        🔴 反例必须**在两种形态下都咬人**（探针可能跑在截断形态或抽干形态的报告上）：
+          ① 池存活 > top_n（截断形态）⇒ 候选清单必须**给满 top_n** ⇒ 少给一条 = 静默截断；
+          ② 池存活 ≤ top_n（抽干形态）⇒ 候选清单条数 == 池存活数 ⇒ 谎报池数即不自洽。
+        🔴 2026-11-11 修（审计：else 分支在「池 == top_n」形态下**咬不动**）：
+           旧 else 分支把池数改成 `len(cands)+1` ⇒ 若 `len(cands)+1 > top_n`，
+           则 `min(top_n, 池)` 仍是 `top_n` == 实得条数 ⇒ **C1 照样 PASS** ⇒ 负例失效（假红）。
+           ⇒ 现在：`len(cands)+1 > top_n` 时**改成截断 candidates 一条**（池数不动）
+             ⇒ 期望值不变、实得少一条 ⇒ 两种形态都咬。
+        """
+        cands = rep.get("candidates") or []
+        pool = (rep.get("filter_stats") or {}).get("n_candidate_pool")
+        top_n = ((rep.get("meta") or {}).get("params") or {}).get("top_n")
+        if isinstance(pool, int) and isinstance(top_n, int) and pool > top_n and cands:
+            rep["candidates"] = cands[:-1]
+        else:
+            fs = rep.setdefault("filter_stats", {})
+            if isinstance(top_n, int) and len(cands) + 1 > top_n:
+                # 池数改成 len(cands)+1 会 **> top_n** ⇒ min() 仍取 top_n ⇒ 咬不动
+                # ⇒ 改成「截断候选清单一条」（池数不动 ⇒ 期望值不变 ⇒ 少给 = 自相矛盾）
+                rep["candidates"] = cands[:-1] if cands else []
+            else:
+                fs["n_candidate_pool"] = len(cands) + 1
+
+    def _break_pool_count_self_consistent(rep: dict) -> None:
+        """**自洽篡改**池子条数 ⇒ C1 必须仍然 PASS（骗过去了），但 **C1b 必须 FAIL**。
+
+        🔴 这是 C1 的真实攻击面：C1 只比 `len(candidates)` 与 `min(top_n, n_candidate_pool)`
+           ⇒ 两个数**一起**改成自洽值就能骗过它（审计实测形态：top_n=100 / pool=10 / cands=10
+           ⇒ C1 PASS，而真实池子是 21 只 ⇒ 假绿）。
+        ⇒ 负例做法：**少给一条候选** + 把 `n_candidate_pool` 改成与它**自洽**
+           ⇒ C1：`min(top_n, len(cands)) == len(cands)` ⇒ 仍 PASS（确实骗过去了）
+           ⇒ C1b：`n_candidate_pool` 与**独立计数** `stages[extra_exit_ma].n_out` 对不上 ⇒ 必 FAIL。
+        """
+        cands = rep.get("candidates") or []
+        if not cands:
+            raise ValueError("报告里没有 candidates ⇒ 夹具不适用")
+        cands = cands[:-1]
+        rep["candidates"] = cands
+        fs = rep.setdefault("filter_stats", {})
+        fs["n_candidate_pool"] = len(cands)
+
     negative_cases = [
         ("N1", "删掉 meta.hash_seed", "M5",
          lambda r: r["meta"].pop("hash_seed", None)),
@@ -746,8 +897,28 @@ def main() -> int:
         ("N20", "把基准年化改成 15.00%（回归探针被绕过）", "B3",
          lambda r: r["meta"]["backtest_summary"]["benchmark_510300"].__setitem__(
              "annualized_return", 0.15)),
+        # 🔴 2026-11-11（C1 口径改成 min(top_n, 池存活数) 后的配套反证）
+        #    ⚠️ 反例必须**在两种形态下都咬人** ⇒ 用**条件变异**：
+        #      ① 池 > top_n（截断形态）⇒ 少给一条就是「静默截断」⇒ 必须 FAIL；
+        #      ② 池 ≤ top_n（抽干形态）⇒ 声称的池存活数与实际条数不符 ⇒ 必须 FAIL。
+        ("N21", "把「池存活数 ↔ 候选清单」的关系改坏（截断形态少给一条 / 抽干形态谎报池数）", "C1",
+         _break_pool_vs_candidates),
+        ("N22", "删掉 filter_stats.n_candidate_pool（池存活数算不出来）", "C1",
+         lambda r: r["filter_stats"].pop("n_candidate_pool", None)),
+        ("N23", "静默截断候选清单（池没抽干却少给一只）", "C1",
+         lambda r: r.__setitem__("candidates", (r.get("candidates") or [])[:-1])),
+        # 🔴 2026-11-11 新增：审计实测的**自洽篡改**（C1 的真实盲区）
+        #    ⇒ C1 必须**仍 PASS**（证明确实骗过了它）＋ C1b 必须 FAIL（独立计数把它抓住）
+        ("N24", "**自洽篡改**池子条数（n_candidate_pool 与 len(candidates) 一起改）"
+                "⇒ C1 骗得过去、C1b 必须 FAIL", "C1b",
+         _break_pool_count_self_consistent, {"C1": True}),
     ]
-    for case_id, desc, target_id, fn in negative_cases:
+    for case in negative_cases:
+        case_id, desc, target_id, fn = case[:4]
+        #: 可选的**伴随断言**（第 5 个元素）：`{断言 id: 期望判定}`
+        #:   ⇒ 用来证明「这条负例真的是那种攻击面」（例：自洽篡改必须**骗过 C1**，
+        #:     否则就证明不了 C1b 是必需的）。
+        extra = case[4] if len(case) > 4 else {}
         # 🔴 2026-11-04 夜实测修（M-F；reviewer 遗留风险）：
         #    负例用 `next(x for x in rows if …)` 选行 ⇒ 若报告里**没有**匹配行，
         #    `next` 抛 StopIteration（PEP 479 ⇒ RuntimeError）⇒ **探针直接崩掉**，
@@ -761,8 +932,49 @@ def main() -> int:
                          "（探针必须报出来，不许崩、不许静默）")
             continue
         ok = got.get(target_id) is False
-        emit(case_id, f"负例「{desc}」⇒ 断言 {target_id} 必须 FAIL",
-             ok, f"{target_id} 的判定={got.get(target_id)}（期望 False；True ⇒ 断言写死了）")
+        detail = f"{target_id} 的判定={got.get(target_id)}（期望 False；True ⇒ 断言写死了）"
+        if extra:
+            extra_bad = [f"{eid} 的判定={got.get(eid)}（期望 {exp}）"
+                         for eid, exp in extra.items() if got.get(eid) is not exp]
+            if extra_bad:
+                ok = False
+                detail += "｜伴随断言不成立：" + "；".join(extra_bad)
+            else:
+                detail += ("｜伴随断言成立："
+                           + "；".join(f"{eid}={exp}" for eid, exp in extra.items()))
+        emit(case_id, f"负例「{desc}」⇒ 断言 {target_id} 必须 FAIL", ok, detail)
+
+    # ---- 正例（口径自检）：「池被抽干」是**合法**形态 ⇒ 不得误判红 ----
+    # 🔴 2026-11-11：C1 改成 min(top_n, 池存活数) 后，必须证明它**不会**把
+    #    「池被抽干（len(candidates) < top_n）」这种合法形态判红
+    #    ⇒ 用**自造夹具**（成对对照：正例必须 PASS / 负例必须 FAIL）。
+    def _c1_on(mutated: dict) -> tuple[bool, str]:
+        return _c1_candidates_verdict(mutated)
+
+    # 🔴 2026-11-11 修（审计：正例缺异常保护 ⇒ 报告缺字段时探针**崩**而不是报 FAIL）：
+    #    ① 夹具要用到 `meta.params.top_n` / `filter_stats.n_candidate_pool` / `candidates`
+    #       ⇒ 报告缺这些字段时直接下标会 KeyError ⇒ 探针崩掉（与本文件自订规矩不一致）；
+    #    ② 夹具假定报告里有 ≥5 条候选 ⇒ 不足 5 条时「池被抽干」这个形态**构造不出来**。
+    #    ⇒ 现在：try/except 包住 + 先断言 `len(candidates) >= 5`，否则 emit(..., False, "夹具不适用")。
+    _cands_p1 = report.get("candidates") or []
+    if len(_cands_p1) < 5:
+        emit("P1", "正例「池被抽干（池存活 5 < top_n 100，候选给 5 条）」⇒ 断言 C1 必须 PASS",
+             False, f"夹具不适用：报告里只有 {len(_cands_p1)} 条候选（<5）"
+                     "⇒ 构造不出「池被抽干」形态")
+    else:
+        try:
+            _drained = copy.deepcopy(report)
+            _drained["meta"]["params"]["top_n"] = 100
+            _drained["filter_stats"]["n_candidate_pool"] = 5
+            _drained["candidates"] = _cands_p1[:5]
+            _ok, _detail = _c1_on(_drained)
+        except Exception as exc:  # noqa: BLE001 —— 夹具构造失败必须报出来，不许崩
+            emit("P1", "正例「池被抽干（池存活 5 < top_n 100，候选给 5 条）」⇒ 断言 C1 必须 PASS",
+                 False, f"夹具构造/判定失败：{type(exc).__name__}: {exc}"
+                         "（探针必须报出来，不许崩、不许静默）")
+        else:
+            emit("P1", "正例「池被抽干（池存活 5 < top_n 100，候选给 5 条）」⇒ 断言 C1 必须 PASS",
+                 _ok, f"C1 的判定={_ok}（期望 True；False ⇒ 口径把合法形态误判红了）｜{_detail}")
 
     # ---- 负例（源码类）：把 analyze.py 改坏 ⇒ 静态断言必须 FAIL ----
     source_negatives = [

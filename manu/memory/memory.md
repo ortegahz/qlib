@@ -112,11 +112,11 @@
 
 | 项 | 值 |
 |:--|:--|
-| **架构** | qlib 全市场个股打分 S（Alpha158 + CSRankNorm(VWAP标签) + LightGBM，股票池 all=6174）→ **E = W×S**（akshare 腾讯持仓权重 W）→ + ETF 自身动量（20/60/120日）→ 三道过滤网 → 绝对动量 mom120>0 → Top5 等权（单只≤40%）→ 手工清单 |
+| **架构** | qlib 全市场个股打分 S（Alpha158 + CSRankNorm(VWAP标签) + LightGBM，股票池 all=6174）→ **E = W×S**（akshare 腾讯持仓权重 W）→ + ETF 自身动量（20/60/120日）→ 三道过滤网 → 绝对动量 mom120>0 → Top5 等权（单只≤**20%**）→ 手工清单 |
 | **评估窗口** | 2024-01-11 ~ 2026-11-04（**679 天**，所有场景共用）｜基准 510300 年化 **12.11%** |
 | **选定配置** | 月频（`--rebalance-every 2`）× α0.5 × 动量0.5 × 迟滞2；成本 佣金1.5bp + 滑点5bp/边 |
 | **主结果（🔴 现役口径，唯一可引用）** | 年化 **19.4627%**｜超额 **+6.5622%**（相对口径）｜**MDD -32.29%**（基准 -20.15%）｜期末回撤 **-23.47%**（峰值日 2026-06-22 = 2.1181×，谷底 2026-07-30）｜年化单边换手 **16.57×**｜成本拖累 2.92% |
-| **口径（必须随数字引用）** | 聚类 = **族硬分区 + 直接冲突对**（#21 重构后，**不是**并查集传递闭包）｜`prefer-held` = **开**｜e_covered 池｜入场 MA20 / 持仓 MA60｜净值刹车**关** |
+| **口径（必须随数字引用）** | 聚类 = **族硬分区 + 直接冲突对**（#21 重构后，**不是**并查集传递闭包）｜`prefer-held` = **开**｜e_covered 池｜入场 **MA60** / 持仓 MA60｜净值刹车**关** |
 | **历史数字（已作废，勿引用）** | 23.53%/+10.06%/-39.31%（v1，无破位过滤）；**21.4929%/+8.3732%/-28.19%（v2，老并查集口径）** ⇒ 口径变更 ⇒ 基线作废（专题档 §16.1，附逐位复现探针） |
 | **同族「已持有优先」A/B** | 关 = 年化 18.3935% / 超额 +5.6084% / MDD -32.65% / 换手 19.22×；开 = **19.4627% / +6.5622% / -32.29% / 16.57×** ⇒ 全面更优 ⇒ 默认开 |
 | **消融（v1 口径，仅作定性）** | 纯动量(α=0) 超额 **-0.98%**｜纯E(α=1) 超额 **-9.08%** ⇒ **E 是暴露分，必须与动量互补**（α 固定 0.5） |
@@ -375,6 +375,58 @@
   `probe_verify_guards` **15/15**、`verify_artifacts` **24/24**（指纹 35 条与磁盘一致）、
   `probe_mode_c_shadow` / `probe_rolling_increment` / `check_memory_tables` 均 rc=0。
 
+### ⑧ ✅ 第八轮追加：独立审查发现 **2 个 🔴 必须修**（已修 ＋ 复验全绿；**交付件字节未变**）
+> 🔴 **触发**：本轮交付后另起一轮**独立只读审查**（reviewer 子代理，逐条读代码 ＋ 实测复现）
+> ⇒ 核心机制（只许压降 / 向后兼容 / 缩放顺序 / 算术自洽 / 崩溃安全 / 披露字段）**全部验证通过**，
+> 但**抓到 2 个真缺陷**（均可复现）＋ 6 项建议 ⇒ **当轮修完并复验**。
+
+- 🔴 **缺陷 1（真·会亏钱）**：`llm_final.py` 的 `equity_target_pct` 复用了 `_PORTFOLIO_PCT_RE`，
+  而它的动词表末尾是**裸介词** `降|到|至` ⇒ **预测/陈述句**被当成**目标**。
+  **实测复现**：「极端反弹情形下，组合层权益将**回升至** 56%」⇒ `equity_target_pct = 56.0`
+  ⇒ `effective_cap = 0.56` ⇒ **权益从 80% 被静默砍到 56%（24pp 仓位被动转现金）**；
+  同族「**回到** 56%」「**可回到** 56%」一样中招（`_is_conditional` 拦不住：无「若/如果/一旦」）。
+  **修法**：新增**严格目标动词表** `_PORTFOLIO_TARGET_PCT_RE`（成词动作：降至/下调至/调整为/压缩至/
+  压降至/压降到/降到/定为/设为/控制在/限定在/不超过/不高于/上限为/最高）⇒ **裸「到/至」不算目标**；
+  🔴 **反向动词一律不算目标**（「提高到/上调至/回升至/回到」是**加仓或预测** ⇒ **宁可不压降，
+  也不许把「想加仓」读成「要减仓」**）。
+  🔴 **`equity_pct`（宽松口径）一个字都没动**（既有金标不变）⇒ 只影响**规则层真正采信的那个字段**。
+- 🔴 **缺陷 2（交付件自相矛盾）**：`final_rebalance_plan.py` 的「🔴 权益超配（不可消除）」告警
+  用 `equity_cap`（**硬上限**恒 0.8）作比较对象，而 `equity_cap_breach` 是对**生效上限**算的
+  ⇒ TA 压降生效时文案变成「合计已超出权益上限 **80.0%** 达 **44.00%**」
+  ⇒ 读者会读成「权益到 124%」，实际是「权益 80% 超过了本轮生效的 36%」⇒ **数字对、对象错**。
+  **修法**：告警改用 `equity_cap_effective`，硬上限作括号补充（「超出**本轮生效上限** 36.0%
+  （规则层硬上限 80.0%）达 44.00%」）。
+- 🟡 **建议 3（单位护栏）**：`_resolve_ta_equity_cap` 的输入单位是**百分点**，但契约没写、且无条件 `/100`
+  ⇒ 小数形式 `0.36` 会被当成 **0.36%** ⇒ **静默压降 100 倍**（`→ 0.0036`）。
+  **修法**：docstring 写死「输入单位 = 百分点」＋ 护栏 `0 < pct < 1 ⇒ out_of_range`（小数形式**判越界**，不静默压降）。
+- 🟡 **建议 4（披露完整）**：「上限为 / 不超过」这类**最自然的 cap 写法**原先抽不出来（⇒ TA 说了不落地且**无任何提示**）；
+  且 `reason=not_a_target` **不进任何披露** ⇒ 用户看不到「TA 明明建议了 36%，规则层却按 80% 执行」。
+  **修法**：动词表补 `不超过|不高于|上限为|最高`；日报新增 `not_a_target` 分支（「TA 提到的权益数字
+  **不是目标口径** ⇒ 规则层**未压降**（仍按硬上限执行）」）。
+- 🟡 **建议 8（测试缺口）**：审查指出**最关键的一条约束没有钉子** —— 「缩放必须在 TA 筛选之前」
+  （顺延补位者必须拿到**缩放后**的权重）。原有用例里被否决的两例候选池 `selected` 全为 True
+  ⇒ **不存在合格顺延者** ⇒ 把缩放挪到筛选之后**现有用例一条都不会转红**（断言没牙）。
+  **补钉**（`tests/test_ta_equity_cap.py` **+8 条**、`daily/tests/test_report.py` **+3 条**）：
+  ① **顺延补位继承缩放后权重**（3 候选 + 否决 1 只 + TA 36% ⇒ 补位者 **0.18**（不是 0.4）、Σ **= 0.36**）；
+  ② **变异负例**：把缩放挪到筛选之后 ⇒ 补位者**直接消失**（权益会顶到 0.8 > 上限 0.36 ⇒ 被上限闸门挡下）
+  ⇒ **真实后果是「顺延彻底失效」**，断言按真实行为写；③ 预测句 / 反向动词 / 上限类写法 / 边界输入（12 组）
+  / 小数形式判越界；④ 日报「Beta 避险」段 **accepted** 与 **not_a_target** 两分支 + 无建议时不渲染。
+- ✅ **交付件字节未变（关键）**：`regen_snapshot_derived.py` **不带** `--accept-render-change` 的
+  **自验证通过**（重渲 **17547 字符逐字节相等**）⇒ 本轮修复**不影响**已交付快照的任何字节
+  ⇒ sha1 链不断；host 侧 `final_rebalance_plan.json` sha1 `e4182d91` / `report_20261109.md` sha1 `5971f1d0`
+  **修复前后完全一致**（实测复核）。
+- ✅ **复验**：本地 pytest **448 → 458 passed**（+10）；`probe_ta_screening` **34 / 0**；
+  **最终链 v15**（`/tmp/etf_final_chain_20261111o.sh`，**14:02:26 → 14:06:07**，3 分 41 秒）：
+  `FINGERPRINT_RC=0` / **`GATES_H_RC=0`** / 断言 **PASS 694 / FAIL 0** / 失败阶段 **0**；
+  host 验收 **17 PASS / 0 FAIL / 0 SKIP**（退出码 0，**修复后复跑**）。
+- ⚠️ **审查建议中本轮**未**做的 3 项（留给用户拍板，不是缺陷）**：
+  ① **3.5 节行情源与规则层不是同一份**（`build_ta_context` 读 canonical `ETF_PRICES_CSV`，
+  规则层读本轮快照 `etf_prices_effective_{asof}.csv`）⇒ 表里的 `corr120` 可能与规则层实际判据不一致
+  ⇒ 修法＝给 `build()` 加 `prices_path` 参数（**改管线接口**，属新增能力）；
+  ② **7.1 节悬空引用**：重合度数据不可得时 3.5 整节省略，但 7.1 仍让 TA「对照 3.5 节」；
+  ③ **日报把内部枚举印进正文**（`accepted` / `at_or_above_base_cap`）—— **修它会改日报字节 ⇒ 断 sha1 链**
+  ⇒ 本轮**刻意不改**，只登记。
+
 ## 2026-11-09 · qlib provider **单一事实源**（研究链 ↔ 每日链不分叉）＋ Mode C 文档订正
 
 > 触发器：`rules.md §十四.93` 第 ④ 款「交付件变了」＋ **第 ⑦ 款「工程结构变了」**（新增模块 ＋ 新增闸门阶段）
@@ -520,14 +572,14 @@ cd /tmp/pycharm_project_658d3fc4
 | 观测点之间 | **LOCF 阶梯**摊到交易日轴上 | 旧观测点的权重每交易日乘 `(1-α)` |
 | 🔴 窗口单位 | **交易日**（**不是**「打分点」） | 打分栅格**每 10 个交易日一个点**（`REBALANCE_EVERY_N_DAYS=10`）⇒ 把「5 个打分点」当窗口 ＝ 跨 50 个交易日 |
 | 预热历史 | **30 个交易日** | EWMA 收敛 ⇒ 结果与「无限历史」一致 |
-| 单一事实源 | `manu/etf_rotation/config.py` | `ENABLE_SCORE_SMOOTHING=True`｜`SMOOTHING_METHOD="ewma"`｜`SMOOTHING_WINDOW=5`｜`SMOOTHING_ALPHA=0.35`｜`SMOOTHING_HISTORY_SPAN_DAYS=30`；**每日链不另复制一份** |
+| 单一事实源 | `manu/etf_rotation/config.py` | `ENABLE_SCORE_SMOOTHING=True`｜`SMOOTHING_METHOD="ewma"`｜`SMOOTHING_WINDOW=5`｜`SMOOTHING_ALPHA=0.20`｜`SMOOTHING_HISTORY_SPAN_DAYS=30`；**每日链不另复制一份** |
 
 ### ③ 🔴 半衰期：**按实算值披露**，不照抄需求文档措辞
 
-- EWMA 半衰期 = `ln(0.5) / ln(1-α)`；`α=0.35` ⇒ **≈1.609 个交易日**（模块函数 `effective_half_life_days()`）；
-- 🔴 需求文档写的是「**3~5 个交易日**」，那需要 `α≈0.21`（3 日 ⇒ 0.2063｜5 日 ⇒ 0.1294）
-  ⇒ 本工程**按实算值披露**，不把文档措辞当结论；
-- 🔴 报告里单列「平滑半衰期」行，并注明「alpha=0.35 ⇒ 约 1.61 日（**不是**需求文档写的 3~5 日）」。
+- EWMA 半衰期 = `ln(0.5) / ln(1-α)`；`α=0.20` ⇒ **≈3.106 个交易日**（模块函数 `effective_half_life_days()`）；
+- 🔴 **2026-11-11 按架构文档 §二.2 对齐**：`α` 由 `0.35` 改为 **`0.20`**（旧值半衰期 1.609 日 ⇒ 偏离文档的「3~5 个交易日」；
+  新值 3.106 日 ⇒ **正落在文档区间内**）⇒ 报告仍**按实算值披露**，不把文档措辞当结论；
+- 🔴 报告里单列「平滑半衰期」行，并注明「alpha=0.20 ⇒ 约 3.11 日（落在文档要求的 3~5 个交易日内）」。
 
 ### ④ 冷启动 fail-safe（失败即回退，**绝不编数字**）
 
@@ -557,7 +609,7 @@ cd /tmp/pycharm_project_658d3fc4
 - `run_pipeline.sh` 用**同一组** `SMOOTH_ARGS` 透传给分析链与规则层（只给一条链 ⇒ 又分叉）；
 - 输出字段：`raw_score` / `smoothed_score` / `score_stability_5d`（`score_stability` ＝ 平滑窗口内标准差，`ddof=0`）；
   🔴 报告里**原始分永远保留**（`alpha_score` 不改），实际参与排序的是 `alpha_score_used`（平滑分优先、缺值退回原始分）⇒ 口径可对账；
-  报告与 Markdown 显式注明「**排序依据**：EWMA 平滑分（alpha=0.35，窗口 5 交易日）」并列原始分 / 平滑分对照。
+  报告与 Markdown 显式注明「**排序依据**：EWMA 平滑分（alpha=0.20，窗口 5 交易日）」并列原始分 / 平滑分对照。
 
 ### ⑦ 🔴 本轮全量闸门抓到的**真缺陷**（已修）：规则层漏传平滑表 ⇒ 两层选出**不同的票**
 
@@ -1903,7 +1955,7 @@ cd /tmp/pycharm_project_658d3fc4
 - 交付面报告 `<RESULTS_ROOT>/reports/report_20261109.md`；执行卡 `order_enabled=False` ＋ 水印「【观察态 · 挂单禁用 · 非实盘信号】」；
 - 动作：买入 4 只（159207 +4900、512170 +17200、515450 +4100、515650 +5200）、卖出 1 只（512800 −1000）、调仓后现金 423.02 元；
 - 穿透分**时间平滑**已落地（`rules.md §十四.97`）：排序依据 = **EWMA 平滑分（alpha=0.35、窗口 5 交易日）**，报告与 json 同时披露 `raw_score` / `smoothed_score` / `score_stability_5d`；
-  🔴 **口径订正**：alpha=0.35 的**半衰期 = 1.61 个交易日**（**不是**需求文档写的 3~5 日；要 3~5 日半衰期 ⇒ alpha ≈ 0.13~0.21）——报告已显式披露，**默认值仍按需求文档取 0.35**；
+  🔴 **口径订正**：alpha=0.35 的**半衰期 = 1.61 个交易日**（**不是**需求文档写的 3~5 日；要 3~5 日半衰期 ⇒ alpha ≈ 0.13~0.21）——报告已显式披露，**默认值仍按需求文档取 0.35**（🔴 **该默认值已于 2026-11-11 改为 0.20**，见下方 2026-11-11 条目；本行保留 2026-11-10 那轮的历史事实）；
 - 痕迹清零（`rules.md §十六`）：`/tmp` 下 ETF 线 **35** 个临时件 ＋ 共享目录 `siping/runs/` 下 **14** 个 ETF 专属散落目录**已删**；`/mnt/data` 根与 data 目录下**无** `_etf_daily_*`；**别的项目**（`nogmc_*` / `npu20ms_*` / `zongheng_*` 等）**一律未碰**。
 
 ### ⑥ 仍未闭环（明早接手）
@@ -1911,3 +1963,853 @@ cd /tmp/pycharm_project_658d3fc4
 - 🔴 **代码落点切换未落地**（`rules.md §十六` owner 清单）：`daily/fetch_data.py` / `daily/daily_config.py` / `etf_rotation/config.py` / `qlib_provider.py` 仍写旧路径 ⇒ 须由**双 env** 派生；
 - 🔴 **基线重建那一步未复跑**：`_full_20261110b/summary.md` 步骤 1（基线重建含 LLM）rc=1 的**根因就是本次 15/16 假红**（产物与 sha1 已在 14:30 产出）⇒ 修完可复跑确认；
 - 🔴 **canonical 基线未重算**：本轮**刻意不重算**（基线冻结 ＋ 假红不涉数据）——若要刷新，须同源重建后再更新金标。
+
+---
+
+## 2026-11-10 · 「rm modeC」收口：模式概念在**代码 / CLI / 服务器产物**三层彻底清零
+
+> **用户指令**：「删除模式C，统一成模式B」。⇒ 目标 = **单一流水线**（模式 B 那条链），
+> **模式 A/B/C 的分诊概念在工程里不再存在**；观察态 vs 实盘态**只**由 `--live-trade` 表达。
+> 🔴 **功能面 2026-11-09 已统一**（`--mode` 传了就拒、`route()`/`MODE_A`/`MODE_B` 下线并被测试钉住），
+> 本轮做的是**收尾：四类残留**（CLI 参数 / 模块名 / 文案 / 服务器遗留产物）**清零**。
+
+### ① 四类残留与处置
+
+| # | 残留 | 处置 |
+|:--|:--|:--|
+| 1 | CLI 仍留 `--mode` 参数 ＋ 枚举 A/B/C 的迁移提示（`daily/main.py`） | **参数彻底删除**（parser 里不再有）；改成 `main()` 里**解析前**拦 `--mode` ⇒ 退出码 2 ＋ 迁移提示**不再列举任何模式名**（只讲「单一流水线 ＋ `--live-trade` 是唯一副作用开关」） |
+| 2 | `daily/mode_router.py`（内容早已是「日期归一 + 运行目录/日志/草稿路径」，只剩名字带 mode） | **`git mv` 更名 `daily/run_paths.py`**（保留历史）；调用点 `daily/agents_rebalance.py`（import ＋ 3 处）＋ `daily/tests/test_agents_rebalance.py`（import ＋ 断言文案）＋ `daily/__init__.py` 说明同步改 |
+| 3 | 代码/文档里的模式提法 | `final_rebalance_plan.py`（决策 JSON 名字的**历史**注释，改为不带模式名的技术表述）、`manu/docs/snapshot_architecture.md` §9 迁移表（删掉两行「影子推演」行、改为一句说明其能力改由 `--dry-run` / `--live-trade` 承担）、`CMDS.md`（拒绝说明不再列举模式） |
+| 4 | 服务器上的 Mode C 遗留产物 | **全深度扫描后逐个删**：`shadow/`（**329M**）、`shadow_archive/`（**43M**）、`reports/report_20261105_modeA.md` / `report_20261105_modeB.md` / `report_20261105_modeB_failed.md` / `report_20261109_modeC.md`、`reports/shadow_decision.md`、`reports/final_rebalance_plan.md`（影子期副本）、`_gates_modeC*`、`_dryrun_reports/report_20261201_modeB.*`、`daily/modeA_*.out` / `daily/modeB_*.out`、`daily/20261105/mode_a_*.json`、`daily/20261201/report_20261201_modeB.md` ⇒ **复查零命中**（只余清理台账 `_cleanup_modeC_20261110.log`） |
+
+### ② 🔴 **不许动**的安全锁（B 类，逐条复核后**全部保留**）
+
+- `--live-trade` = **唯一**副作用开关（发信 / 下单）；`--dry-run` = 观察态的显式声明（**两者互斥**仍拒）；
+- 执行卡**结构性** `order_enabled=False` ＋ 水印「【观察态 · 挂单禁用 · 非实盘信号】」⇒ 构造性保证，不是 if 判断；
+- `fail-closed` 断言（日历门拿不到日历 ⇒ 报错退出；降级事实必须进交付面）**一字未动**；
+- 🔴 **「统一成模式 B」≠ 「打开实盘」**：默认仍是**观察态**，下单必须显式 `--live-trade`。
+
+### ③ 验收（**实测数字**，2026-11-10 16:35 收口）
+
+| 项 | 实测结果 | 落点 |
+|:--|:--|:--|
+| 服务器 `pytest manu/etf_rotation/daily/tests` | **172 passed**（更名后无 import 断裂；3 条 DeprecationWarning 与本轮无关） | 服务器 `/tmp/pycharm_project_658d3fc4` |
+| 全量闸门复跑（`--skip-repro`） | **断言 PASS 625 / 失败阶段 0 / 最终退出码 0**（27 个阶段 rc=0、跳过 1＝repro）⇒ 与 rm 之前**逐项一致** ⇒ 本轮**没有**削弱任何守卫 | 日志 `_gates_full_20261110e.log`（结果根） |
+| 快照契约探针（关键耦合） | **PASS 37 / FAIL 0**；`S6`（`--mode` 被拒⇒rc2）、`S6b`（stderr 含迁移提示）、`S10f`（变异「`--mode` 改名 ⇒ S6 必须转红」）**三条全绿** ⇒ 拒绝 shim 仍带牙齿 | `probe_snapshot_contract.py` |
+| CLI 拒绝实测 | `--mode <旧取值>` ⇒ **退出码 2** ＋ stderr 迁移提示（只讲「单一流水线 ＋ `--live-trade` 唯一副作用开关」，**不列举任何模式名**） | `daily/main.py::main()` |
+| 指纹表重生成 | **35 条（22 md5 + 13 sha1）路径集不变**，只改值（本轮改值 9 条），写回后逐条复验通过 | `_ms5_md5.txt`（结果根） |
+| 模式标识符残留扫描 | `manu/etf_rotation/`、`manu/docs/`、`manu/tools/`、`CMDS.md` ⇒ **零命中**（剩余 4 处是 `overnight_takeover.md` 里**引用已删除代码标识符**的历史叙述，如 `MODE_A`/`resolve_mode()`） | 本地 `grep -rE "Mode [ABC]\|模式 [ABC]"` |
+| 服务器产物痕迹 | 结果根内 `*mode_c*` / `*modeA*` / `*modeB*` / `*shadow*` **零命中**；`daily/mode_router.py` **已不存在**；`/mnt/data` 根**无** `_etf_daily_*`；repro 临时目录**无残留**；`siping/runs/` 下**别的项目目录未触碰** | 服务器全深度扫描 |
+
+### ④ 本轮改动清单（27 个文件，+146/−138）
+
+- **行为层**：`daily/main.py`（删 `--mode` 参数 ＋ 解析前裸 argv 拒绝）、`daily/report.py`（删 `mode` 参数 / `_resolve_unified_mode` / 报告里的「流水线模式」行）、`daily/agents_rebalance.py`（删结果 dict 的 `mode` 键）、`daily/snapshot.py`（删 manifest 的 `mode` 键）、`daily/run_paths.py`（**`git mv` 自 `mode_router.py`**）、`daily/__init__.py`；
+- **测试层**：`daily/tests/test_report.py`（旧「`mode` 抛 ValueError」契约 ⇒ 新「`render_report` 无 `mode` 参数、结果无 `mode` 键、报告无「流水线模式」字段」契约；**防回潮用例 `test_observation_mode_report_has_no_legacy_mode_c_wording` 原样保留**）、`daily/tests/test_agents_rebalance.py`、`daily/tests/test_full_run_degradation.py`；
+- **文案层**：`daily/README.md`、`daily/run_qlib_score.py`、`daily/snapshot.py` docstring、`final_rebalance_plan.py`、`llm_final.py`、`run_gates.sh`、`manu/docs/snapshot_architecture.md`、`manu/tools/overnight_snapshot_run.sh`、`manu/tools/overnight_takeover.md`、`CMDS.md`；
+- **探针层**：`probes/probe_snapshot_contract.py`（删禁用标记容忍键里的 `shadow_only`）、`probes/probe_llm_parser.py`、`probes/probe_decision_scenarios.py`、`probes/probe_node_reprice.py`、`probes/probe_node_scenarios.py`、`probes/probe_verify_guards.py`（**只改注释标签，不改任何断言**）。
+
+## 2026-11-10 · 🛡 架构评审落地：**留 20% 现金** ＋ **TA 做合规筛选**（否决/顺延）＋ 服务器自治链交接
+
+> 依据：用户贴的架构评审文档（Qlib 负责「算」→ 统计/均线门禁 → **TradingAgents 负责「审」** → 规则引擎负责「锁」）。
+> 用户口径：**① 留 20% 现金；② TradingAgents 要做筛选（重复 / 高度重合 ETF 等）**。
+
+### ① 留 20% 现金（规则层权益上限 80%）
+- **单一事实源**：`config.py` 新增 `CASH_RESERVE_RATIO = 0.20` ＋ 与 `daily/daily_config.py` 同值互锁 `assert`；每日链同值副本 `daily/daily_config.py`。
+- **规则层**：`engine/portfolio.py` 目标权重改为 `w = min((1 - CASH_RESERVE_RATIO) / n, cap)` ⇒ 5 只时**每只 16%**、**现金 20%**（`cash_weight` 仍是残差口径，不外借不加杠杆）；返回值新增 `cash_reserve_ratio` / `equity_budget`。
+- **账户口径**：`account.py` `TARGET_POSITION_WEIGHT = 0.16` / `TARGET_POSITION_AMOUNT = 4_776.0`（向下取整到**元**，沿用旧版 5,970.93→5,970.0 口径）。
+- **执行卡**：`daily/agents_rebalance.py` 生效下限 = `max(CASH_BUFFER_MIN, 总资产 × 20%)` ⇒ 守卫/可行性/post_trade/constraints 全部用**生效下限**；`post_trade` 新增 `cash_reserve_ratio / cash_reserve_required / cash_reserve_ok`。
+- **报告面**：`daily/report.py` 执行摘要新增「现金预留比例 / 现金预留下限 / 现金缓冲达标？（生效下限）」；现金流对账补「实得现金占比 / 现金预留比例 / 现金预留金额」。
+- **闸门**：`probes/probe_plan_arithmetic.py` P12 改为「Σ目标权重 + 计划现金权重 = 1 且计划现金 ≥ 预留比例」，新增 **P12b**「权益权重 ≤ 1 − 预留比例」（比例从常量读，不写死）。
+- 🔴 **旧口径存量产物跑新断言必红**（5×20%、现金 0%）——这是**预期**，新闸门只对新产物成立。
+
+### ② TradingAgents 做筛选（合规陪审团：**一票否决 + 规则层顺延**）
+- **新增** `manu/etf_rotation/overlap.py`：`compute_overlap_pairs(...)` —— 复用 `engine/filters.py` 的 `_weight_overlap` / `build_theme_and_conflicts` 与 `engine/features.py` 的 `compute_corr_matrix`；`rule_conflict`＝规则层现役口径（重叠 ≥ 0.90 或 corr120 ≥ 0.95），`screen_flag`＝**更宽口径预警**（重叠 ≥ 0.50 或 corr120 ≥ 0.80 或同族，阈值是模块顶部可配常量）。
+- **否决解析**：`llm_final.py` 新增 `extract_rejections(text)` —— 6 位代码 ＋ 同句/同行 ±40 字内须有剔除动词；护栏排除「否决权 / 一票否决 / 不否决 / 未否决 / 无需否决 / 若否决 / 如否决」与范围级表述。既有 `extract_final_decision` **一字未改**。
+- **上下文**：`llm/build_ta_context.py` 第 3 节候选表加「主题」列；新增 **3.5 节「候选池重合度筛查（一票否决依据）」**（🔴 2026-11-11 第八轮：标题与引言已由「供审查参考」改为**明确授权**）；数据不可得则整节省略并在 meta 记 `overlap_screen_available / reason`；表内空格写「—」，**不出现 None**。
+- **顺延**：`final_rebalance_plan.py` 新增 `apply_ta_screening(...)`（**在建 plans 之前**调用，`build_plan` 内 `:1924`）：剔除被否决 action（**不是权重 0**；若本来在持仓里 ⇒ 只剔除候选、**持仓不动**）→ 按 `final_score` 降序顺延补位；顺延合格条件＝原本未入选 / 未破位 / 未被 MA 过滤 / 覆盖达标 / 与已入选集合不构成规则层冲突对 / **与已入选集合及被否决者均不同族** / 该族未达 `MAX_PER_THEME`；顺延者**沿用被否决者权重**（保持等权）；找不到合格者 ⇒ **不强行补**，只记 `no_substitute_reason`。
+- **产物**：计划件新增 `plan["ta_screening"]`（`rejected / substituted / no_substitute_reason / screen_pairs / held_not_touched / screen_note`）；计划 MD 新增「**二之四**、🛡️ TA 合规筛选（否决 / 顺延）」章节（🔴 原拟「二之二」与既有「二之二 最终裁决」**撞号**，已改「二之四」，同步改 `probe_ta_screening.py` 断言；`probe_llm_parser.py` A20⑪ 只要求「二之二 / 二之三」在场，不受影响）。
+- **贯通**：`daily/agents_rebalance.py` `run_pipeline()` 返回值新增 `ta_screening` ⇒ `daily/report.py` 新增「🛡 TA 合规筛选（否决 / 顺延）」小节（否决名单 / 顺延记录 / 无补位理由 / 高重合预警对；**只透传不反推**）。
+- **闸门**：新增 `probes/probe_ta_screening.py`（**26 断言**：重合度 / 否决解析 / 顺延合格条件 / **2 条变异反证** / 端到端 `build_plan`＋`render_markdown`），已注册为 `run_gates.sh` **第 25 个阶段**；新增单测 `tests/test_llm_rejections.py`（8 用例，含变异负例）。
+
+### ③ 验收数字（2026-11-10 17:3x）
+- 本地 pytest：`manu/etf_rotation/tests` ＋ `manu/etf_rotation/daily/tests` ⇒ **263 passed**。
+- 服务器 pytest（ql env，同一 263）⇒ **263 passed**（原先 1 红是 `test_probe_lookahead_snapshot_target` 的**环境相关既有缺陷**：服务器有真实数据集 ⇒ 探针在「个股分数方差为 0」处抛 `ValueError`，而测试只捕获 `FileNotFoundError` ⇒ 已把 except 扩成 `(FileNotFoundError, ValueError, KeyError)`，两端都绿）。
+- 探针 `probe_ta_screening.py` ⇒ 本地 **PASS 26 / FAIL 0**、服务器 **PASS 26 / FAIL 0**。
+- 同步：`manu/etf_rotation`（115 文件）/ `manu/docs`（2）/ `manu/tools`（14）/ `manu/memory`（10）/ `CMDS.md`（1）**两侧 md5 一致**。
+
+### ④ 🔴 服务器自治链（host 18:00 关机 ⇒ 链在服务器上跑完）
+- 脚本：`/tmp/etf_chain_20261110.sh`（`setsid nohup` 脱离，**不受 host 关机影响**）。
+- 步骤：**STEP0** ak 环境刷 ETF 行情（`ak/bin/python manu/etf_rotation/data/fetch_etf_prices.py --resume`）→ **STEP1** 主跑 `daily/main.py --asof 2026-11-09 --no-refresh-scores --no-update-qlib-bin`（**不传 `--skip-llm`** ⇒ TA 真跑；**不传 `--live-trade`** ⇒ 观察态）→ **STEP2** 兜底（STEP1 失败则 `--skip-fetch` ＋ 重算 S 层）→ **STEP3** 全量闸门 `run_gates.sh --skip-repro --log .../\_gates_full_20261110g.log`。
+- 🔴 **已知坑（第一轮 `_pipeline_20261110h` 失败）**：`--skip-fetch` 时 `load_effective_prices(run_root=本轮快照目录)` 只合并 canonical（最新 2026-11-04）⇒ **行情不覆盖 asof 2026-11-09 ⇒ 阶段失败**。根因：**增量日文件 `etf_prices_daily_20261109.csv` 只存在于 14:30 那轮快照目录**，新快照目录里没有 ⇒ 必须先刷行情（或跑取数阶段）。
+- **明早验收三看**：`① cat /mnt/data/siping/runs/etf_rotation_results/_chain_20261110.log`（STEP0/1/2/3 的 RC）；② `ls -lt .../snapshots/` 找**新快照目录**（看 `etf_analysis_report.json` 的 `candidates` 是否含 `raw_score / smoothed_score / score_stability_5d`，`rebalance_recommendation.json` 的 `cash_weight` 是否 **≈ 0.20**）；③ `tail -40 .../_gates_full_20261110g.stdout`（目标：**失败阶段 0 / rc=0**；断言总数会因新探针 26 条与 P12b 上升，**以「失败 0 / rc=0」为准**）。
+- 交付件落点（铁律十六）：`/mnt/data/siping/runs/etf_rotation_results/{reports,snapshots}/`；host 副本 `etf_rotation_20261110/server_runs_etf_rotation/`。
+
+### ⑤ 待用户拍板（**2026-11-11 已全部落地**，见下方 2026-11-11 条目；此处保留原始「未改」记录作证据）
+- **EWMA alpha**：文档写 `0.20`（半衰期 3.11 日），原现役 `0.35`（半衰期 1.61 日）⇒ 原**未改** ⇒ **2026-11-11 已改为 `0.20`**。
+- **单标的上限**：文档写「20% 上限」，原现役 `cap = 0.40`；留 20% 现金后每只 16% ⇒ 原 cap 不 binding ⇒ **2026-11-11 已提为 `config.MAX_SINGLE_WEIGHT = 0.20`**。
+- **现金缓冲**：文档「≥ 400 元」曾被「留 20% 现金」覆盖 ⇒ 原为 `max(200 元, 20% × 总资产)` ⇒ **2026-11-11 绝对下限改为 400 元**（本账户下比例下限仍压倒它 ⇒ 判定结果不变）。
+
+### ⑥ 真机验证（服务器快照 `20261110_174111`，17:44 产物）
+- **留 20% 现金 = 真机生效**：`etf_analysis_report.json → recommendation.cash_weight = 0.2`；5 只目标权重**全部 = 0.16**（159207 高股息 / 512170 医疗 / 512800 银行 / 515450 红利低波50 / 515650 消费50）⇒ 5×16% + 20% 现金 = 100%。
+- **TA 重合度筛查 = 真机生效**：`ta_context_meta.json → overlap_screen_available = True`；`ta_research_context.md` 同时含「**3.5 候选池重合度筛查**」章节与候选表「**主题**」列。
+- 🔴 **小缺口（明早可补）**：`recommendation` 节点里 `cash_reserve_ratio` / `equity_budget` 两个新键**未透传**（值在 `engine/portfolio.py` 返回值与执行卡 `post_trade/constraints` 里都有，只差 `analyze.py` 往报告 JSON 转发）⇒ 交付面报告**能显示**「现金预留比例 20%」，但分析 JSON 里查不到 ⇒ 若要齐全，明早补 `analyze.py` 的转发即可。
+
+## 2026-11-11 · 🔴 真机实跑暴露的**两个阻塞缺陷**修复（否决解析过度误判 ＋ 孤儿持仓市值蒸发）＋ 服务器自治重跑
+
+> 背景：2026-11-10 17:41 的服务器实跑（asof 2026-11-09）把**闸门 8 个阶段**打成红
+> （verify_artifacts / probe_llm_parser / probe_verify_guards / probe_plan_arithmetic /
+> probe_node_basis / probe_run_lock / probe_llm_stage_repro / probe_decision_scenarios），
+> 断言 631 PASS / **8 个失败阶段** / rc=1。**根因不是新功能本身，而是两个真缺陷**。
+
+### ① 🔴 阻塞缺陷 1：否决解析把「TA 要买 / 要减」的标的误判成否决
+- **实测**：真实决策件 `snapshots/20261110_174111/tradingagents_decision.md` 里，TA 明确
+  「买入 `515450` 8% / 买入 `515650` 6% / **减持** `512800` 但不清仓」，
+  而 `extract_rejections` 把 **515450 / 515650 / 512800 / 511990 / 563020 / 159207 / 512170**
+  **全判成否决** ⇒ 计划里 5 席几乎被清空 ⇒ 下游 8 个探针连环转红。
+- **根因**：① 切句只按 `。；\n` ⇒ `当前不买；条件买入` 被切碎（"条件买入"丢失）；
+  ② 同文件已有的 `_is_conditional` **没被复用**；③ 表格行没按「整行」判定；
+  ④ 反向语义护栏是**整句级**（同句真否决被吞）；⑤ 词表缺「回避 / 0仓观察」等真实用语；
+  ⑥ 名称抽取抽出 `'0%'` / `'未持有'` 这类垃圾。
+- **修法**（`llm_final.py`，`extract_rejections` 重写；`extract_final_decision` **一字未改**）：
+  表格行**整行**判定 ｜ 复用 `_is_conditional` ｜ **买入意图豁免**（条件买入 / 目标权重 > 0%）
+  ｜ **子句级**反向护栏 ｜ 词表补齐 ｜ 「减持但不清仓」不算否决 ｜ 名称卫生（取不到就空）。
+- **复核补丁（我亲自发现）**：夹具头部说明文字「…**不得**被判成否决」因「不得」与「否决」**隔字**
+  ⇒ 旧护栏失效 ⇒ **误伤 3 只** ⇒ 加正则 `否定词 + ≤16 字 + 否决类动词`（`_REJECT_NEGATION_RE`），
+  并把夹具头部改成**不含代码**（说明文字不得污染解析）＋ 新增「整文件解析 == 正文解析」断言。
+- **验收**：真实决策件与夹具**判定完全一致**：13 条否决、`515450/515650/512800` **零误伤**、
+  名称列**无垃圾**；`tests/test_llm_rejections.py` **48 → 53 例**（含 4 个变异负例）。
+
+### ② 🔴 阻塞缺陷 2：被否决且**在持仓里**的标的，市值在口径里凭空消失
+- **实测**：被否决且在持仓的 action 被**整条剔除** ⇒ 那一行从计划里消失 ⇒
+  「计划权益 40%」而真实落地权益 49.1% ⇒ **权益被低估** ⇒ `probe_plan_arithmetic` 的
+  「权益 ≤ 1−现金预留比例」闸门拿偏小的数判 ⇒ **闸门可被绕过**。
+- **修法**（`final_rebalance_plan.py`）：**孤儿持仓**（被否决 ∩ 在持仓）保留成一行「维持」
+  （目标权重 = **当前权重**、目标股数 = 当前股数 ⇒ delta=0 ⇒ **不进挂单**）⇒ 市值**仍计入权益口径**
+  ⇒ 恒等式自洽；**顺延补位要过「权益合计 ≤ 1−0.2」闸**，过不了 ⇒ **不补位**（写 `no_substitute_reason`
+  / `cap_skipped`）；账户在该标的上当前权重已超席位预算（TA 不许卖）⇒ 权益必然超配 ⇒
+  如实披露 `equity_cap_breach` + `plan["warnings"]`（**不粉饰**）。
+- **配套**：覆盖闸门改用 `coverage` vs 既有常量 `C.MIN_E_COVERAGE`（**`coverage_ok` 是死代码**）；
+  顺延池改用 `config.ANALYZE_TOP_N = 100`（**每日链 / run_pipeline.sh / run_gates.sh 三处同口径**）；
+  被否决代码在「二之二 LLM 最终裁决」表里**单列一行**（规则层目标 0% + 注「TA 一票否决」）。
+
+### ③ 交付面与闸门的口径同步（我亲自改）
+- `daily/report.py`：🛡 小节补「孤儿持仓」「权益上限 / 顺延因超限跳过 / 权益超配额」。
+- `verify_artifacts.py`：「规则层与交付层入选同源」改为 **TA 感知**
+  （期望集合 = 规则层 − 被否决 + 顺延 + 孤儿维持）⇒ 一次**正确的** TA 否决不再被误判成缺陷。
+- `run_gates.sh` / `run_pipeline.sh`：analyze 调用统一传 `--top-n $ANALYZE_TOP_N`
+  （**单一事实源 = `config.ANALYZE_TOP_N`**）⇒ repro 段与每日链**同口径**。
+- `HANDOFF_20261105.md`：章节号纠正（「二之四」）、顺延合格条件补齐（`above_ma60` / 与被否决者不同族）、
+  覆盖口径纠正、新增「2026-11-11 审计后的加严与修法」6 条。
+
+### ④ 验收数字（2026-11-11 09:1x）
+- 本地 pytest：`manu/etf_rotation/tests` ＋ `manu/etf_rotation/daily/tests` ⇒ **308 passed**（263 → 308）。
+- 探针 `probe_ta_screening.py` ⇒ **PASS 26 / FAIL 0**（探针文件本轮**未改**）。
+- 合成夹具（Coder 2 的 `/tmp/tafix/ta_floor_fixture.py`）⇒ **35/35**；变异自检 5 组**全部被检出**。
+- 同步：`manu/etf_rotation` **116 文件** / `manu/docs` 2 / `manu/tools` 14 / `manu/memory` 10 / `CMDS.md` 1
+  **两侧 md5 一致**。
+
+### ⑤ 服务器自治链（`/tmp/etf_chain_20261111.sh`，09:17 启动）
+`STEP A` 复用既有 TA 决策件快跑（`--skip-llm`）→ `GATES A` → `STEP B` **全新 TA 决策（真跑 LLM）**
+→ `GATES B` → `STEP C` 指纹表重生成。
+**明早验收**：`cat /mnt/data/siping/runs/etf_rotation_results/_chain_20261111.log`（各步 RC）＋
+`_gates_20261111{a,b}.stdout` 末尾的「失败阶段数 / 最终退出码」（目标 **0 / rc=0**）。
+
+---
+
+## 2026-11-11 · 真机跑批第二轮：一票否决**作用域**修复 + 审计轮（5 缺陷）
+
+### ① 🔴 根因：一票否决把**分析师观点**当成了**最终裁决**
+- **现象**：`--skip-llm` 快跑（asof=2026-11-09）里，规则层入选 5 只 = `512800/515450/515650/159207/512170`，
+  但 `ta_screening.rejected` 判出 **16 只**（真实只有 **13 只**）⇒ 多出的 3 只是
+  **`515450` / `515650` / `512800`** —— 正是 TA 最终裁决里明确「**买** 8%」「**买** 6%」「**减**至 10%」的那 3 只。
+- **根因**：`final_rebalance_plan._decision_text()` 把决策 JSON 的 **7 个段落**
+  （研究经理 / **多头** / **空头** / **激进派** / 保守派 / 中立派 / 最终交易决定）拼成一段文本，
+  `llm_final.extract_rejections` 扫**全文** ⇒ 把**观点**当**否决**：
+  - `investment_debate.bear_history`（**空头**）含「暂不买入 `515450`、`515650`」⇒ 误伤 2 只；
+  - `risk_debate.aggressive_history`（**激进派**）含「清仓512800，等于放弃…」⇒ 误伤 1 只。
+- **为什么探针是绿的**：夹具 `tests/fixtures/ta_decision_real_20261110.md` 是**节选**（9.9KB），
+  **不含**分析师观点原文 ⇒ 夹具与真实件**口径失真** ⇒ 「真机红、探针绿」。
+- **修法**（`llm_final.py`）：新增 `AUTHORITY_SECTIONS` ＝ 5 段**权威裁决**
+  （研究经理 / 辩论裁决 / 风险裁决 / Trader 交易计划 / 最终交易决定）＋
+  `extract_authority_rejections()`（只喂权威段落；`.json` 缺失时兜底走 `.md`，
+  且按 **markdown 标准章节语义**保留 `### 辩论裁决` / `### 风险裁决` / 基准调仓表 / 最终调仓方向表）。
+  `final_rebalance_plan.py` 调用点改为它。**`extract_rejections` / `extract_final_decision` 本体一字未改。**
+- **实测**：真实决策件 ⇒ 权威提取**恰好 13 只**、**零误伤**（JSON 与 `.md` 兜底两条路径一致）。
+
+### ② 🔴 `--skip-llm` 复用底座会**静默丢**决策件（同一轮暴露）
+- **现象**：跑批交付件写「**本轮无 TA 否决**」、🛡 合规筛选整节失效，**且不报错**。
+- **根因**：`daily/agents_rebalance.py` 的复用只取「**最新一份**快照」⇒ 若那份是**被中断的不完整快照**
+  （没有 `tradingagents_decision.json`）⇒ 复制不到任何决策件 ⇒ 本轮静默变成「无 TA 意见」。
+- **修法**：`daily/snapshot.py` 新增 `latest_snapshot_with_file(root, filename, exclude=, asof=)`
+  （按目录名**从新到旧**找**第一个真的有该文件**的快照；`asof` 语义不变）⇒ 调用点改用它。
+
+### ③ 审计轮（独立 reviewer 抓出）共 6 处，本轮全修
+| # | 缺陷 | 修法 | 严重度 |
+|:--|:--|:--|:--|
+| 1 | `reprice_node_day.py` 节点日重算**丢 `ta_rejected` 标记** ⇒ 执行卡对被否决标的生成**卖出挂单**（`--live-trade` 下会被当真） | 与 `final_rebalance_plan._is_ta_hold` **同口径**：目标股数＝当前股数、delta=0、动作「维持」，并**透传** `ta_rejected`/`held_not_touched`（默认路径产物**逐字节不变**） | **阻断** |
+| 2 | 表格行目标权重列被漏看（动作词落在理由格时）⇒ **买行被误否** | 改取「代码格之后、理由列之前的**第一个**百分比」 | 高 |
+| 3 | 子句级代码继承跨过「持有语义」子句 ⇒ `512800 保留本仓，其余不考虑。` 误伤 | 前子句带保留/持有/维持语义 ⇒ **不继承** | 高 |
+| 4 | 词表缺口 | 补「拒绝」「不予考虑」（真否决）；护栏补「不排除」；「不买也不卖」判为维持 | 中 |
+| 5 | `.md` 兜底与 `.json` 口径不一致（漏掉 `### 辩论裁决`/`### 风险裁决`） | 改按 markdown 标准章节语义切块 | 高 |
+| 6 | 孤儿维持行**缺价**时市值蒸发（`price is None` 分支排在 `ta_rejected` 之前） | `ta_rejected` 分支提到缺价判断**之前** | 中 |
+
+### ④ 新增的钉子（防止同类回归）
+- 新探针 **`probes/probe_ta_veto_scope.py`**（**闸门第 26 阶段**，`run_gates.sh` 已接线）⇒ **PASS 10 / FAIL 0**：
+  权威提取恰好 13 只 / 零误伤 / **观点段落确实会命中保护组**（证明护栏 load-bearing，不是硬编码名单）/
+  `.md` 兜底同口径 / **变异反证 + 正反对照** / Fail-safe（决策件缺失或损坏 ⇒ 返回空、不抛异常）。
+- 新夹具 **`tests/fixtures/ta_decision_real_20261110.json`**（真实决策件**高保真裁剪版**，88KB，
+  保留全部 10 个语义段落 ⇒ 与真实件**同口径**）。
+- 新测试 **`tests/test_ta_veto_and_reprice.py`** ⇒ **11 passed**（含节点日重算 TA 维持、表格权重列、
+  子句继承、词表、md/JSON 口径一致）。
+- 本地 pytest ⇒ **319 passed**（308 → 319）。
+
+### ⑤ 闸门进展（同一轮实测）
+- 修复前：**失败阶段 8**；修复后（链 C 之前的一次跑批）：**失败阶段 6**
+  （`probe_report_spec` / `probe_llm_parser` / `probe_plan_arithmetic` / `probe_run_lock`
+  / `probe_llm_stage_repro` / `probe_decision_scenarios`）。
+  🔴 其中 `probe_llm_parser`（A1 official 真实决策可解析）与 `verify_artifacts` 的红灯，
+  **根因都是 ②（决策件没被复用）** ⇒ 修 ② 后应自愈。
+- 剩余待收口：`probe_report_spec` C1（top_n 口径）、`probe_plan_arithmetic` P13（留现金后口径过期）、
+  `probe_run_lock` A1/A2/A6（**陈旧锁**：`daily/main.py` 的 `_RunLock` **不记 PID** ⇒
+  进程被 kill 后锁**永久残留** ⇒ 后续跑批全被误拦）、`probe_decision_scenarios` P8
+  （生产基线需用 `rebuild_baseline.sh` 在服务器重建）。
+
+## 2026-11-11 · 真机跑批第三轮：ZERO 方向语义 + 三件套缺件根因 + 锁治理 + L20 金标换值（闸门 8 红 → 0）
+
+### ① 🔴 根因 A：**ZERO 方向（卖/清仓/不买…）的「条件性上限 %」被当成目标权重**
+- **症状**：真机交付件自带守卫 `verify_artifacts._check_llm_direction_semantics` 报
+  「冲突[515450]·bear 方向『不买』⇒ 目标权重必须 0%，实为 **8.0%**」（515650 同理 6.0%）。
+- **根因**：空头真实表行 `| 515450 | 未持有 | 不买/观察 | 若必须配置权益，**条件性上限8%**，绝非16% |`
+  ⇒ 目标列里的「条件性上限」被当成**目标权重** ⇒ 方向「不买」配目标 8% ⇒ 语义矛盾。
+- **修法**（`final_rebalance_plan.py::_llm_target_views`）：`_force_zero = direction in _ZERO_DIR_WORDS`
+  ⇒ **`target_pct` 直接置 0.0**，且**所有**取数路径（表头目标列 / 方向列下一格 / 目标锚定 /
+  金额→百分比折算）一律跳过（它们都以 `target_pct is None` 为前提 ⇒ 天然被挡住）。
+  🔴 旧代码里**注释本就写着**这个意图，只是**实现只挡住了「金额折算」一条路径**。
+- **实测**（真实决策件 + 真实账户；asof=2026-11-09 快照 `20261111_094103`）：本轮**共 4 行**归零 ——
+  `515450` bear **8.0 → 0.0**、`515650` bear **6.0 → 0.0**、
+  **`563020` bull `20.0 → 0.0`**、**`563020` bear `20.0 → 0.0`**
+  （`563020` 两行方向同为「不买」⇒ **一并归零**）。
+  🔴 **逐行比对口径**（可复算）：该决策件 `_llm_target_views` 共 **41** 条视图，
+  **仅上列 4 条**的 `target_pct` 变化；其余 **37** 条数值未变
+  （如 `515450` research/bull/final **8/16/5**、`515650` **6/16/2**）。
+
+### ② 🔴 根因 B：`--skip-llm` 复用底座 ⇒ **上下文三件套缺件** ⇒ sha1 链永远验不了
+- **症状**：`verify_artifacts` 的「LLM 意见未过期 / 新鲜度可校验 / sha1 链新鲜」三条同时红，
+  原因写的是「上下文三件套**缺件** `['ta_context_meta.json','ta_research_context.md']`」。
+- **根因**：`daily/agents_rebalance.py` 的复用分支**只复制 `tradingagents_decision.json`**，
+  不带 `ta_research_context.md` / `ta_context_meta.json` ⇒ `final_rebalance_plan._llm_staleness`
+  与 `verify_artifacts._check_sha1_chain` 都**只读决策件所在目录** ⇒ 永远缺件。
+- **判据（重要，别误改）**：**真跑 LLM（STEP B）时三件套同代同目录 ⇒ 链天然闭合**；
+  `--skip-llm` 复用的底座是**旧代**（底座上下文是 15 只候选那一代，本轮 21 只）
+  ⇒ 判「无法校验/已过期」是**正确语义**，**不许**为了刷绿而放宽。
+  ⇒ 真机跑批的 sha1 链红灯**只在 skip-llm 复用模式出现**，真跑模式自愈。
+
+### ③ 🔴 潜伏缺陷 C：「维持」行**缺执行说明** ⇒ `probe_execution_date` P9 必红
+- **症状**：`probe_execution_date` 的 **P9** 要求**每一条** action 的 `execution_note` 同时写
+  「信号日」与「执行日」；旧实现里「维持」行（被 TA 一票否决但**仍在持仓**）在
+  `execution_note` **赋值之前**就 `continue` 了 ⇒ 计划缺执行说明 ⇒ P9 必红。
+- **为何长期没炸**：本轮「维持」行数 = **0**（TA 只否决了未持仓候选）⇒ 缺陷**潜伏**，
+  直到某轮 TA 否决了**持仓**才会炸在交付闸门上（跑批时不出声 ⇒ 极难排查）。
+- **修法**：日期口径**提到分支之前**算好；「维持」行走**专用文案**
+  （写明「既不建仓也不卖出」+ 目标股数＝当前股数 + 信号日/执行日），
+  **不污染**「跌破 MA60 ⇒ 强制退出」这类卖出文案（缺陷 A 的修法不受影响）。
+- **钉子**：新测试 **`tests/test_ta_hold_execution_note.py`（3 条）**——用**真实 `build_plan` 路径**
+  + 合成夹具（账户持有 512800、TA 权威段否决它）复现「维持」行，断言
+  ① `action=维持`/`ta_rejected=True`/`delta=0` ② `execution_note` 含信号日+执行日
+  ③ 送进**真实闸门** `probe_execution_date.evaluate` ⇒ P9 必须 PASS；
+  另附**反证**（抹掉执行说明 ⇒ P9 必须 FAIL ⇒ 证明闸门有牙）。
+  🔴 **变异验证**：把生产代码还原成旧行为 ⇒ **2 条测试转红**；恢复 ⇒ **3 条全绿**。
+
+### ④ 闸门 4 处口径过期（本轮逐个修）
+| 闸门 | 过期原因 | 修法 |
+|:--|:--|:--|
+| `probe_report_spec` **C1** | 断言 `len(candidates)==top_n`，但 `top_n=100` 时池只有 21 只 ⇒ **恒错** | 改 `len(cands)==min(top_n, filter_stats.n_candidate_pool)` + 3 条变异反证（N21 池>top_n / N22 删池数字段 / N23 静默截断） |
+| `probe_plan_arithmetic` **P13** | 2026-11-10「留 20% 现金」把 P12/P12b 改成新口径，**唯独 P13 漏改** | 归现金 = **计划现金权重**（未分配 + 席位缺口）⇒ 分解式断言；旧口径产物（权益100%/现金0%）仍 PASS |
+| `probe_run_lock` **A1/A2/A6** | 管道内跑 asof=2026-11-03 的流水线 ⇒ 撞上**过期金标** ⇒ 退出码 1 | 见 ⑤（L20 金标换值）＋ 锁治理 |
+| `probe_decision_scenarios` **P8** | 生产基线是旧代 ⇒ 漂移 | `rebuild_baseline.sh --asof 2026-11-03 --label 20261105` 重建 |
+
+### ⑤ 🔴 L20 金标换值（第三版）+ **归因已重做**（**不是**报告算错）
+- **实测金标**（asof=2026-11-03，`lookahead_audit.flip_test.same_theme_closest_by_gap` 第一名）：
+  `512800 ↔ 512820`，`final_gap` **0.024434 → 0.024412**、`swap_threshold_realistic` **0.177043（未变）**、
+  `margin_realistic` **−0.152609 → −0.152631**（恒等式 `margin = gap − thr` 成立；5 条按 |gap| 升序）。
+- 🔴 **2026-11-11 复核：旧记的「换值根因」两条因果链都被证伪 ⇒ 归因重做**
+  （对照两次实跑产物：OLD `generated_at` **2026-11-10T10:11** ↔ NEW **2026-11-11T10:52**，asof 均为 2026-11-03）：
+  - ❌ **「留 20% 现金」不是根因**：`account_target_position_weight` 0.2 → 0.16 只进
+    `engine/portfolio.py` 的 `equity_budget`（**目标权重**）与披露；
+    `final_score = w_alpha·z_alpha + w_mom·z_mom` **与目标权重无关** ⇒ 改它**动不了分差**。
+  - ❌ **`ANALYZE_TOP_N` 15 → 100 也不是根因**：它只切**报告切片**（`candidates`）与
+    `la_codes → la_bounds`（前视审计输入集），**不碰** `chain["pool"]`、**不碰** `final_score`
+    ⇒ 只能改「考察哪几对」，**改不了任何一对的分差**；且本轮 `filter_stats.n_candidate_pool`
+    **两次都是 15** ⇒ 连切片都没变。
+  - ✅ **真因已定位＝价格 / 交易日历输入刷新 ⇒ 动量侧变化**：两次产物**唯一变了的输入**是
+    `etf_prices`（mtime 2026-11-04T20:03 → 2026-11-10T17:41、max_date 2026-11-04 → 2026-11-10）
+    与 `qlib_calendar`（2026-11-03 → 2026-11-09）；`stock_scores`/`stock_prices`/
+    **`etf_holdings`（W 成分快照）**/`etf_universe`/`account_snapshot` 的 mtime 与 size **逐位未变**。
+    逐只对得上：`e_score`/`smoothed_score`/`z_alpha` **逐位未变**（⇒ **E 侧与平滑观测集没变**），
+    而 `momentum_score` 全池微移（`516310` **1.6934904 → 1.6934020**、`512820` 1.6813011 → 1.6812132、
+    `512800` 1.6623109 → 1.6622238；`515450` 1.4807838 → **1.4878570**，其 `mom20/60/120`
+    **原始窗口本身**也变了）⇒ **`z_mom` 变 ⇒ `final_score` 变 ⇒ 5 条 gap 全部移动**
+    （0.024434 / 0.062584 / 0.065616 / −0.262260 / −0.564080
+    → **0.024412 / 0.062542 / 0.065580 / −0.275613 / −0.577386**，**不止第一条**）
+    ⇒ 而 `swap_threshold_realistic` 只依赖**原始 E**（池内截面 σ_E）+ **W 成分快照** + **个股分数**
+    （对应输入 `etf_holdings` / `stock_scores` / `stock_prices` **逐位未变**）
+    ⇒ **5 条阈值逐位不变**（0.177043 / 0.175633 / 0.17195 / 0.283913 / 0.316192）。
+  - ⚠️ **仍未闭环的一小步**：为何只有 `515450` 等少数 ETF 的**原始动量窗口**变了
+    （缺失行情被补齐 or 交易日历轴变动）没单独留证 ⇒ 下次实跑须记录每只候选的
+    `alpha_score_used` / `z_alpha` / `momentum_score_trend_adj` ＋ **W 快照日期** ＋ 平滑观测日列表。
+  - 🔴 **连带发现（待修，本轮未改）**：`probes/probe_lookahead.py` 注释里 2026-11-11 那段的
+    「第 2~5 条」数值（0.062584 / 0.065616 / 0.262260 / 0.564080）**仍是旧值**（复制自上一版未更新）
+    ⇒ 实测新值应为 0.062542 / 0.065580 / 0.275613 / 0.577386。
+- ℹ️ **同期确实改过的口径（但与分差无因果）**：「留 20% 现金」⇒ 权益上限 0.8、
+  席位 **5×20% → 5×16%**（**席位数不变**，`account.TARGET_POSITIONS=5`、
+  `config.TARGET_N_HOLDINGS=5` **都没动**）；`config.ANALYZE_TOP_N` **15 → 100**（顺延池要看见第 16 名以后）。
+- ⚠️ **重测触发条件（改对）**：**任何会改到池内 `final_score` 的输入刷新**
+  （ETF 价格 / 交易日历 / W 成分快照 / 平滑观测集 / 个股分数）⇒ 金标必须重测；
+  **不是**现金预留比例、**也不是** `ANALYZE_TOP_N`（这两条都不参与打分）。
+  ⇒ 按该文件自己的规矩「口径变了就重新实测金标」换值，**旧值保留在注释里作证据**。
+- ⚠️ **顺序铁律**：金标换值**必须先于** `rebuild_baseline.sh` —— 否则基线重建时
+  `run_pipeline.sh` 第 12 步（`probe_lookahead`）会拿**新报告**撞**旧金标** ⇒ 重建 die。
+  反之，换值后**基线未重建**前，`probe_lookahead`（基线变体，断言 canonical 根目录那份）会红
+  ⇒ 中间态的红是**预期**的，必须以「基线重建完成后的那一轮闸门」为准。
+
+### ⑥ 每日链 `_RunLock` 锁治理（陈旧锁不再永久误拦）
+- **口径修正**：`fcntl.flock` 由内核托管 ⇒ **进程一死锁就释放**，残留锁文件**本身**不会挡住跑批；
+  真缺陷是「锁文件**不自证身份**」⇒ 查不出是谁在跑、也判不出是不是陈旧 ⇒ 运维只能盲目 `rm`。
+- **修法**：锁文件内容从「一行裸时间戳」改成 JSON（`pid/host/started_at/start_ticks/script/state`）；
+  `__enter__` 拿到内核锁后读旧记录：`dead`（同机且 `/proc/<pid>/stat` starttime 对不上 ⇒ PID 复用也算死）
+  ⇒ WARNING「清理了陈旧锁」并接管；`alive` ⇒ **拒**；**跨机记录 ⇒ 拒**（本机验不了 ⇒ 宁可误拦）。
+- **红线不变**：「谁能跑」**只由内核 flock 决定**；锁记录只能「加拦截」，**永远不能「放行」**
+  ⇒ 孤儿持锁 / 活人持锁 / 记录说已死但内核锁被占 三种情形**仍被拒**。
+- **新增闸门 A7/A8/A9**（陈旧锁接管 / 活锁被拒 / 记录不可推翻内核）⇒ 探针 6 项 → **9 项**。
+
+### ⑦ 本轮闸门进展（同一轮实测，逐步收口）
+- 修复前：**失败阶段 8** → GATES A（`--skip-llm` 复用）：**失败阶段 5**（8 → 5）。
+  剩余 5 个里 **3 个是 skip-llm 模式的「预期红」**（三件套缺件 ⇒ `verify_artifacts` /
+  `probe_verify_guards` / `probe_llm_stage_repro`，真跑 LLM 后自愈），
+  **1 个是 P8**（基线重建修），**1 个是 `probe_run_lock` A1/A2/A6**（撞 L20 金标 ⇒ 金标换值 + 基线重建后修）。
+- **本地 pytest**：319 → **324 passed**（新增 `test_ta_hold_execution_note.py` 3 条）。
+- **同步**：`manu/etf_rotation` **121 个文件两侧 md5 完全一致**。
+
+### ⑧ 「架构评审文档」两条要求的**现状核对**（2026-11-11 实测证据）
+- **留 20% 现金** ✅：`config.CASH_RESERVE_RATIO=0.20`（每日链 `daily_config` 与研究链 `config`
+  **双份事实源 + assert 互校**）⇒ 权益上限 0.8；实测快照 `20261111_100106`：
+  计划现金权重 **0.20**、实际落地权益 **79.32%**、实际落地现金 **21.13%**、期末现金 **6,345.37 元**
+  （总资产 30,035.57）⇒ **5 席 × 16% = 80%**，且 `ta_screening.equity_cap_breach = 0.0`。
+- **TA 做筛选（重复/高度重合 ETF）** ✅ **三层同时在位**：
+  ① **规则层硬拦**：`overlap.py` 单一实现 —— 成分重叠 ≥ **0.90** 或 120 日相关性 ≥ **0.95** 的**冲突对不共存**；
+  ② **TA 上下文喂表**：`build_ta_context.py` 用**更宽**的口径（重叠 ≥ **0.50** / 相关性 ≥ **0.80**）
+     生成「候选池重合度筛查表」交给 TA ⇒ TA 有**更早**的预警视野；
+  ③ **顺延补位查重**：`apply_ta_screening` 顺延时**跳过同族**（`_SKIP_SAME_THEME_ON_SUBSTITUTE`）
+     **且跳过规则层冲突对**（`_SKIP_CONFLICT_ON_SUBSTITUTE`），两个开关都有**变异负例**钉死。
+  🔴 **真机实证**：本轮 TA 决策件明写「**563020 存在 E 口径冲突，而且与 515450 高度相关**，不应配置」
+  ⇒ **TA 确实在做重合筛选**，且否决权真的生效（13 只否决 + 顺延 `512010←159207`、`516620←512170`）。
+
+### ⑨ 仍待用户拍板（本轮**刻意未改**，会整体改变排序与基线）
+- **EWMA α**：文档 0.20 vs 现役 **0.35**（用户早前明确要求 α=0.35 ⇒ 现役保持 0.35）。
+- **单只上限**：文档「单标的 20%」 vs 现役 `engine/portfolio.py` **40%**（留现金后 5×16% ⇒ 实际不 binding）。
+- **≥400 元现金缓冲**：已被「留 20% 现金」覆盖（现为 `max(200, 总资产×20%)`）。
+
+
+## 2026-11-11 · 真机跑批第四/五轮：🔴 **TA 一票否决「误伤」真缺陷** ＋ 规则层现金口径漏记 ＋ 产物级闸门换版（权威层级）
+
+### ① 🔴 真缺陷 1：**TA 明确要买的标的被当成一票否决**（散文否决归属错位）
+- **事故实录**（交付件快照 `20261111_100742`）：`ta_screening.rejected` =
+  `['515450','512170','563020','159207']`，而**同一份** `tradingagents_decision.md`
+  第 47 行明写 `| 买 | 515450 | 红利低波50ETF南方 | 16% | …`、第 78/191 行写
+  「515450 **买**（16%…）」⇒ **TA 要的红利低波 515450 被剔除** ⇒ 5 席被顺延成
+  `512800/515650/512890/516620/512010` ⇒ **交付件自相矛盾**。
+  另：`512800`（明写「保留 512800 的 16% 进攻核心」）同样被误伤。
+- **根因三处**（全在 `llm_final.py` 的散文否决归属 `llm_final._prose_hits`）：
+  ① **比较/工具引用被当成裁决对象**——「与 515450 相关性 0.917」「红利敞口只用 515450 表达足够，**不建仓**」
+     ⇒ 旧口径把「不建仓」挂到**比较对象** 515450 头上
+     ⇒ 修法：`_MD_REF_COMPARE_RE` / `_MD_REF_TOOL_RE` + `_reference_codes()`
+     ⇒ 引用代码**不作否决主体**，且**不跨子句继承**；
+  ② **反向语义护栏词表不全**——「降低无效权益，**而不是放弃**有效权益：保留 512800…」⇒
+     否定护栏的**尾动词表**缺「放弃」⇒ 512800 被误伤
+     ⇒ 修法：尾动词表补 `放弃/回避/暂缓/拒绝/不配置/不予配置/不参与/不纳入`；
+  ③ **弱否决动词跨子句继承**——「此时清仓等于**放弃**唯一有效趋势暴露」⇒
+     「放弃」是**弱**动词，且代码 515450 是从上一子句**继承**来的 ⇒ 不该判否决
+     ⇒ 修法：新增 `_REJECT_VERBS_WEAK`（放弃/回避/暂缓/拒绝/不予考虑/…）
+     ⇒ **弱动词 + 跨子句继承的代码不判否决**。
+- **钉子**：`tests/test_ta_veto_misjudge.py`（8 条，自带今日 md 原文节选）
+  ⇒ 515450 / 512800 **不得**进否决名单；512170 / 563020 / 159207 **必须**仍被否决；
+  另含 **3 条变异负例**（关掉引用护栏 / 否定护栏尾动词 / 弱动词表 ⇒ 误伤立刻复现）
+  ⇒ 证明三道护栏**都是承重的**。
+  ⚠️ 变异点踩过的坑：以为要去掉「而不是/而非」，实际**无效**——「而不是」本身含「不是」，
+  「不是」早已在否定词闭集里 ⇒ 真正承重的是**尾动词表里的「放弃」**。
+
+### ② 🔴 真缺陷 2：规则层交付件**漏记**自己算好的现金口径（B1 验收项，**不是脚本口径过期**）
+- **查证结论**：`engine/portfolio.py` 的 `build_portfolio()` **已经算好**
+  `cash_weight` / `cash_reserve_ratio`（= `config.CASH_RESERVE_RATIO`）/ `equity_budget`
+  （= `1 - CASH_RESERVE_RATIO`）并放进返回的 `result`；`analyze.py` 把它们写进了
+  `etf_analysis_report.json` 的 `recommendation` 节点；
+  🔴 **但 `recommend.py` 落盘时只漏了这三个** ⇒ 同一层两件交付物**自相矛盾**
+  ⇒ 验收脚本 `accept_20261111.py` 的 B1（从规则层自己的交付件核对「留 20% 现金」）判红。
+- **修法**：把**引擎自己算出来的值**补进 `rebalance_recommendation.json`
+  （不是外部常量、不是反推、**更没有**为了让脚本变绿而放松断言）。
+- **钉子**：`tests/test_recommend_cash_fields.py`（3 条）—— 三字段在位且 == 配置口径、
+  `equity_budget + cash_reserve_ratio == 1`、**变异负例**（引擎给错值 ⇒ 断言必须真的报红）。
+
+### ③ 🔴 产物级闸门「零误伤」换版：**按权威层级比**，不按「有没有出现过买侧证据」比
+- **新增**：`probes/probe_verify_guards.py` 的 `G-TA1`（已挂在 `run_gates.sh` 第 3 阶段 +
+  `run_pipeline.sh` 第 13 步 ⇒ **每次跑链自动执行**）——交付件 `ta_screening.rejected`
+  里**不得出现**同一份交付件里 TA 明确要买的标的。
+- **换版原因（实测踩到的）**：初版判据把**真否决**也判红了 ⇒
+  今日交付件 `20261111_121218` 的 `159207` 被误报——
+  研究经理**提案表**说「买 159207 4%」，**Trader 交易计划**说「不建议保留 4% 象征仓」
+  ⇒ **Trader 覆盖了研究经理的提案** ⇒ **159207 是真否决**
+  （「一票否决 + 顺延」正是这么设计的：把 159207 顺延成 512010）。
+  ⇒ 判据必须是：**买侧证据的权威层级 ≥ 否决的权威层级** 才算误伤。
+- **层级闭集**：观点 `0` < 研究经理 `10` < 辩论/风险裁决 `20` < Trader `30` < 最终交易决定 `40`；
+  认不出来的章节 ⇒ `0` ⇒ **最保守**（任何买侧证据都算矛盾）。
+- **钉子**：`tests/test_probe_ta_reject_authority_rank.py`（9 条）—— 低层买侧证据不推翻高层否决、
+  同层自相矛盾必判红、更高层买侧证据必判红、观点层买侧不算、出处认不出来按最保守、
+  **变异负例**（把否决出处从 Trader 层改成研究经理层 ⇒ 159207 立刻变误伤）、
+  以及**真实交付件回归**（修好后 `20261111_121218` 必须 PASS；修之前 `20261111_100742`
+  必须仍然抓到 515450 ⇒ **不许被调松**）。
+
+### ④ 本轮交付件（服务器快照 `20261111_121218`，asof=2026-11-09，**观察态 · 挂单禁用**）
+- **重跑方式**：`daily/main.py --asof 2026-11-09 --no-refresh-scores --no-update-qlib-bin --skip-llm`
+  ⇒ **复用** `20261111_100742` 的决策 json（`--render-only` 重渲 md）⇒
+  **决策 md / json 字节完全一致**（md sha1 `04c13eed…`、json sha1 `e77af2a4…`）、
+  `stock_scores.csv` 也逐位一致 ⇒ **只有解析层与计划层变了**。
+- **结果**：`ta_screening.rejected` = `['512170','563020','159207']`（**515450 已归位**）⇒
+  5 席 = `512800 卖出(0.16) / 515450 买入(0.16) / 515650 买入(0.16) / 512010 买入(0.16) / 516620 买入(0.16)`；
+  `Σtarget_weight = 0.80`、计划现金权重 `0.20`、实际落地现金占比 `21.13%`、期末现金 `6,345.37 元`。
+- **验收**（host 侧 `accept_20261111.py`）⇒ **PASS 17 / FAIL 0 / SKIP 0**
+  （上一轮是 15 PASS / 2 FAIL：A2 误伤、B1 现金口径缺失 ⇒ 本轮**双双转 PASS**）。
+
+### ⑤ 本轮验收数字（实测）
+- **本地 pytest**：`manu/etf_rotation` ⇒ **383 passed**（350 基线 + 33 新增）。
+- **服务器 pytest**：`381 passed / 2 skipped`（跳过的是需要 host 路径的真实交付件回归）。
+- **最终链 v9**（`/tmp/etf_final_chain_20261111i.sh`，12:21:16 起，12:25:53 结束）：
+  `BASELINE_RC=0`、`FINGERPRINT_RC=0`、🔴 **`GATES_H_RC=1` ⇒ 失败阶段数 3**
+  （`verify_artifacts=1`、`probe_verify_guards=1`、`probe_llm_stage_repro=1`）；
+  闸门断言对象**自动指向最新「完整」快照** `20261111_121218`
+  ⇒ 但那是 `--skip-llm` 建的 ⇒ **缺 LLM 三件套** ⇒ 链**结构上**过不了
+  ⇒ ⚠️ **不是代码回归**（根因见 ⑦ 的 D-2）⇒ 修法是**选对断言对象**，**不是**放宽判据。
+  （🔴 本条此前误写「GATES_RC=0 ⇒ 失败阶段数 0」，与同节 ⑦ 的实测**自相矛盾** ⇒ 以日志为准，已订正。）
+- **同步**：改动文件**两侧 md5 逐个一致**（`sync_to_server.sh` 自带双侧比对）。
+
+### ⑥ 已知既有问题（本轮**未修**，留给下一轮）
+- ⚠️ `probes/probe_run_lock.sh` 的 **A5** 依赖「孤儿 `sleep 8` 持有 `.pipeline.lock` 的 8 秒窗口」
+  ⇒ **时序脆弱**（机器慢时可能窗口不够）⇒ 需另开加固任务（改成「持锁者自己上报 pid + 轮询确认」）。
+- ⚠️ `run_gates.sh` 第 181-182 行与 `run_pipeline.sh:368` 的**失败文案**仍写「守卫已失效（守卫坏了）」，
+  而 `G-TA1` 变红其实指**交付件有误伤** ⇒ 文案待改（不影响判据）。
+
+### ⑦ 🔴 本轮实跑**新撞到**的三个潜伏缺陷（已定位，前两个**未修**，第三个已修）
+- 🔴 **D-1「内容指纹」其实**不是**内容指纹**：`report_fingerprint.report_content_sha1_from_file`
+  把 `meta.generated_at` 与 `current_holdings_diagnosis.snapshot_path` **算进去了**
+  ⇒ 实测：同一份报告重生成后（只差这两个字段）内容指纹从 `6708b0b8…` 变成 `6c1d4d20…`
+  ⇒ **快照一旦重生成，sha1 链第一环就永远对不上**
+  ⇒ ⚠️ **不能直接修**（会级联）：改了指纹算法 ⇒ `ta_context_meta.report_content_sha1` 变
+  ⇒ context md 变 ⇒ `decision.meta.context_sha1` 变 ⇒ **决策件必须真跑 LLM 重新生成**
+  ⇒ ⇒ 结论：**只有「真跑 LLM」那条路能让 sha1 链闭合**；`--skip-llm` 复用**结构上就闭不上**。
+- 🔴 **D-2「最新完整快照」的「完整」判据太松**：`run_gates.sh` 只看
+  `snapshot_manifest.json + etf_analysis_report.json + etf_analysis_report.md`
+  ⇒ **`--skip-llm` 建的快照也会被选中**当闸门断言对象
+  ⇒ 而 `probe_llm_stage_repro` 硬要求 `ta_research_context.md`（缺失即 `FileNotFoundError` **崩**）
+  ⇒ `verify_artifacts` 的三件套断言（LLM 意见未过期 / 新鲜度可校验 / sha1 链新鲜）**必然 FAIL**
+  ⇒ 实测链 v9：`失败阶段数 3`（`verify_artifacts=1`、`probe_verify_guards=1`、`probe_llm_stage_repro=1`）
+  ⇒ **这不是新代码的回归**，是「skip-llm 快照**结构上**过不了链」的既有语义
+  ⇒ ⚠️ **判据不许为刷绿而放宽**（三件套缺件 ⇒ 链**无法校验** ⇒ 判 FAIL 是**正确语义**）。
+- ✅ **D-3 已修**：`probe_verify_guards` 的 scratch 目录原落在 `snapshots/` 里
+  ⇒ ① 崩了留残留；② 更糟：残留目录里**也有** manifest + 报告两份文件
+  ⇒ `run_gates.sh` 的「最新完整快照」扫描会把它**选中当交付件根**
+  （`_` 的 ASCII 比数字大 ⇒ 倒序排序时排第一）⇒ 闸门断言对象被指到临时目录
+  ⇒ 修法：scratch 统一放到**结果根**下（快照根的上一级）。
+  同时修：N8 负例直接 `read_text()` 读 `ta_context_meta.json` ⇒ skip-llm 快照没这文件 ⇒ **崩**
+  ⇒ 改成「存在才备份」（**断言本身不变**：链必须判 FAIL）。
+
+## 2026-11-11 · 真机跑批第六/七轮：🔴 真 LLM 决策件落地 ＋ **5 个真缺陷**（否决误伤 / 闸门假绿 / 部分卖出当清仓 / A19② 假红 / A20⑥ 假红）＋ **派生件确定性重生成**新工具
+
+### ① ✅ 真 LLM 跑批（**不重掷骰子**的那一次已落地）
+- **时间线**：`12:28:25` 启动 → `12:47:04` 结束（**19 分钟**），`REGEN_LLM_RC=0`；决策 json `status=ok` / `signal=Sell` / `elapsed=922.6s`。
+- **交付快照**：服务器 `/mnt/data/siping/runs/etf_rotation_results/snapshots/20261111_122825/`；
+  host 镜像 `/media/manu/1TB-Volume/workspace/etf_rotation_20261110/server_runs_etf_rotation/snapshots/20261111_122825/`。
+- **sha1 链闭合**：`ctx_meta.report_md_sha1=2fff72ee…` == 报告 md sha1；`ctx_meta.report_content_sha1=e7083a2b…`；
+  `decision.meta.context_sha1=cc0c2ed4…` == 上下文 md sha1；三件套（`ta_research_context.md` / `ta_context_meta.json` / `tradingagents_decision.{md,json}`）齐全。
+
+### ② 🔴 5 个真缺陷（本轮挖出并全部修掉，**判据不放宽**）
+| 编号 | 缺陷 | 根因 | 修法 | 钉子 |
+|:--|:--|:--|:--|:--|
+| A | **否决误伤**：TA 明写「买 515450 / 512170」却被判一票否决 ⇒ 5 席变成 `512800/515650/512890/516620/512010` | `llm_final._prose_hits` 子句只按「，；」切、**不切顿号「、」** ⇒ 末尾的「不买」反向污染前面的标的 | `llm_final.py` 新增 `_ITEM_SPLIT_RE` / `_ITEM_ACTION_WORDS` / `_item_spans` / `_own_action` / `_item_scope_hits`（R1 同项内 / R2 头作用域 / R3 尾作用域）+ `_MD_REF_METRIC_RE` | `tests/test_llm_final_list_item_scope.py`（17 例） |
+| B | **G-TA1 闸门假绿**：真实交付件里 515450 明明在「最终交易决定」(rank 40) 被买，闸门却判「无买侧证据 ⇒ 零误伤」 | `probe_verify_guards._md_row_ranks` 只看**最内层**标题（丢掉祖先「六、最终交易决定」rank 40）；`_md_directions` 只读**表格行**，看不见权威段落的列表行 | 改**标题栈继承** ＋ 新增 `_md_list_directions`（只认层级 ≥10 段落的列表行） | `tests/test_probe_ta_reject_evidence_scope.py`（12 例） |
+| C | **A20⑥ 部分卖出被当清仓**：交付件「最终裁决」写 512800 卖/0%，而动作表写「卖 3,600 份、留 12% 核心仓」⇒ 自相矛盾 | 裸「卖出」规则④**先命中**：`最终决策是：卖出（Sell）512800，但属于减仓而非清仓式看空` | `llm_final.py` 新增 `_PARTIAL_SELL_MARKERS` / `_PARTIAL_SELL_NAMED_TAIL` / `_sentence_partial_sell_codes()`，给「裸卖出」加**句级**护栏 | `tests/test_llm_final_partial_sell.py` |
+| D | **A19② 假红**：判据要求「**完全相同**的代码集合在 ≥2 个表格块里重复」，而今天这份 md 的 5 个含代码块集合**两两不同**（11/7/4/7/3 个代码），但交集充分（多头表 ⊇ 空头表） | 旧判据把「多头表/空头表代码集合必须一模一样」当成隐含假设 ⇒ LLM 每轮把多空写成不同标的子集就误红 | 换成**成对**判据（共享代码数 ≥2 **且** ≥ 较小集合的一半，向上取整）；判据③ 的「并集」改成「**成对块**的并集」 | `tests/test_probe_llm_parser_table_invariant.py`（7 例，含 N-A19①~⑤ 五条变异负例） |
+| E | **A20⑥ 探针侧假红**：探针把 512800 判成**零方向（清仓）** ⇒ 报「原文写明零方向，但计划目标=12.0（必须 0.0）」⇒ **探针误杀** | 子句切分在「，」处把**句尾限定语**切掉了（`卖出（Sell）512800` ‖ `但属于减仓而非清仓式看空`）⇒ 子句级规则永远看不见「减仓」 | `probe_llm_parser.py` 新增 `_md_sentence_partial_sell_codes()`（**句级**部分卖出护栏，与解析器同源但泛指时更保守：句内只有一只代码才泛指） | `tests/test_probe_llm_parser_partial_sell_guard.py`（6 例，含变异反证） |
+
+- ⚠️ **D 的负例口径变更（唯一一处）**：N-A19④ 原写成「每张表**注入 1 个**唯一代码」⇒ 注入后 5 块**仍然两两重叠**（最终表是枢纽表）⇒ 在**新**判据下它拦不住任何东西（负例空跑）
+  ⇒ 改成「每张表换成**自己独有的**代码」（集合两两不相交）⇒ 这才是新判据口径下的「没有成对的表」⇒ 负例**仍然咬人**。
+  ⇒ **新判据不比旧判据更强**（覆盖面更宽 ⇒ 更容易 PASS）—— 换版的目的是**消除实测假红**，同时保住「整表被切掉 ⇒ 没有成对表 ⇒ FAIL」这条牙。
+- 🔴 **A19② 判据换版的事实依据**：同链 A19④（md == 用现版 `_tail` 从决策 json 重渲 ⇒ 逐字节相等）**PASS**、且多头表/空头表**都在** ⇒ 这份 md **没有**被腰斩/切表 ⇒ 旧判据**假红**确凿。
+
+### ③ 🔴 方法论新发现：**整链重跑不可字节复现** ⇒ 派生层必须「就地确定性重生成」
+- **实测**：同一份 `stock_scores.csv`（sha1 `433a78fd…` 逐位相同）＋ 同一份 `etf_prices_effective_20261109.csv`（sha1 `426b9774…` 逐位相同），
+  但 `20261111_100742` 与 `20261111_122825` 两轮的报告 **`report_content_sha1` 不同**（`6708b0b8…` vs `e7083a2b…`）、`recommendation_sha1` 也不同。
+  ⇒ **根因**：5 日 EWMA 平滑的**历史依赖**会随「快照目录数」变化 ⇒ 同一份底座也会排出不同的规则层结论。
+  ⇒ **结论**：**不能重跑分析层**（重跑 ⇒ 报告变 ⇒ `ta_context_meta.report_content_sha1` 变 ⇒ 上下文 md 变 ⇒ `decision.meta.context_sha1` 断链 ⇒ 闸门必红）。
+- ✅ **新工具 `manu/tools/regen_snapshot_derived.py`**：**分析层字节一律不动**，只重生成**派生层**（纯函数，可复算）：
+  ① `final_rebalance_plan.py`（报告 + 决策 md + 行情 + 池 + 账户 ⇒ 调仓计划）
+  → ② `reprice_node_day.py`（计划 + 行情 + 账户 ⇒ 节点日重算）
+  → ③ `build_execution_card`（节点 + 计划 + 账户 ⇒ 执行卡）
+  → ④ `daily/report.py`（⇒ 交付面报告 `report_20261109.md`）
+  → ⑤ `daily/snapshot.py`（⇒ manifest 的 `artifacts` 指纹按目录重算）。
+- 🔴 **自验证 fail-closed**：动手前先用**旧产物**重渲一遍交付面报告 ⇒ 必须与盘上那份**逐字节相等**（实测 18116 字符相等）⇒ 不等 ⇒ **立即中止、不落任何盘**（宁可不动，也不落一份不可信的交付件）。
+- 🔴 **缺陷件留档**：重生成前的旧派生件已备份到 `/mnt/data/siping/runs/etf_rotation_results/_defect_backup_20261111/`（含 `INDEX.json` 记 sha1）⇒ host 侧同步一份（只读证据，**不是**交付件）。
+
+### ④ 本轮交付件（快照 `20261111_122825`，asof=2026-11-09，**观察态 · 挂单禁用**）
+- **TA 合规筛选**：`ta_screening.rejected` = `['159207','563020','511990']`（**515450 / 512170 已归位**，不再被误伤）⇒ 顺延补位**只剩 1 条**：`516620 ← 159207`。
+- **5 席**（`Σtarget_weight = 0.800000`）：`512170 买入 0.16`（+13,800 股）｜`512800 卖出 0.16`（−2,300 股）｜`515450 买入 0.16`（+3,200 股）｜`515650 买入 0.16`（+4,200 股）｜`516620 买入 0.16`（+4,800 股）。
+- **现金口径**：`invested_weight_planned = 0.8`、`target_cash_weight = 0.20`、`target_cash_amount = 6,007.11 元`、`equity_cap = 0.8`、**`equity_cap_breach = 0.0`**；实际落地权益 **79.29%**、期末现金 **6,353.77 元**（缺口 0.00）。
+- **512800 的方向**：`llm_final_decision.targets["512800"]` = `direction='减'` / `target_pct=12.0` / `shares_sell=3600`（**部分卖出，不是清仓**）⇒ 缺陷 C 的修法生效。
+- **验收**（host 侧 `accept_20261111.py`）⇒ **PASS 17 / FAIL 0 / SKIP 0**（A2 保护集 `515450/515650/512800` 均不在否决名单；B1 现金口径 0.2/0.8；B3 `Σtarget_weight = 0.8`；E1b `ranking_basis = 'EWMA 平滑分（alpha=0.35，窗口 5 交易日）'`）。
+
+### ⑤ 本轮验收数字（实测）
+- **本地 pytest**：`manu/etf_rotation/tests` + `manu/etf_rotation/daily/tests` ⇒ **431 passed**（425 基线 + 本轮 6 条）。
+- **最终链 v12**（`/tmp/etf_final_chain_20261111l.sh`，13:17:04 起，13:21:32 结束，**4 分 28 秒**）：
+  `BASELINE_RC=0`、`FINGERPRINT_RC=0`、🔴 **`GATES_H_RC=0` ⇒ 失败阶段数 0**（不适用 0 / 跳过 0 / 断言 PASS **686** 行 / 最终退出码 0）。
+- **链 v11**（13:07:53 起）曾红 1 个阶段（`probe_llm_parser` 的 A20⑥）⇒ 根因是缺陷 E（**探针侧**假红）⇒ 修完探针后链 v12 全绿。
+- **服务器清理**（铁律）：删 **36 项**本任务痕迹（`/tmp/etf_*`、`/tmp/kill_etf_chain.sh`、`_work/{_etf_daily_20261109,_plan_rebuild_20261111,_plan_rebuild2_20261111}`、`_probe_*` scratch）；
+  **保留** `/mnt/data/siping/runs/etf_rotation_results/`（正式结果 + 18 份快照 + 链日志）；**绝不动** `npu20ms_offcal` / `pycharm_project_10ae9e2e` / `npu20ms` / `nogmc_t3`（清理后复核 4 条禁区**全部仍在**，且别的 session 的 GPU 任务照常在跑）。
+
+### ⑥ 已知既有问题（本轮**未修**，留给下一轮）
+- ⚠️ `final_rebalance_plan._ZERO_DIR_WORDS` / `verify_artifacts.LLM_DIRECTION_ZERO` / `probe_llm_parser._ZERO_DIRS` **三张零方向词表不同源**（实测「清」「Sell」分叉）。
+- ⚠️ 方向可能从**理由列**兜底扫出并强制归零（critic 标的高危 1）。
+- ⚠️ `probes/probe_run_lock.sh` 的 **A5** 依赖「孤儿 `sleep 8` 持锁的 8 秒窗口」⇒ **时序脆弱**（机器慢时窗口可能不够）。
+- ⚠️ L20 金标「换值根因」注释写反（已排除 cash-reserve 与 TOP_N 两条路径，真因在 `final_score`）。
+- ⚠️ `run_gates.sh` 第 181-182 行 / `run_pipeline.sh:368` 的**失败文案**仍写「守卫已失效」，实际指「交付件有误伤」⇒ 文案待改（不影响判据）。
+- ⚠️ `manu/report/report_20261109_modeC.md` 仍是 **Mode C 时代遗留文件**（Mode C 已删）⇒ 可清理。
+- ⚠️ `report_content_sha1` 把**快照路径**算进指纹 ⇒ 换目录即变（与 D-1 同源，**未修**：修它会级联到决策件）。
+
+## 2026-11-11 · 真机跑批第八轮（按「架构文档」再优化）：🔴 **Beta 避险落地**（TA 建议压降组合权益上限 ⇒ 规则层**采纳**）＋ **TA 合规陪审团授权**（3.5 / 7.1）＋ 独立审计 15 条对照
+
+> 附件文档：`/home/manu/.codex/attachments/a5bfac37-f729-4ad5-b682-ef8c2fa7f4bc/pasted-text-1.txt`（「Qlib 算 / TA 审 / 规则层锁」三层架构）。
+> 用户诉求（本轮）：**按这份文档再做优化**；此前已落地「留 20% 现金」＋「TradingAgents 做筛选（重复/高度重合 ETF）」。
+
+### ① 🔴 缺口定位（独立审计实测，带行号证据）
+- **Beta 避险（文档 §三.3「极端行情下的仓位建议」）＝ 真缺口**：`_EQUITY_CAP = 1 − CASH_RESERVE_RATIO`（`final_rebalance_plan.py`，写死 **0.8**，**无任何 TA 输入口**）⇒
+  TA 在真实决策件里喊「本轮组合权益由 48.02% 适度降至约 **36%**，现金提高至约 **64%**」，
+  规则层**一字不采纳** ⇒ 交付件部署 **79.29%** 权益，与 TA 的 36% **直接矛盾**（且该分歧只进 `llm_conflicts` 披露，不进判据）。
+- **TA 没被授权（文档 §三.2「主题过度集中预警」）**：TA 上下文 3.5 节原文写「**只供你审查参考，不改变规则层判定**」⇒
+  合规陪审团**不知道自己有一票否决权**，也不知道否决后规则层会顺延补位 ⇒ 交付那一轮 TA 的否决是「顺口说的」，不是被 prompt 驱动的合规动作。
+
+### ② ✅ 本轮修的**第一件事：Beta 避险落地**（规则层**采纳** TA 的权益上限建议）
+- **解析层**（`llm_final.py`）：新增 `post_trade.equity_target_pct` ＋ `equity_target_pct_evidence` ——
+  **只认目标动词**（「降至 / 定为 / 控制在 / 压到 …」，正则 `_PORTFOLIO_PCT_RE`）；
+  宽松口径（「组合层权益**约** 56%」）只是**陈述当前值**，**不算建议** ⇒ 规则层不许拿它压降权益。
+  ⚠️ 既有 `equity_pct` / `equity_pct_note` **一字未改**（不动既有金标）。
+- **规则层**（`final_rebalance_plan.py`）：新增 `_resolve_ta_equity_cap(llm_raw)` ⇒ 返回 `{pct, evidence, reason}`；
+  `reason ∈ {no_ta_advice, not_a_target, out_of_range, at_or_above_base_cap, accepted}`。
+  口径三条（写死成不变量）：
+  ① **只许压降、不许抬高**（建议 ≥ 规则层硬上限 ⇒ `at_or_above_base_cap` ⇒ **忽略**）；
+  ② 越界 / 解析不出 ⇒ **完全保持原行为**（`_scale = 1.0` ⇒ 产物**逐字节不变**）；
+  ③ 生效上限 `effective_cap = min(_EQUITY_CAP, ta_cap)`。
+- **接线与缩放**：`build_plan` 在 `apply_ta_screening(...)` **之前**解析 cap ⇒
+  `席位预算 = 生效上限 − 「维持」行占额`（「维持」行＝被 TA 否决但**仍在持仓**者，目标权重 = 当前权重，**权重不动**）⇒
+  **席位目标权重等比缩放**（系数 = 席位预算 / 席位基准）⇒ 再以 `equity_cap=effective_cap` 调 `apply_ta_screening`。
+  🔴 **缩放必须在 TA 筛选之前**：否则顺延补位继承的是**未缩放**权重 ⇒ 权益合计与生效上限自相矛盾（会被顺延闸门误杀补位）。
+  缩放后 `Σ(席位权重) + Σ(维持行权重) = 生效上限`（恒等，实测 0.36 = 0.36）。
+- **披露**：`ta_screening.equity_cap` **恒为 0.8**（= 规则层硬上限，**验收脚本按它断言，不许被 TA 改写**）；
+  新增 `equity_cap_effective` / `equity_cap_ta_recommendation`（含 pct + 原文证据句 + reason）/ `equity_cap_scale`（系数 + 席位基准 + 席位预算 + 维持行占额）；
+  计划 MD 新增「**Beta 避险**」段（写了 TA 建议值、生效值、缩放系数、原文证据句）。
+- **测试**（新增 `tests/test_ta_equity_cap.py`，**10 例**）：解析 4 例（目标动词 / 陈述句 / 无决策 / 高于硬上限）＋ 端到端 5 例（压降 / 无建议不变 / 高于上限忽略 / **维持行权重不动** / md 披露）＋ **1 条变异负例**（把 `_resolve_ta_equity_cap` 打成「无建议」⇒ 权益**必须**回到 80% ⇒ 证明断言有牙）。
+- **探针**（`probes/probe_ta_screening.py`）：新增 **F 组 8 条断言**（F1a~F1e / F2a~F2b / F3 变异反证）⇒ 探针由 **26 → 34 条**。
+
+### ③ ✅ 本轮修的**第二件事：TA 合规陪审团授权**（文档 §三.2）
+- `llm/build_ta_context.py` **3.5 节**：标题「候选池重合度筛查（**供审查参考**）」→「候选池重合度筛查（**一票否决依据**）」；
+  引言从「只供你审查参考，**不改变规则层判定**」改成**明确授权**（这张表就是行使一票否决权的合法依据；同族 / 高重叠对可据此点名否决），
+  并写明**确定性后果**（否决 ⇒ 从候选池剔除 ⇒ 规则层**顺延挑选下一个不同主题**的资产；等权口径不变；顺延者与已入选集合不同族且不构成规则层冲突对；无合格顺延者 ⇒ **不强行补**）。
+  ⚠️ 措辞只描述 `apply_ta_screening` **已实现**的行为，**不承诺新能力**。
+- `llm/build_ta_context.py` 新增 **`### 7.1 你的身份与权力（合规陪审团，不是操盘手）`**：定位（只审不操盘）＋
+  正式权力**只有一票否决**（黑天鹅 / 主题过度集中）＋ **没有的权力**（❌ 不许推荐候选池之外的标的；❌ 不许自行指定买多少股 —— 股数与权重由规则层用确定性数学算）＋
+  职责之一（对照 3.5 节做主题过度集中审查，**要求点名否决**，别只在论据里提一句）＋
+  仓位建议（只给**方向性**权益敞口建议，须**写明数值与依据**；具体股数/权重由规则层算）。
+- **测试**（新增 `tests/test_ta_context_duties.py`，**7 例**）：否定授权措辞必须消失 ＋ 身份/权力/边界/仓位建议口径齐 ＋ context 全文**无 "None"** ＋
+  **改写前后 3.5 表格逐字一致**（用 `ast` 在内存里改回旧实现重渲比对，并冻结金标准 5 行）＋ **2 条变异负例**（抽掉授权引言 / 抽掉 7.1 ⇒ 对应断言必须转红）＋ 真实产物回归。
+
+### ④ 独立审计：文档 15 条要求 × 代码现状（**本轮只做记录，不改**的部分见 ⑥）
+- **已实现且本轮复核通过**：全市场 S 层（`n_stocks=5578`）｜E=W×S 穿透（`engine/weights.py`）｜**留 20% 现金**（规则层 + 执行层双约束）｜
+  整手 100 股向下取整 ｜重复/高度重合 ETF 不共存（重叠 ≥ 0.90 / corr120 ≥ 0.95，**初始选中 + 顺延池两处**都生效）｜TA 一票否决 + 顺延不同主题 ｜**Beta 避险（本轮补上）**｜执行卡确定性（卡内无时间戳）。
+- **口径不符 / 未实现**（详见 ⑥）：EWMA alpha、MA60 硬否决、单只 20% 上限、现金缓冲 400 元、拥挤度、舆情接入。
+
+### ⑤ 本轮交付件（快照 `20261111_122825` **派生层就地重生成**；分析层字节**未动** ⇒ sha1 链不断）
+- 🔴 **权益上限**：规则层硬上限 **0.80** → **本轮生效上限 0.36**（TA 建议 36%，原文证据句已入产物：`"- 本轮组合权益由48.02%适度降至约 **36%**，现金提高至约 **64%**"`）⇒
+  席位等比缩放系数 **0.45**（席位基准 0.80 → 席位预算 0.36，维持行占额 0）⇒ **5 席各 0.072**。
+- **5 席**（`Σtarget_weight = 0.360000`）：`512170 买入 0.072`（+6,200 份）｜`512800 卖出 0.072`（−5,300 份）｜`515450 买入 0.072`（+1,400 份）｜`515650 买入 0.072`（+1,900 份）｜`516620 买入 0.072`（+2,100 份）。
+- **现金口径**：`invested_weight_planned = 0.36`、`target_cash_weight = 0.64`、`equity_cap = 0.8`、**`equity_cap_effective = 0.36`**、**`equity_cap_breach = 0.0`**；
+  实际落地权益 **35.22%**、期末现金 **19,593.83 元**（缺口 0.00）。
+- **否决 / 顺延**（不变）：`ta_screening.rejected = ['159207','563020','511990']`；顺延仍只有 `516620 ← 159207`。
+
+### ⑥ ⚠️ 已知口径差异（**2026-11-11 已处理 5 项**；下表保留原始审计实测作证据，末两列给出本轮处置）
+| 文档要求 | 代码现状（**2026-11-11 审计实测，原状**） | 为什么原轮不改 | **2026-11-11 处置** |
+|:--|:--|:--|:--|
+| 5 日 EWMA `alpha=0.20` | **0.35**（`config.py` 单一事实源；`score_smoothing.py`/`agents_rebalance.py` 各有一处**字面量副本**，未绑定 assert）⇒ 半衰期 **1.61** 交易日（非文档的 3~5 天）；且**回测链不走 EWMA**（`backtest.py` 不传 `smoothing_config` ⇒ 回测数字是**未平滑口径**） | 改 alpha ⇒ 分析层字节变 ⇒ 交付快照 sha1 链断；且与用户早前「alpha=0.35」的口径文冲突 ⇒ 需拍板 | ✅ **已改 `config.SMOOTHING_ALPHA = 0.20`**（半衰期 **3.106** 交易日 ⇒ 落在文档 3~5 日区间）＋ `score_smoothing.DEFAULT_SMOOTHING_ALPHA` **绑定 config**（消灭字面量副本）＋ 分析/帮助文案同步；🔴 **回测链仍不走 EWMA** ⇒ 见 §⑧ 回测口径缺口 |
+| 跌破 MA60 强制一票否决 | **入选闸门是 MA20**（`entry_ma_ok`）；MA60 只在「已持仓强制退出 / 顺延池否决 / 0.5× 软惩罚」三处生效 ⇒ 新标的破 MA60 仍可入选 | 同上（改分析层） | ✅ **已改 `config.ENTRY_MA_FILTER_WINDOW = 60`**（入场闸门＝MA60）＋ 新增 `TREND_MA_REPORT_WINDOW = 20` **仅作报告参考**（不删 MA20 信息）＋ `daily_config.ENTRY_MA_WINDOW = 60` ＋ `run_pipeline.sh` 的 `--entry-ma-window` **改从 config 读**（原写死 20 ⇒ 两链分叉）|
+| 单标的 20% 上限 | **40%**（`engine/portfolio.py` **行内字面量**，不是 config 常量）；每日链另有 `MAX_POSITION_AMOUNT = 6000`（**固定金额**，不随总资产缩放） | 本轮 5 席各 16%/7.2% ⇒ 从未触发；但改文案会改分析层字节 | ✅ **已提为 `config.MAX_SINGLE_WEIGHT = 0.20`**（`engine/portfolio.py` 读该常量）＋ 每日链 `MAX_POSITION_AMOUNT` **改为 `0.20 × 总资产`（= 6,007.11 元，随账户缩放）** |
+| 现金缓冲 ≥ 400 元 | 绝对下限 **200/300 元**（`daily_config.CASH_BUFFER_MIN/MAX`）；**比例下限取大者机制已实现**（当前账户比例下限 6,007 元压倒绝对下限） | 改数值不改变当前判定，但属口径文冲突 ⇒ 需拍板 | ✅ **已改 400/400**（本账户下比例下限 6,007 元仍压倒它 ⇒ **判定结果不变**，纯口径对齐）|
+| 拥挤度（crowding）维度 | **未实现**（只有成分重叠 + corr120 + 名称族三维度） | 属**新增能力**，需另开一轮（要资金流/换手数据源） | ✅ **已实现**（`config.CROWDING_*` + `build_ta_context.compute_crowding()`）：口径 = **近 20 日日均成交额 ÷ 基期 120 日日均成交额**（放量倍数）+ **池内分位**；数据不足/缺字段 ⇒ **不参与、不编造**（如实标注不可得）⇒ 新增 **3.5b 候选池拥挤度** 表；🔴 **口径如实披露**：用**成交额放量倍数**代替「资金流/换手」口径（行情内可得）|
+| 舆情/宏观接入（黑天鹅） | 数据工具**默认打桩**（`DATA_UNAVAILABLE`）⇒ 只能审**结构性**黑天鹅 | 需真实联网 + API key + 配额 ⇒ 需授权 | 🔴 **仍未动**（唯一剩余的口径缺口；需用户授权联网 + 配额）|
+
+### ⑦ ✅ 本轮收口（链 v13 / v14 全绿 ＋ host 只读验收 17/17 ＋ 服务器痕迹清零）
+- 🔴 **最终链 v13**（`/tmp/etf_final_chain_20261111m.sh`，**13:40:54 → 13:45:55**，4 分 59 秒）：
+  `BASELINE_RC=0`（基线重建，复用决策件不重跑 LLM）／`FINGERPRINT_RC=0`（指纹表重生成）／
+  🔴 **`GATES_H_RC=0` ⇒ 失败阶段数 0**（断言 PASS **694** 行 / FAIL **0**，闸门全量含 repro）。
+- 🔴 **最终链 v14**（`/tmp/etf_final_chain_20261111n.sh`，**13:49:01 → 13:53:07**，4 分 06 秒）：
+  只重生成指纹表 + 重跑全量闸门（**不重跑 LLM、不改分析层字节**）⇒ `FINGERPRINT_RC=0` /
+  **`GATES_H_RC=0`** / 断言 PASS **694** / FAIL **0** / 失败阶段 **0** / 退出码 **0**。
+  ⇒ **两链独立复现同一结论**（v13 含基线重建、v14 不含）⇒ 排除「基线重建顺手改坏」的可能。
+- ✅ **host 只读验收**（`etf_rotation_20261110/accept_20261111.py`，**主 agent 亲自复跑**，不采信自报）：
+  **PASS=17 / FAIL=0 / SKIP=0，退出码 0**（`--json-out` 落 `/tmp`，快照目录三次哈希一致 ⇒ 真只读）。
+  17 项覆盖：A1~A7（TA 筛选与权益上限披露）｜B1~B3（留 20% 现金口径 ＋ Σtarget_weight ≤ 0.8）｜
+  C1~C2（md 章节与现金预留披露）｜D1~D2（执行卡**观察态**、被否决代码无下单）｜
+  E1~E1b（**212 条 ETF 的 `smoothed_score` 均有限** ＋ 排序依据 = 「EWMA 平滑分（alpha=0.35，窗口 5 交易日）」）。
+- ✅ **交付数字复核**（从拉回 host 的快照 JSON 直接读出，与 ⑤ 一致）：
+  **5 席各 `target_weight=0.072`**、`Σtarget_weight = 0.360000`、
+  `512170 买入 +6,200`｜`512800 卖出 −5,300（目标 2,400）`｜`515450 买入 +1,400`｜`515650 买入 +1,900`｜`516620 买入 +2,100`；
+  `cash_flow.cash_end = 19,593.83 元`、`deficit = 0.0`、`invested_weight_planned = 0.36`、
+  `target_cash_weight = 0.64`、`equity_weight_realized = 35.22%`、`ta_screening.equity_cap_breach = 0.0`。
+- ✅ **服务器痕迹清零**（铁律 §十六 落点唯一化 ＋ 痕迹清零）：脚本 `_cleanup_20261111.py`（**用 `shutil.rmtree`/`os.unlink`，不许 `rm -rf`**）
+  删 **233/233** 条本项目 `/tmp` 痕迹（`etf_*` 链脚本 / `probe_mode_c_*` 16 个 / `probe_lock_*` / `_probe_*` / `score_probe*` / `_ctx_probe` 等，共 ≈3.5 MB）；
+  🔴 **别的 session 的文件一个没动**（实测仍在：`chain_cold.sh` / `chain_sync.sh` / `day4_adaptive.sh` / `watch_full.sh` /
+  `fp_regen.py{,2,3}` / `decision_sweep_chain{,2}.log` / `regen_*.log` 20 个）；
+  🔴 **四条禁区仍在**：`npu20ms_offcal` / `pycharm_project_10ae9e2e` / `nogmc_t3` / `npu20ms_seed` / `CANDIDATES` / `ashare_topk`。
+  ⇒ **三条断言复核全绿**：`/mnt/data` 根无 `_etf_daily_*` ✅｜`siping/datasets/` 顶层无本项目目录 ✅｜
+  `siping/runs/` 下本项目专属目录**只存在** `<RESULTS_ROOT>=etf_rotation_results` 一个 ✅。
+- 📦 **产物路径（真值在服务器，host 为只读镜像）**：
+  - 服务器结果根 `/mnt/data/siping/runs/etf_rotation_results/`，交付快照 `snapshots/20261111_122825/`（**23 件**）；
+  - host 镜像 `/media/manu/1TB-Volume/workspace/etf_rotation_20261110/server_runs_etf_rotation/snapshots/20261111_122825/`
+    ＋ 链 v13/v14 日志 `_final_chain_20261111{m,n}.log` / `_gates_20261111{m,n}.log(.stdout)` / `_fingerprint_20261111{m,n}.log` /
+    `_rebuild_baseline_20261111m.stdout` ＋ canonical 根派生件 `canonical_root_*.{json,md}`；
+  - 拉取脚本 `_pull_final_20261111n.sh`（**先拉后删**，rsync 幂等）。
+- ⚠️ **canonical 根的 `tradingagents_decision.md` 是旧决策件**（sha1 `cc26cc87`，说「降至约 10%」、否决 15 只），
+  与快照里的新决策件（sha1 `c3159459`，「降至约 **36%**」、只否决 3 只）**不是同一代** ⇒
+  canonical 根的 plan 因此是 `effective_cap=0.1 / Σtw=0.025`（**对新代码自洽**，属**既有状态**，非本轮引入）⇒
+  🔴 **交付口径一律以快照 `20261111_122825` 为准**（勿拿 canonical 根的数字对外报）。
+
+## 2026-11-11 · 真机跑批**第九轮**（按架构文档补齐口径）：EWMA **α=0.20** ＋ 入场闸门 **MA60** ＋ 单只上限 **20%** ＋ 现金缓冲 **400 元** ＋ **拥挤度** ＋ **行情源同源**
+
+### ① 本轮起因
+上一轮（第八轮）独立审计把「文档要求 × 代码现状」逐条对完，发现 **6 项口径差异**：EWMA α（文档 0.20 / 现役 0.35）、
+入场闸门（文档 MA60 / 现役 MA20）、单只上限（文档 20% / 现役 40% 行内字面量）、现金缓冲（文档 400 元 / 现役 200/300 元）、
+**拥挤度未实现**、舆情/宏观打桩。用户授权「按文档再做优化」⇒ 本轮补齐前 5 项。
+
+### ② 本轮改了什么（全部落到**单一事实源**）
+| # | 口径 | 改法 | 落点 |
+|:--|:--|:--|:--|
+| ① | EWMA **α = 0.20**（半衰期 **3.106** 交易日 ⇒ 落在文档 3~5 日内） | `config.SMOOTHING_ALPHA = 0.20`；`score_smoothing.DEFAULT_SMOOTHING_ALPHA` **绑定 config**（消灭字面量副本，AST 测试钉死）；分析报告「平滑半衰期」行与 argparse help 文案同步 | `config.py` / `score_smoothing.py` / `analyze.py` / `recommend.py` |
+| ② | 入场闸门 **跌破 MA60 一票否决**（MA20 降为**报告参考**） | `config.ENTRY_MA_FILTER_WINDOW = 60` ＋ 新增 `TREND_MA_REPORT_WINDOW = 20`（仅持仓诊断表展示）＋ `daily_config.ENTRY_MA_WINDOW = 60` ＋ 🔴 **`run_pipeline.sh` 的 `--entry-ma-window` 由写死 20 改为从 config 读**（否则两链分叉） | `config.py` / `daily/daily_config.py` / `run_pipeline.sh` / `analyze.py` |
+| ③ | 单标的权重上限 **20%** | 新增 `config.MAX_SINGLE_WEIGHT = 0.20`（`engine/portfolio.py` 由**行内 0.40 字面量**改为读该常量）；每日链 `MAX_POSITION_AMOUNT` 由写死 6,000 元改为 **`0.20 × 总资产`（= 6,007.11 元，随账户缩放）** | `config.py` / `engine/portfolio.py` / `daily/daily_config.py` |
+| ④ | 现金缓冲 **≥ 400 元** | `daily_config.CASH_BUFFER_MIN/MAX` 200/300 ⇒ **400/400**（本账户下比例下限 6,007 元仍压倒它 ⇒ **判定结果不变**，纯口径对齐） | `daily/daily_config.py` |
+| ⑤ | **拥挤度**（文档 §三.2） | 新增 `config.CROWDING_*`（近 20 日 / 基期 120 日 / 放量倍数阈值 1.5 / 池内分位阈值 0.80）＋ `build_ta_context.compute_crowding()` ＋ **3.5b「候选池拥挤度」表**；数据不足 / 缺字段 ⇒ **不参与、不编造**（meta 记 `crowding_available` / `crowding_reason`） | `config.py` / `llm/build_ta_context.py` |
+| ⑥ | 🔴 **行情源同源**（审查发现 3.5） | 新增 `_resolve_prices_path()`：显式 `--prices` → 本轮 `etf_prices_effective_{asof}.csv` → `etf_prices_daily_{asof}.csv` → canonical 兜底；**每日链显式传 `--prices <本轮有效行情>`**（原先 TA 上下文读 canonical 旧行情 ⇒ `corr120` / 拥挤度与规则层对不上） | `llm/build_ta_context.py` / `daily/agents_rebalance.py` |
+
+### ③ 🔴 连带修掉的两个真缺陷（不是口径改动，是**分叉/崩坏**）
+1. **`run_pipeline.sh` 写死 `--entry-ma-window 20`** ⇒ 与 `config.ENTRY_MA_FILTER_WINDOW` 分叉 ⇒ 研究链与每日链**选出不同的票**且**不报错** ⇒ 已改为从 config 读（测试 `test_run_pipeline_does_not_hardcode_ma_windows` 钉死）。
+2. **`score_smoothing.py:58` 语法错误**（多一个单引号 ⇒ `SyntaxError` ⇒ 整模块 import 失败）⇒ 本轮 pytest **直接收集失败** ⇒ 已修。
+
+### ④ 前视金标**换值**（不是断言增删；换值根因 = 排序口径变了）
+- asof=2026-11-03 的「同主题最近的一对」**仍是** `512800 ↔ 512820`，但数字变了：
+  `final_gap` **0.024412 ⇒ 0.029595**｜`swap_threshold_realistic` **0.177043 ⇒ 0.187930**｜`margin_realistic` **−0.152631 ⇒ −0.158335**。
+- 根因 = α 0.35⇒0.20 ＋ MA20⇒MA60 ＋ 40%⇒20% ⇒ 池内 `final_score` 变 ⇒ **分差与翻转阈值同时变**。
+- 复核证据：5 条目仍按 `|final_gap|` 升序且首条最小；恒等式 `margin = gap − thr` 成立（0.029595 − 0.187930 = −0.158335）；报告 md「八之四」独立写着同一对与同一组数字。
+- 🔴 **铁律顺序**：「**金标换值必须先于 `rebuild_baseline.sh`**」—— 本轮先跑一次「基线重建（复用决策）」拿到新报告 ⇒ 换金标 ⇒ 再跑真链（否则第 12 步 `probe_lookahead` 撞旧金标 die）。
+
+### ⑤ 本轮测试
+- 新增 `manu/etf_rotation/tests/test_spec_round3_alignment.py`（**24 条**）：α 单一事实源（含「改 config ⇒ 默认随之变」的行为联动）｜MA60 闸门（**真实价格序列**上证明 MA60 比 MA20 更严 ＋ 引擎把窗口原样传进破位判定）｜20% 上限（**压到 5% ⇒ 目标权重真的被压住**）｜400 元缓冲｜拥挤度（放量倍数 / 池内分位 / 样本不足不编造 / 缺字段不编造 / **asof 之后的数据不得影响结果**）｜行情源同源解析（显式 > effective > daily > canonical）｜3.5b 节与 meta 字段。
+- 本地全量：`pytest manu/etf_rotation/tests manu/etf_rotation/daily/tests -q` ⇒ **482 passed**（改前 458 ＋ 新增 24），**既有 458 条一条未红**。
+
+
+### ⑥ 🔴 本轮修掉的 4 处「TA 一票否决误伤」真缺陷
+
+**症状**：TA（tradingagents）**明确要买 / 要减**的标的被当成一票否决剔出计划 ⇒ 席位顺延给**更弱**的标的。
+**四处全在 `manu/etf_rotation/llm_final.py`**（TA 否决归属层）；探针侧另修 1 处**误读**（A20⑥）。
+
+| 根因 | 现象 | 修法（全部在 `manu/etf_rotation/llm_final.py`） |
+|:--|:--|:--|
+| **F1 让步/假设句** | canonical 决策件原文「- 即使否决 `515450`，它也不能作为顺延者…」⇒ 515450（最终分 **0.8672**、TA 权威表写「买（条件性）」）被误否决 ⇒ 顺延位给了 **563020**（最终分 **−0.4683**） | 新增 `_HYPOTHETICAL_MARKERS`（即使/即便/就算/哪怕/纵使/假设/假定，`llm_final.py:190`）＋ `_HYPOTHETICAL_GAP_RE`（`:194`）＋ `_hypothetical_verb_positions()`（`:1278`）；🔴 **必须紧邻才豁免**（「即使拥挤度92%也不买X」仍判真否决）⇒ 接入 `_prose_hits`（`:1357`：**剔除假设动词 ＋ 清空 `prev_codes`**） |
+| **F2 跨子句继承** | 每日链原文「…`512800`卖出超配部分、保留16%核心；`515450`复核通过后买入；…弱信号、拥挤及同族重复候选否决；…」⇒ 泛指「否决」**继承上一子句代码** ⇒ 512800/515450 一起被误否决 | 新增 `_codes_with_own_action()`（`:1310`）＋ `_OWN_DECISION_WORDS`（`:1338`）＋ `_has_own_decision()`（`:1343`）；🔴 **自带裁决（买/卖/减/保留/持有…）的代码不被下一子句继承成否决主体**（「只/仅」不算，避免与引用护栏职责重叠） |
+| **F3 否定护栏缺「不作」** | 每日链表格行「\| `512800` \| **减，保留** \| …不作正式否决 \|」⇒ 512800 被误否决 ⇒ 计划写成「**维持22.2%**」而非「**减到16%**」 | `_REJECT_NEGATION_RE`（`:861`）否定词表补 `不作\|不做` |
+| **F4 「避免与 X 重复」** | 每日链原文「`515020`、`516310`、`512820` 不买，避免与 `512800` 重复银行暴露；…避免与 `515450` 重复」⇒ 512800 被下一子句「不买」拖下水 | 新增 `_MD_REF_AVOID_RE`（`:1132`：避免/防止/以免/杜绝 ＋ 与/和/跟 ＋ 代码）并接入 `_reference_codes()`（`:1153`） |
+
+🔴 **探针 A20⑥ 假红纠正**（`manu/etf_rotation/probes/probe_llm_parser.py`）：原文「…**`512800`卖出超配部分、保留16%核心」⇒ 裸「卖出」命中零方向 ⇒ 探针判 512800 **清仓**（计划实为**减至16%**）⇒ **假红**。
+- **修法**：`_md_clause_zero_word()`（`probe_llm_parser.py:875`）的裸「卖出」分支加**两道并联**护栏 ⇒ `_MD_KEEP_TOKENS`（`:872`：保留/持有/维持/留下/留着/保底仓）＋ `_MD_SELL_PARTIAL_RE`（`:869`：卖出…部分）；🔴 **清仓/清零分支不受影响**。
+- ✅ 这是**探针误读纠正**，**断言本身未放松**（真清仓仍必须判零方向）。
+
+### ⑦ 本轮新增测试与本地全量结果
+
+- 新增 `manu/etf_rotation/tests/test_llm_final_veto_scope_round3.py`（**16 条**）：F1/F2/F3/F4 各自正例 ＋ 探针 A20⑥ 口径 ＋ **5 条变异反证**（证明每道护栏**真在承重** ⇒ 改坏护栏测试**必须变红**）。
+- 本地全量：`/home/manu/anaconda3/envs/uav/bin/python -m pytest manu/etf_rotation/tests manu/etf_rotation/daily/tests -q` ⇒ **498 passed**（1 warning，退出码 **0**）。
+  - 🔴 **可钉死的增量只有「本轮新增 16 条」**：单独跑 `pytest manu/etf_rotation/tests/test_llm_final_veto_scope_round3.py -q` ⇒ **16 passed**。
+  - ✅ **全量最终口径 = 499 passed**（退出码 0，解释器 `/home/manu/anaconda3/envs/uav/bin/python -m pytest`）。
+    **498 → 499 的漂移根因已定位**（主 agent 复验）：不是「别的 agent 并发加测试」，而是**本轮自己新增了 1 条钉死测试**
+    （`tests/test_spec_round3_alignment.py::test_run_gates_does_not_hardcode_ma_windows`，见 ⑪）⇒ `482 ＋ 16 ＋ 1 = 499` 才自洽。
+  - ⚠️ 交办单写的「495 passed（既有 482 ＋ 本轮新增 13）」**复现不出来**（新文件实测就是 16 条）⇒ 按**实测**记。
+  - ✅ 那次 `test_run_gates_does_not_hardcode_ma_windows` 的偶发失败**根因已定位并修掉**（主 agent 复验）：
+    钉死测试断言「脚本里不许出现字面量 `--entry-ma-window 20`」，而**我新写的注释里恰好含这串字面量** ⇒ 测试正确地咬住了我 ⇒
+    已把注释改成「写死入场均线 20」⇒ 之后单跑 3/3、全量全绿。**断言未被放松。**
+  - 🔴 **pytest 解释器必须是 `/home/manu/anaconda3/envs/uav/bin/python -m pytest`**（系统 `python3` 没装 pytest）。
+- **真实件 A/B 验证**（`extract_authority_rejections`（`llm_final.py:1630`）对服务器两份真实决策件；对比件在 `/tmp/etfcheck/decision_canonical.{md,json}` 与 `/tmp/etfcheck/decision_daily.{md,json}`）：
+  - **canonical 决策件**：旧 **13** 只 ⇒ 新 **12** 只，**只去掉 515450**，**无新增否决**（`.md` 与 `.json` 两种入口结果一致）。
+  - **daily 决策件**：旧 **16** 只 ⇒ 新 **14** 只，**去掉 512800、515450**，**无新增否决**（`.md` 与 `.json` 两种入口结果一致）。
+  - ✅ 复验方式：在 `/tmp` 复制件里**只中和 F1~F4 四道护栏**（`_hypothetical_verb_positions` 早退 / `_has_own_decision` 恒假 / 否定词表去掉 `不作|不做` / `_reference_codes` 去掉 `_MD_REF_AVOID_RE`）⇒ 还原旧行为 ⇒ 逐项比对**否决集合**（不靠记忆、不靠交办单数字）。
+
+### ⑧ 修复后方案的交付数字（服务器实跑）
+
+- **每日链新快照**（服务器 `/mnt/data/siping/runs/etf_rotation_results/snapshots/` 下，asof=2026-11-09）：
+  - `512800` **卖出 7700→5400（16%）**（修复前是「**维持 22.2%**」）；
+  - `515450` **买入 0→3200（16%）**；
+  - `512170` **买入 0→13800（16%，替补被否决的 159207「高股息ETF广发」）**；
+  - 权益 **48%**（`cash_flow.invested_weight_planned = 0.48`）／现金 **52%**（`target_cash_weight = 0.52`）；
+  - `lot_rounding_gap_amount = +177.47`（**≥ 0 ⇒ P4 闸门绿**；修复前为 **−129.21** ⇒ 红）；
+  - 🔴 **无「维持席位」**（`held_not_touched = false`、`orphaned_holdings = []`）⇒ **P6/P7 闸门绿**（P4/P6/P7 同源于 512800 被误否决产生的维持席位 ⇒ **重跑即同时转绿，无需改码**）；
+  - `ta_screening.rejected` = **14 只**合法否决（**无 512800 / 515450**）。
+- **研究链 canonical 根**（asof=2026-11-03）：
+  - `512800` **卖出 7700→3300（10%）**；`515450` **买入 0→2000（10%）**；
+  - 权益 **20%**（`invested_weight_planned = 0.20`）／现金 **80%**；
+  - 与修复前**权益上限口径完全一致**：`equity_cap 0.8 → equity_cap_effective 0.3`、`equity_cap_ta_recommendation.pct = 0.3`（reason `accepted`）⇒ **不变**；
+  - 唯一差异：负分替补 **563020（−0.4683）** 换成正分 **515450（+0.8672）** ⇒ **严格改善**。
+- ⚠️ **修复前快照 `20261111_142244` 是污染版**（512800 **维持 22.2%**、**无 515450**）⇒ **只可作事故证据，不可作交付**。
+
+### ⑨ 已知残留缺口（登记，不要当已完成）
+
+- **舆情/宏观黑天鹅仍打桩**（`DATA_UNAVAILABLE`）⇒ 需**联网 + API key + 配额** ⇒ 🔴 **需用户单独授权**。
+- **回测链仍不走 EWMA**：已登记的回测基线（2026-11-06）是 **MA20 闸门**口径 ⇒ 与现役 **MA60 ＋ EWMA** 不一致 ⇒ 回测数字**仅作历史研究参考**（本轮**刻意不重跑** ⇒ 重跑会连带改上下文 ⇒ **sha1 链断**）。
+- 「**维持席位**」的权重可能 **> 单只 20% 上限**（维持行**权重不动**）—— 本轮因 512800 回归普通席位而**消失**，但**机制仍在** ⇒ 值得登记。
+
+### ⑩ 铁律遵守与服务器痕迹
+
+- 本轮结果只落 `/mnt/data/siping/runs/etf_rotation_results/`（`siping/runs/` 下本项目**只许一个**目录 `etf_rotation_results`）；**未在 `data/` 目录下新建任何 `_etf_daily_*` 临时目录**（取数工作目录在 `/mnt/data/siping/datasets/manu/etf_rotation/_work/` 下，属 `datasets/manu` 允许范围）。
+- **未 commit / 未 push**（HEAD `b1be18ac`，工作区大量未提交改动）。
+- 本轮服务器驱动脚本 `pass1.sh` / `pass234.sh` / `pass567.sh` / `pass89.sh` 收尾时用 `os.unlink` / `shutil.rmtree` 删除（🔴 **不许 `rm -rf`**）；**别的 session 的 `/tmp` 文件一个不动**。
+- ℹ️ **交付快照号与验收数字待主 agent 补写（见后续补记）**。
+
+### ⑪ 🔴 本轮收尾阶段另修的 2 处真缺陷（主 agent 在验收演练时挖出）
+
+| # | 缺陷 | 现象 / 后果 | 修法 |
+|:--|:--|:--|:--|
+| ⑪-1 | **`run_gates.sh` 的 repro 段写死 `--entry-ma-window 20`** | 本轮入场闸门已改 **MA60**（`config.ENTRY_MA_FILTER_WINDOW=60`）⇒ 闸门「重跑产物 vs 基线逐字节比对」段会用 **MA20** 重跑 `recommend.py`，而基线是 **MA60** 跑出来的 ⇒ 产物必然不一致 ⇒ **闸门假红**。与已修的 `run_pipeline.sh` 属**同一类分叉**（两链/两闸门口径不同源） | `manu/etf_rotation/run_gates.sh` 的 repro 段改为从 `config` 读（`config.ENTRY_MA_FILTER_WINDOW` / `config.EXIT_MA_FILTER_WINDOW`，与 `run_pipeline.sh` 同写法）＋ **新增钉死测试** `tests/test_spec_round3_alignment.py::test_run_gates_does_not_hardcode_ma_windows`（断言脚本里既不许写死 20 也不许写死 60，且必须从 config 读） |
+| ⑪-2 | **验收脚本 A2 的保护集是「上一轮决策件的硬编码 3 只」** | A2 原写死 `PROTECTED_CODES = ("515450","515650","512800")` ⇒ 本轮决策件对 **515650 自相矛盾**：权威节「二、研究经理结论」L33/L63 写「**否决 / 不买，正式否决**」，而多头(Bull)辩论段 L104/L132/L145 写「**不否决**」「**买，但不超配**」⇒ 按「**权威节优先**」口径，515650 本轮**确实该被否** ⇒ 旧断言把**正确行为**判成误伤（**假红**） | `etf_rotation_20261110/accept_20261111.py` 的 A2 改为**从本轮决策件权威节动态推导保护集**（`_authority_section_lines` / `_authority_verdicts` / `_protected_codes`）：凡权威节**表格方向列**写「买/保留/持有/维持」且不含否决词的代码 ⇒ 不许进否决名单；历史硬编码集仅作**权威节解析失败时的兜底**，且**被权威节明确否决的代码会被剔除**（不再盲目保护）。覆盖面反而更广（本轮保护集 = `512010 / 512170 / 512800 / 515450` 四只）|
+
+✅ **A2 修正后复验**：`accept_20261111.py` 对本轮快照 `20261111_150859` 与上一轮快照 `20261111_122825` **各 17 PASS / 0 FAIL / 0 SKIP**（两代都验过 ⇒ 不是拍脑袋改绿）。
+✅ **服务器闸门侧同样验过**：`probes/probe_verify_guards.py::find_ta_reject_mis_hits` 是**按权威层级比**的（买侧证据层级 ≥ 否决层级才算误伤；`研究经理`=10 / `多头·空头`=0 / `辩论裁决·风险裁决`=20 / `Trader`=30 / `最终交易决定`=40）⇒ 515650 的买侧证据只出现在**多头段（层级 0）** ⇒ `0 < 10` ⇒ **不判误伤**。已用**真实件直跑该函数**：`20261111_150859` ⇒ **status=pass**、`20261111_122825` ⇒ **status=pass** ⇒ **闸门不会假红**。
+
+### ⑫ 🔴 第 5+6 组根因：4 处真缺陷（否决归属层）＋ 2 处交付链缺陷（跨快照复用 ⇒ sha1 链断裂）
+
+本节把第九轮**收尾阶段**的第 5、6 组根因一次写完：
+
+- **第 5 组** = 「**否决归属层**」的 **4 处真缺陷**，全部落在 `manu/etf_rotation/llm_final.py`
+  （旧口径把「**谁否的**」和「**否决成不成立**」混成一件事 ⇒ 真否决被放过、真持有被误否）；
+  另修 **2 处**制造「**假红**」的交付链缺陷（闸门口径分叉、验收断言写死）。
+- **第 6 组** = 交付链上的 **3 处**，根子是「**跨快照复用决策件 ⇒ sha1 链断裂**」
+  （落点 `daily/agents_rebalance.py` / `daily/snapshot.py` / `final_rebalance_plan.py`）。
+
+#### ⑫.1 第 5 组根因：4 处真缺陷（全部在 `llm_final.py` 的**否决归属层**）
+
+**起因**：**2026-11-11 15:21** 的真 LLM 跑批产出决策件 `20261111_152132`，
+**计划件却是污染版**（`512800` 被 `ta_rejected=True` 变成「**维持 22.2%**」、`515450` **整个消失**、
+`516620` / `512890` **反被买入**）⇒ 说明「**解析否决名单**」这一步同时存在**漏放**与**误伤**两类错误。
+
+| # | 根因 | 现象 / 后果 | 修法 |
+|:--|:--|:--|:--|
+| ⑫-1<br>**F5-a** | **`llm_final.py::_REJECT_NEGATIONS` 含「一票否决」⇒ 假护栏** | 任何含「一票否决」这四个字的子句都被 `llm_final.py::_guarded()` **整条中和** ⇒「`516620` **正式一票否决**，不买」这种**真否决被放过**（**漏放**）⇒ `516620` 进了计划件 | **删掉「一票否决」**，只保留**条件式**写法：「若一票否决 / 如一票否决 / 一旦一票否决 / 假如一票否决 / 倘若一票否决」（那才是假设句）；「**否决权**」（能力陈述）仍由本表守住 |
+| ⑫-2<br>**F5-b** | **第三方立场元指代**：否决**权属对方**，不是否决这只标的 | 「**熊方的否决**拿不出更优替代」⇒ 该句里的「否决」属**熊方** ⇒ 旧口径把同句的 `512800` 一并误否 ⇒ `512800` 被误判成被否（本轮就是 `512800` 变「维持 22.2%」的直接原因之一） | `llm_final.py` 新增 `_META_VETO_RE`（**熊方 / 空头 / 多头 / 对方 / 对手方**等立场的「否决」）＋ `_meta_veto_positions()`（命中位置的否决动词**不否决**子句里任何代码）；**动词后置**写法「否决熊方」也一并覆盖（另有 `_strip_meta_veto()` 先抹掉再判） |
+| ⑫-3<br>**F5-c** | **点名裁决不生效**：散文推断能推翻这一只的**直接裁决** | 权威节编号条目 `1) 512800（…）：方向「持 / 减至目标权重」` 是**这一只本轮的直接裁决** ⇒ 散文推断**不得推翻**它；但旧口径没有这一层 ⇒ 散文里一句元指代就能把点名裁决推翻 | `llm_final.py` 新增 `_EXPLICIT_ITEM_RE`（**只认编号条目 `N) CODE`**，项目符号条目**太弱**——把弱条目当裁决会**凭空造出否决**，实测会造出 `515450`）＋ `_explicit_item_verdicts()` ＋ `_explicit_verdict_rejects()`；在 `llm_final.py::extract_rejections()` 里做「**点名裁决优先（救 + 抓）**」：条目说买/减/持 ⇒ **豁免**（不进否决名单）；条目说否决/不买/不建仓 ⇒ **补抓**（散文漏放时兜底） |
+| ⑫-4<br>**F5-d** | **弱化限定词 ＋ 否定式否决**（F5-a 的假护栏一拆就暴露） | ① 「一票否决**理由不足**」⇒ 这条**否决不成立**（研究经理明写否掉空头对 `512800` 的否决）⇒ 旧口径把「一票否决」当否定词才躲过，这次拆掉假护栏后立刻暴露；② 「**不能**仅因模型存在局限就一票否决 `512800`」⇒ **否定式否决** ⇒ 旧护栏词表只有「不可 / 不得」、**缺「不能」** ⇒ 逃过护栏 ⇒ `512800` 被误判成否决 | `llm_final.py` 新增 `_VETO_WEAKENED_MARKERS`（理由不足 / 理由不成立 / 理由不充分 / 理由欠缺 / 不成立 / 站不住 / 不予采纳 / 未被采纳 / 不获采纳 / 有误 等）＋ `_weakened_veto_positions()`；`llm_final.py::_REJECT_NEGATION_RE` **补「不能 / 不至于」**（原词表只有「不可 / 不得」） |
+
+#### ⑫.2 另修 2 处：制造「**假红**」的闸门口径分叉与验收断言写死
+
+> ℹ️ 这 2 处与上一节 **⑪-1 / ⑪-2** 是**同一处修复**（第九轮收尾阶段主 agent 在验收演练时挖出），
+> 本节把它们并进「第 5 组根因」叙述，并补上本轮**新测**到的证据（`probe_reproducibility=0`）。
+
+| # | 根因 | 现象 / 后果 | 修法 |
+|:--|:--|:--|:--|
+| ⑫-5 | **`manu/etf_rotation/run_gates.sh` 的 repro 段写死 `--entry-ma-window 20`** | 本轮闸门已改 **MA60**（`config.ENTRY_MA_FILTER_WINDOW=60`）⇒ 闸门「重跑产物 vs 基线逐字节比对」段会用 **MA20** 重跑，而基线是 **MA60** 跑出来的 ⇒ 产物必然不一致 ⇒ **闸门假红**（与已修的 `run_pipeline.sh` 属**同一类分叉**：两链 / 两闸门口径不同源） | `manu/etf_rotation/run_gates.sh` 的 repro 段改为**从 `config` 读**（`config.ENTRY_MA_FILTER_WINDOW` / `config.EXIT_MA_FILTER_WINDOW`，与 `run_pipeline.sh` 同写法）＋ 新增**钉死测试** `test_run_gates_does_not_hardcode_ma_windows` ⇒ 实测修后 **`probe_reproducibility=0`** ✅ |
+| ⑫-6 | **验收脚本 A2 的保护集是「上一轮决策件的硬编码 3 只」** | A2 原写死 `PROTECTED_CODES = ("515450","515650","512800")` ⇒ 本轮决策件对 `515650` **自相矛盾**：权威节 L33/L63 写「**否决 / 不买，正式否决**」，多头段 L104/L145 写「**买，但不超配**」⇒ 按「**权威节优先**」口径，`515650` 本轮**确实该否** ⇒ 旧断言把**正确行为**判成误伤（**假红**） | `etf_rotation_20261110/accept_20261111.py` 的 A2 改为**从本轮决策件权威节表格方向列动态推导**（`_authority_section_lines` / `_authority_verdicts` / `_protected_codes`）⇒ 本轮保护集 = **`512010` / `512170` / `512800` / `515450`**（覆盖面反而更广；历史硬编码集仅作**权威节解析失败时的兜底**，且**被权威节明确否决的代码会被剔除**） |
+
+#### ⑫.3 第 6 组根因：交付链 3 处（**2026-11-11 16:11** 那轮 Pass10 才暴露）
+
+| # | 根因 | 现象 / 后果 | 修法 |
+|:--|:--|:--|:--|
+| ⑫-7 | **`daily/agents_rebalance.py`：`--skip-llm` 把 `build_ta_context.py` 一起跳过了** | `build_ta_context.py` 是**本地确定性计算**（拥挤度 / 重合度 / 3.5 节），**不调 API** ⇒ 旧口径把它塞在「真 LLM」分支里 ⇒ `--skip-llm` 复跑时快照**缺** `ta_research_context.md` / `ta_context_meta.json` ⇒ 快照**结构不完整** ⇒ 闸门「取最新 LLM 完整快照」**跳过它** ⇒ 这一轮**白跑** | `manu/etf_rotation/daily/agents_rebalance.py` 把**上下文构建移出 `if skip_llm:`** ⇒ 上下文**永远**构建；`--skip-llm` **只跳过 LLM 调用**（决策件复用既有落盘件） |
+| ⑫-8 | **跨快照复用决策件 ⇒ sha1 链断裂 ⇒ 闸门 4 阶段假红** | 决策件记录的是**它当初吃到的 context** 的 sha1（`meta.context_sha1`），而闸门（`verify_artifacts` 第二环 / `probe_llm_stage_repro` P4）校验的是「**本快照** context md 的 sha1 == 决策件记录的 `context_sha1`」⇒ 只复制决策件（**不复制它那份 context**）⇒ **链必断** ⇒ 交付件被判「LLM 意见已过期」⇒ `verify_artifacts` / `probe_verify_guards` / `probe_llm_stage_repro` / `probe_reproducibility` **4 个阶段红**（实测快照 `20261111_161126`） | **修法（3 处）**：① 新增 `manu/etf_rotation/daily/snapshot.py::snapshots_with_file()`（`latest_snapshot_with_file()` 改为调用它，**行为不变**）⇒ 复用分支**从新到旧遍历候选快照**；② 新增 `manu/etf_rotation/daily/agents_rebalance.py::_carry_context_trio()`：**只搬 `ta_research_context.md`**（`ta_context_meta.json` **留在本快照** —— 它记的是「**本快照**报告 → 本快照上下文」的链接，搬来源的会让**第一环**反而断），判定**三条全过**才搬：来源 context 存在 ／ **sha1(来源 context) == 来源决策件 `meta.context_sha1`**（它自己自洽）／ 来源 context 与**本轮现算**的 context **逐字等价**（仅快照路径行不同 ⇒ 证明基于**本轮数据**）；③ `manu/etf_rotation/final_rebalance_plan.py::_llm_staleness()` 第二环加 `_context_equivalent()` **兜底**（上游 context 与本快照 context **归一化快照目录后逐字一致** ⇒ 不算过期） |
+| ⑫-9 | **否决名单里 `515020` 的名称被解析成「以及」**（**连词当名称**） | `llm_final.py::_name_near` 的**向左回看**兜底把连词「以及」当成了 `515020` 的名称 ⇒ 交付件的被否名单里出现「**515020 \| 以及**」这种垃圾名（实测 `20261111_161126`） | `manu/etf_rotation/llm_final.py::_NAME_STOP_WORDS` **新增一批连词 / 连接词**（以及 / 还有 / 另外 / 此外 / 同时 / 其中 / 包括 / 外加 / 另加 / 连同 / 换言之 / 并且 / 例如 / 比如 / 也就是说 / 除此之外 / 其余 / 其他 / 其一 / 尤其是 / 特别是）⇒ 取不到名就**返回空串**（渲染层显示「—」），再由**计划层用分析报告的 code→name 表回填** ⇒ `515020` 应显示「**银行ETF华夏**」 |
+
+- 🔴 **附带查清的一件事**：**「报告内容指纹」本身带快照路径** ⇒ **跨快照必然不等**
+  （`report_fingerprint.py::VOLATILE_META_KEYS` 只剔 `meta` 里的易变键，而
+  `current_holdings_diagnosis.snapshot_path` 在报告**正文**里 ⇒ 路径一变指纹就变）
+  ⇒ 跨快照的「数据没变」判定**不能**用它（实测 `20261111_152132` vs `20261111_161126`
+  报告指纹 `8295d0a3` vs `5cd4c013`，但**逐字段 diff 只有 12 处、全是路径/mtime** ⇒ 正文完全一致）
+  ⇒ 改用**上下文逐字等价**判定（context 由报告生成 ⇒ context 等价 ⇔ 报告等价）。
+  ⚠️ **`report_fingerprint.py` 本身没动**（改它会让**全部**已登记指纹失效 ⇒ 闸门假红）。
+
+#### ⑫.4 本轮新增测试与本地全量结果
+
+- 新增 `manu/etf_rotation/tests/test_llm_final_veto_scope_round3_fixes.py` —— **14 条**：
+  F5-a / F5-b / F5-c / F5-d ＋ 弱化限定词 ＋ 否定式否决 ＋ 项目符号条目不算裁决 ＋ 端到端真实形态（**精确 7 只**）＋ 每日链 AST 断言 ＋ **5 条变异反证**。
+- 新增 `manu/etf_rotation/tests/test_round3_delivery_polish.py` —— **15 条**：
+  连词取名 ＋ 上下文等价 ＋ 候选遍历 ＋ 上下文三件套搬运 ＋ **变异反证**。
+- **本地全量**：
+
+  ```bash
+  cd /media/manu/1TB-Volume/workspace/qlib && /home/manu/anaconda3/envs/uav/bin/python -m pytest manu/etf_rotation -q
+  ```
+
+  ⇒ **528 passed**（**退出码 0**）。
+  ⚠️ 解释器**必须**是 `/home/manu/anaconda3/envs/uav/bin/python -m pytest` —— 系统 `python3` **没装 pytest**。
+
+#### ⑫.5 真实件 A/B 验证（**不是夹具自证**）
+
+`llm_final.py::extract_authority_rejections`（**md / json 两入口一致**）对两代真实件直跑：
+
+| 决策件 | 修复前 | 修复后 | 判读 |
+|:--|:--|:--|:--|
+| 旧件 `20261111_150859` | — | **14 只不变**（**无 `512800` / `515450`**） | ⇒ **无回归** |
+| 新件 `20261111_152132` | **8 只**（**误伤** `512800` / `515450`、**漏放** `516620`） | **7 只 = {159207, 515020, 516310, 512820, 516620, 563020, 515650}**（**无 `512800` / `515450`**） | ✅ 误伤与漏放**同时消掉** |
+
+- 闸门函数 `manu/etf_rotation/probes/probe_verify_guards.py::find_ta_reject_mis_hits` 对**两代真实件直跑** ⇒ **`status=pass`**。
+  判据是**权威层级**：研究经理=**10** / 多头=**0** / 辩论裁决=**20** / Trader=**30** / 最终交易决定=**40**
+  ⇒ **买侧证据层级 < 否决层级**才判误伤 ⇒ 多头段的「买」不构成对研究经理否决的推翻。
+
+#### ⑫.6 已知残留缺口（**登记，不要当已完成**）
+
+- **舆情 / 宏观黑天鹅仍打桩**（`DATA_UNAVAILABLE`）⇒ 需**联网 + API key + 配额** ⇒ 🔴 **需用户单独授权**。
+- **回测链仍不走 EWMA**：已登记的回测基线（**2026-11-06**）是 **MA20 闸门**口径 ⇒ 与现役 **MA60 + EWMA** 不一致 ⇒ 回测数字**仅作历史参考**（本轮**刻意不重跑** ⇒ 重跑会连带改上下文 ⇒ **sha1 链断**）。
+- ⚠️ 快照 **`20261111_142244`** 与 **`20261111_152132`（修复前）** **都是污染版** ⇒ **只可作事故证据，不可交付**。
+- 「**维持席位**」的权重可能 **> 单只 20% 上限**（维持行**权重不动**）—— 本轮因 `512800` 回归普通席位而**消失**，但**机制仍在** ⇒ 值得登记。
+
+### ⑬ 🔴 最终交付（本轮收尾 · 唯一可交付快照）
+
+- **交付快照号**：`20261111_163156`（asof = **2026-11-09**，每日链）
+  - 服务器：`/mnt/data/siping/runs/etf_rotation_results/snapshots/20261111_163156/`
+  - host 只读镜像：`etf_rotation_20261110/server_runs_etf_rotation/snapshots/20261111_163156/`
+- **验收**：`etf_rotation_20261110/accept_20261111.py` ⇒ **17 PASS / 0 FAIL / 0 SKIP**
+  （A1/A2/A2b/A3/A4/A5/A6/A7/B1/B2/B3/C1/C2/D1/D2/E1/E1b）。
+- **交易方案**：权益 **19.2%**／现金 **80.8%**（TA 建议权益上限 **32%** ⇒ 席位**等比缩放 0.4** ⇒ 每席 **6.4%**）
+  - `512800` **卖出 7700 → 2100**（−5600 股 @0.885）
+  - `515450` **买入 0 → 1300** @1.46
+  - `512170` **买入 0 → 5500** @0.347（替补 **159207**）
+  - `lot_rounding_gap_amount = +101.83`（≥0 ⇒ P4 绿）｜`feasible = true`｜`held_not_touched = false`
+- **TA 合规筛选**：`ta_screening.rejected` = **7 只** = `516620 / 159207 / 563020 / 515650 / 515020(银行ETF华夏) / 516310 / 512820`
+  ⇒ **无 512800 / 515450**。
+- **sha1 链闭合**：`ta_context_meta.json` 的 `context_sha1` == 决策件记录的 `meta.context_sha1` == `d54f2d4b…`
+  （`llm_stale=false`、`llm_decision_status=ok`）。
+- **服务器闸门（Pass15 = 最终代码基线，失败阶段数 0）**：**694** 条断言 PASS / **0** FAIL / **0** N/A / 0 跳过 / 退出码 **0**（Pass13 = **692** 条 PASS / 1 个 N/A；**N/A 变 0 正是复合方向格根因修好的证据**）
+  （前一轮的 2 个红 —— **D4 负例失效**（`_mutate_drop_side_tables` 只删一份同签名副本）与
+  **canonical 基线漂移**（旧基线用旧解析器 ⇒ 否决 12 只 vs 新解析器 13 只）—— 均已真修）。
+- 🔴 **审计 P1-1（假绿）已修**：生产闸门对「**不买，否决同族替代**」这类**复合方向格**认不出方向
+  ⇒ `515020/516310/512820` 落进 `unjudged` ⇒ 闸门判 **`status=na`（不适用 ≠ 通过）**
+  ⇒ 验收脚本旧实现走 `else: reporter.ok(...)` ⇒ **把「判不了」记成「过了」**（假绿）。
+  ⇒ 修法（**只放开非买侧**）：`probes/probe_verify_guards.py` 新增 `_classify_cell_direction`
+  （按分隔符切段后**只认 ZERO/NEUTRAL/REDUCE**；**买侧词不放开** ⇒「买，但仅在数据复核通过后」
+  这类**附条件**意见仍不算买侧证据 ⇒ 不会把真否决误判成误伤）；
+  验收脚本 A2 改为 **`status != "pass"` 一律记 SKIP**（na 既不算过、也不算不过），旧兜底路径标注「**口径降级**」。
+  ⇒ 复验：交付快照 A2 由 `na` 变**真 `pass`**（`unjudged` 清零），验收仍 **17 PASS / 0 FAIL / 0 SKIP**。
+- 🔴 **审计 P1-2（fail-open）已修**：`daily/agents_rebalance.py` 的上下文等价校验原为
+  「本轮 context 不存在 ⇒ 直接搬来源 context」⇒ 改成 **fail-closed**（缺 context ⇒ **不搬** ＋ 记理由）。
+- 🔴 **审计 P2-6 已修**：`run_gates.sh` 的 `ANALYZE_TOP_N` 读取原在 `cd "$REPO_ROOT"` **之前**
+  （相对路径只在 CWD==仓库根时可达 ⇒ 静默兜底成 100 ⇒ 口径漂移 ⇒ 闸门假红）⇒ 移到 `cd` 之后 ＋ 兜底不再静默。
+- ⚠️ **不可交付的事故快照**：`20261111_142244`、`20261111_152132`（修复前计划件）、
+  `20261111_161126`（假 stale，链断）、`20261111_162423`（Pass11 无 LLM 意见）—— **只作事故证据**。
+- ℹ️ **残留缺口（登记，不要当已完成）**：舆情 / 宏观打桩（需**联网 + API key + 配额** ⇒ 🔴 **需用户单独授权**）；
+  回测链仍 **MA20** 口径；「维持席位」> 20% 机制仍在。

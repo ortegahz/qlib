@@ -11,7 +11,7 @@
 | `notify_email.py` | `smtplib` + `email.mime` 发信（四套模板 + dry-run） |
 
 辅助模块：`daily_config.py`（常量单一事实源）、`account_state.py`（实盘账户基准）、
-`calendar_gate.py`（交易日历门，fail-closed）、`mode_router.py`（每日产物**路径**工具，无模式概念）。
+`calendar_gate.py`（交易日历门，fail-closed）、`run_paths.py`（每日产物**路径**工具，无模式概念）。
 
 入口（服务器工作副本 `/tmp/pycharm_project_658d3fc4`）：
 

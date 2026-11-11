@@ -1113,6 +1113,11 @@ def _rebuild_chain(
     exit_win = C.EXIT_MA_FILTER_WINDOW if exit_ma_window is None else int(exit_ma_window)
     held_codes = {str(c) for c in (current_holdings or {})}
     entry_ma = _ma_ok_map(prices, asof, entry_win)
+    #: 🔴 2026-11-11（文档 §二.2）：**入场闸门已切到 MA60**（`ENTRY_MA_FILTER_WINDOW = 60`），
+    #:    而「持仓诊断表」仍要展示 **MA20 状态** ⇒ 这里**单独**算一张 MA20 的 map，
+    #:    **只作参考展示**（`ma20_ok`），**不再**参与入场闸门判定（否则标签会说谎）。
+    _report_win = int(getattr(C, "TREND_MA_REPORT_WINDOW", 20) or 0)
+    report_ma = _ma_ok_map(prices, asof, _report_win) if _report_win != entry_win else entry_ma
     cand["entry_ma_ok"] = [
         (bool(entry_ma.get(str(c), False)) if entry_ma else True) or bool(d)
         for c, d in zip(cand["code"], cand["is_defensive"])
@@ -1359,6 +1364,8 @@ def _rebuild_chain(
         "conflicts": conflict_pairs,
         "entry_ma": entry_ma,
         "exit_ma": exit_ma,
+        #: 🔴 2026-11-11：报告口径的 MA20（**参考信号**，非闸门）—— 供持仓诊断表展示
+        "report_ma": report_ma,
         "exit_codes": sorted(exit_codes),
         "relaxed": relaxed,
         "weights_used": {"alpha": w_alpha, "momentum": w_mom},
@@ -1445,6 +1452,8 @@ def _diagnose_holdings(
     universe_codes = {str(c) for c in universe["code"]}
     entry_ma = chain["entry_ma"]
     exit_ma = chain["exit_ma"]
+    #: 🔴 报告口径的 MA20（参考信号）；老 chain 没有这个键 ⇒ 回落用 entry_ma（向后兼容）
+    report_ma = chain.get("report_ma") or entry_ma
     actions: list[dict] = []
 
     rows: list[dict] = []
@@ -1465,7 +1474,9 @@ def _diagnose_holdings(
         reason = reasons.get(code)
         # 🔴 无行情数据的 code 根本不在 MA map 里 ⇒ 不能用 `.get(code, False)`
         # （那会把「查不到」当成「跌破」，凭空造出强制退出理由）。None = 不可判定。
-        ma20_ok = entry_ma.get(code) if entry_ma else None
+        #: 🔴 `ma20_ok` = **报告口径**的 MA20（参考信号）；`ma60_ok` = 退出闸门（MA60）。
+        #:    ⚠️ 入场闸门（MA60）由 `cand["entry_ma_ok"]` 承担 ⇒ 这里**不再**拿 MA20 当闸门。
+        ma20_ok = report_ma.get(code) if report_ma else None
         ma60_ok = exit_ma.get(code) if exit_ma else None
         px_codes = set()
         if prices is not None and len(prices):
@@ -2142,7 +2153,10 @@ def _risk_disclosure(
             "severity": "medium",
             "detail": (
                 f"当前账户总资产 {_num(total_assets, 2)} 元、现金 {_num(cash, 2)} 元"
-                f" ⇒ 单笔规模很小；等权 {C.TARGET_N_HOLDINGS} 只、单只上限 40%；"
+                f" ⇒ 单笔规模很小；等权 {C.TARGET_N_HOLDINGS} 只"
+                f"（权益 ≤ {int((1.0 - C.CASH_RESERVE_RATIO) * 100)}%"
+                f" ⇒ 每只 ≈ {int((1.0 - C.CASH_RESERVE_RATIO) / max(C.TARGET_N_HOLDINGS, 1) * 100)}%，"
+                f"留 {int(C.CASH_RESERVE_RATIO * 100)}% 现金）、单只上限 40%；"
                 f"但**流动性过滤只卡在日均成交额 {C.MIN_AVG_AMOUNT_20D:,.0f} 元**，"
                 f"资金放大到千万级时冲击成本会非线性上升 ⇒ 容量结论**不可外推**。"
             ),
@@ -2299,7 +2313,9 @@ def _render_markdown(rep: dict) -> str:
     )
     add(
         f"4. **目标组合**：{rep['recommendation'].get('n_selected', 0)} 只"
-        f"（等权上限 {int(1.0 / max(C.TARGET_N_HOLDINGS, 1) * 100)}%，单只 ≤ 40%），"
+        f"（权益 ≤ {int((1.0 - C.CASH_RESERVE_RATIO) * 100)}%"
+        f"（留 {int(C.CASH_RESERVE_RATIO * 100)}% 现金）"
+        f" ⇒ 等权上限 {int((1.0 - C.CASH_RESERVE_RATIO) / max(C.TARGET_N_HOLDINGS, 1) * 100)}%，单只 ≤ 40%），"
         f"候选池 {rep['filter_stats']['n_candidate_pool']} 只 ⇒ 明细见 §六。"
     )
     add(
@@ -2341,7 +2357,7 @@ def _render_markdown(rep: dict) -> str:
         ["平滑半衰期", (
             f"{params['score_smoothing_half_life_days']} 个交易日"
             if params.get("score_smoothing_half_life_days") is not None else "-"
-        ), "EWMA 衰减速度；alpha=0.35 ⇒ 约 1.61 日（**不是**需求文档写的 3~5 日）"],
+        ), "EWMA 衰减速度；半衰期按实际 alpha 披露（文档要求 3~5 个交易日）"],
         ["平滑观测日", (
             "、".join(params.get("score_smoothing_observation_dates") or []) or "-"
         ), "实际参与平滑的打分日（打分栅格每 10 个交易日一个点 ⇒ 观测点稀疏）"],
@@ -2596,8 +2612,8 @@ def _render_markdown(rep: dict) -> str:
                     "是" if h.get("in_universe") else "否",
                     "是" if h.get("in_candidate_pool") else "否",
                     "是" if h.get("selected") else "否",
-                    ("MA20 " + ("✅" if h.get("ma20_ok") else "❌")
-                     + " / MA60 " + ("✅" if h.get("ma60_ok") else "❌")),
+                    ("MA20(参考) " + ("✅" if h.get("ma20_ok") else "❌")
+                     + " / MA60(闸门) " + ("✅" if h.get("ma60_ok") else "❌")),
                     _num(h.get("e_score"), 3),
                     _pct(h.get("mom120")),
                     h.get("reject_reason") or "—",
@@ -2885,7 +2901,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smoothing-window", type=int, default=None,
                    help="滚动窗口（**交易日**；默认 5）")
     p.add_argument("--smoothing-alpha", type=float, default=None,
-                   help="EWMA 系数 alpha（默认 0.35 ⇒ 半衰期约 1.61 个交易日）")
+                   help="EWMA 系数 alpha（默认取 config.SMOOTHING_ALPHA）")
     p.add_argument("--smoothing-history-days", type=int, default=None,
                    help="EWMA 预热历史跨度（**交易日**；默认 30）")
     p.add_argument("--entry-ma-window", type=int, default=None, help="入场破位过滤均线（0=关）")
@@ -3308,6 +3324,12 @@ def main() -> int:
     recommendation = {
         "n_selected": int(portfolio["n_selected"]),
         "cash_weight": portfolio["cash_weight"],
+        # 🔴 2026-11-10：现金**预留口径**随分析产物一起披露（留 20% 现金）
+        #    ⇒ 不靠外部记忆就能从 JSON 读出「权益 ≤ 80% / 每只 16%」
+        "cash_reserve_ratio": portfolio.get(
+            "cash_reserve_ratio", getattr(C, "CASH_RESERVE_RATIO", None)
+        ),
+        "equity_budget": portfolio.get("equity_budget", None),
         "weights_used": portfolio["weights_used"],
         "hold_buffer": portfolio["hold_buffer"],
         "actions": rec_actions,

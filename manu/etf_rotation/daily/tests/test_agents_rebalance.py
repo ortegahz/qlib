@@ -12,7 +12,7 @@
    现金缓冲守卫、卖出含印花税；
 4. 🔴 **观察态 / 实盘态二态**：``live_trade=False``（缺省）⇒ 执行卡**挂单禁用**；
    ``live_trade=True`` ⇒ 不带禁用标记（可下单）；
-5. 🔴 **无「模式」概念**：`mode_router` / `calendar_gate` 都**不许**再有 mode API；
+5. 🔴 **无「模式」概念**：`run_paths` / `calendar_gate` 都**不许**再有 mode API；
    当日口径只给**事实**（是否信号日 / 执行日 / 静默防守），**不带 mode 键**；
 6. ``build_run_dir`` / ``log_path``：路径前缀与建目录行为。
 """
@@ -33,7 +33,7 @@ if str(_DAILY) not in sys.path:
 import agents_rebalance as AR  # noqa: E402
 import calendar_gate as CG  # noqa: E402
 import daily_config as DC  # noqa: E402
-import mode_router as MR  # noqa: E402
+import run_paths as MR  # noqa: E402
 
 
 # ---------------------------------------------------------------- 合成数据工具
@@ -174,7 +174,12 @@ def test_card_money_fund_slot_is_unbuildable():
 
 
 def test_card_cash_buffer_guard():
-    """现金会被吃到 < 200 元 ⇒ 系统缩减买入，把现金拉回缓冲线之上。"""
+    """现金会被吃到 < 200 元 ⇒ 系统缩减买入，把现金拉回缓冲线之上。
+
+    🔴 2026-11-10：生效下限 = max(绝对 200 元, 总资产 × 现金预留比例)。
+    本夹具 ``total_assets=1000`` ⇒ 比例下限 = 1000 × 20% = **200 元**（与绝对下限相等）
+    ⇒ 行为与旧口径**完全一致** ⇒ 无需改断言（已实测通过）。
+    """
     card = _card(
         [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
           "price": 1.0, "target_amount": 400.0}],
@@ -187,7 +192,10 @@ def test_card_cash_buffer_guard():
 
 
 def test_card_cash_buffer_infeasible_is_reported():
-    """现金连缓冲线都保不住（无买入可减）⇒ feasible False + 明确 reason。"""
+    """现金连缓冲线都保不住（无买入可减）⇒ feasible False + 明确 reason。
+
+    🔴 2026-11-10：同上（``total_assets=1000`` ⇒ 比例下限 200 元 = 绝对下限）⇒ 行为不变。
+    """
     card = _card(
         [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
           "price": 1.0, "target_amount": 400.0}],
@@ -196,6 +204,37 @@ def test_card_cash_buffer_infeasible_is_reported():
     assert card["cash_flow"]["feasible"] is False
     assert card["post_trade"]["cash_buffer_ok"] is False
     assert any("不可行" in w for w in card["warnings"])
+
+
+def test_card_cash_reserve_ratio_floor_shrinks_buy():
+    """🔴 2026-11-10：**比例下限生效** —— 现金只剩 20.5%，绝对 200 元根本拦不住
+    ⇒ 买入必须被缩减，且调仓后现金 ≥ 总资产 × 现金预留比例。
+
+    夹具：总资产 100,000 元、现金 20,500 元
+    （比例下限 20% = 20,000 元 **>** 绝对下限 200 元 ⇒ 生效下限 = 20,000 元）
+    ⇒ 4,000 元的买单必须被砍到只剩几百元。
+    """
+    total_assets = 100_000.0
+    cash_begin = 20_500.0
+    reserve_floor = total_assets * DC.CASH_RESERVE_RATIO
+    card = _card(
+        [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
+          "price": 1.0, "target_amount": 4000.0}],
+        account={"total_assets": total_assets, "cash": cash_begin},
+    )
+    # 生效下限 = 比例下限（> 绝对下限 200 元）
+    assert card["constraints"]["cash_buffer_min_eff"] == pytest.approx(reserve_floor)
+    assert card["constraints"]["cash_reserve_ratio"] == DC.CASH_RESERVE_RATIO
+    # 买入被缩减（不缩减就会击穿 20% 现金预留）
+    assert card["cash_flow"]["scaled_down"], "比例下限生效时必须缩减买入"
+    order = card["orders"][0]
+    assert order["delta_shares"] < 4000
+    # 调仓后现金守住 20% 预留
+    assert card["post_trade"]["cash"] >= reserve_floor
+    assert card["post_trade"]["cash_reserve_ok"] is True
+    assert card["post_trade"]["cash_reserve_ratio"] == DC.CASH_RESERVE_RATIO
+    assert card["post_trade"]["cash_reserve_required"] == pytest.approx(reserve_floor, abs=0.01)
+    assert card["cash_flow"]["feasible"] is True
 
 
 def test_card_sell_fee_includes_stamp_duty():
@@ -278,8 +317,8 @@ def test_card_live_trade_mode_has_no_order_disabled_marker():
 
 
 def test_no_mode_routing_api_anywhere():
-    """mode_router / calendar_gate 都**不许**再暴露「模式」概念。"""
-    assert not hasattr(MR, "route"), "mode_router 不许再有 route()（模式分诊已下线）"
+    """run_paths / calendar_gate 都**不许**再暴露「模式」概念。"""
+    assert not hasattr(MR, "route"), "run_paths 不许再有 route()（模式分诊已下线）"
     for name in ("MODE_A", "MODE_B"):
         assert not hasattr(CG, name), f"calendar_gate 不许再有 {name}"
     for name in ("resolve_mode", "describe_mode"):

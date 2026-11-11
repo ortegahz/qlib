@@ -200,10 +200,22 @@ def option_b_shares(plan: dict, action: dict) -> int:
     """选项 B（采纳 LLM 最终裁决）的落地股数 = 从 `llm_final_decision.targets[code]` **推导**。
 
     * 方向 ∈ {卖, 不买, 不建仓, 清仓} ⇒ **0 股**；
-    * 方向 = 减 且原文给了保留手数（`shares_keep`）⇒ **保留该股数**；
+    * **有目标权重（`target_pct`）⇒ 按目标权重落地**（`floor(目标金额 ÷ 价格 ÷ 手数) × 手数`）
+      —— 与 `make_decision_options` / `make_decision_scenarios` **同口径**；
+    * 没有目标权重、方向 = 减 且原文给了保留手数（`shares_keep`）⇒ **保留该股数**；
     * 方向 = 买（或方向未知）⇒ 目标权重 × 账户总资产 ⇒ 折**整手**股数
       （`floor(目标金额 ÷ 价格 ÷ 手数) × 手数`）；
     * 通用兜底：**算出来的股数若对应金额 < 一手成本（价格 × 手数）⇒ 整手买不起 ⇒ 0 股**。
+
+    🔴 2026-11-11 口径修正（实测 2026-11-03 那一轮决策 md 实证）：
+       原文：「保留3,400份、卖出4,300份；保留市值约2,971.60元、权重约9.95%」
+       —— 这 3,400 份是**按参考价 0.874 元测算**的**示例**，而计划落地用的是**执行价**；
+       旧口径（`减` + `shares_keep` ⇒ 用股数）⇒ 3,400 × 0.88 = 2,992 元
+       = 总资产的 **10.02%** ⇒ **突破原文自己写的硬上限 10%**；
+       而按**目标权重 10%** 向下取整到整手 = 3,300 份 = 2,904 元 = **9.73%** ⇒ 不破上限。
+       ⇒ **目标权重是 LLM 的主口径，股数只是参考价下的示例** ⇒ 目标权重优先。
+       （生成器 `make_decision_scenarios` / `make_decision_options` 本来就是这个口径
+         ⇒ 旧口径会让独立重算与产物**必然对不上** ⇒ P6 假红。）
     """
     code = str(action["code"])
     price = float(action["price"])
@@ -211,15 +223,17 @@ def option_b_shares(plan: dict, action: dict) -> int:
     if not isinstance(final, dict):
         raise ValueError(f"llm_final_decision.targets 缺 {code} 的条目（抽不出 ⇒ 报错，不许默认）")
     direction = str(final.get("direction") or "").strip()
+    target_pct = final.get("target_pct")
     if direction in ZERO_DIRECTIONS:
         shares = 0
+    elif target_pct is not None:
+        # 🔴 目标权重优先（口径见 docstring）：LLM 的主口径是「降至 X%」，
+        #    原文股数只是**参考价**下的示例 ⇒ 用执行价落地时会漂移（可能破硬上限）。
+        shares = shares_from_target_pct(float(target_pct), price, plan_total_assets(plan))
     elif direction == "减" and final.get("shares_keep") is not None:
         shares = int(final["shares_keep"])
     else:
-        target_pct = final.get("target_pct")
-        if target_pct is None:
-            raise ValueError(f"llm_final_decision.targets[{code}] 无方向也无 target_pct（抽不出 ⇒ 报错）")
-        shares = shares_from_target_pct(float(target_pct), price, plan_total_assets(plan))
+        raise ValueError(f"llm_final_decision.targets[{code}] 无方向也无 target_pct（抽不出 ⇒ 报错）")
     one_lot_cost = price * LOT_SIZE
     if shares > 0 and shares * price < one_lot_cost - 1e-9:
         shares = 0
@@ -365,7 +379,7 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
                          f"断言 {len(assertions)} 条全 PASS")
 
         # --- P5 A/A/A 现金 == plan.cash_flow.cash_end ---
-        # 🔴 2026-11-09 修（Mode C v2 独立审计后补）：原来**写死**标签
+        # 🔴 修（2026-11-09 独立审计实证）：原来**写死**标签
         #    「全 A」组合标签串 ⇒ 分歧标的集合一变（本轮 LLM 裁决不同 ⇒
         #    分歧项就换人）就「找不到 A/A/A 情景」⇒ **假红**。
         #    ⇒ 改成**动态找「全部选项都是 A」的情景**（2^N 情景 ⇒ 唯一）

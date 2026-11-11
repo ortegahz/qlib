@@ -551,12 +551,33 @@ def _mutate_drop_side_tables(md_text: str, side_blocks: dict[str, list[list[str]
     located = _locate_debate_blocks(lines, side_blocks)
     spans = located.get(side) or []
     drop: set[int] = set()
+    _dropped_spans: list[tuple[int, int]] = []
     for bi in range(len(side_bullets)):
         span = spans[bi] if bi < len(spans) else None
         if span is None:
             raise ValueError(f"{side} 侧第 {bi + 1} 张表块在交付 md 里定位不到"
                              " ⇒ 负例无法构造")
         drop.update(range(span[0], span[1]))
+        _dropped_spans.append(span)
+    # 🔴 2026-11-11 修（**D4 负例失效 ⇒ 闸门假红**）：
+    #    同一张表在交付 md 里可能**出现不止一次**（多头表在「多空辩论要点」与
+    #    「Trader 交易计划」里各出现一次）⇒ 只删**定位到的那一份**时，
+    #    P7 仍能在 md 里找到另一张「表头逐字相同 + 行数相同」的表 ⇒
+    #    P7 **真空 PASS**（它只检查「找到的表块」自不自洽）⇒
+    #    D4 要求的「P6 **与** P7 必须同时 FAIL」永远不成立 ⇒ 负例**没有牙**
+    #    （实测 2026-11-11：Pass10 / Pass12 都红在 D4）。
+    #    ⇒ 修法：把**同签名（表头逐字 + 行数）**的所有 md 表块**一起删掉**
+    #      ⇒ 真正模拟「这一侧的表块**整块**消失」⇒ P7 必 FAIL ⇒ 负例恢复牙齿。
+    _sigs = set()
+    for _span in _dropped_spans:
+        _rows = lines[_span[0]:_span[1]]
+        if _rows:
+            _sigs.add((_rows[0], len(_rows)))
+    if _sigs:
+        for _span in _table_block_spans(lines):
+            _rows = lines[_span[0]:_span[1]]
+            if ((_rows[0] if _rows else ""), len(_rows)) in _sigs:
+                drop.update(range(_span[0], _span[1]))
     kept = [line for i, line in enumerate(lines) if i not in drop]
     return _join_lines(kept, md_text)
 

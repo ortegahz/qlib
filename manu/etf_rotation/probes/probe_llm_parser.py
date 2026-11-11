@@ -350,7 +350,7 @@ _BUY_ACTION_RE = re.compile(
 #:       （「只有 512800 保留，其余清仓」这种句子仍要能看出清仓 ⇒ 少判条件更安全）。
 _COND_WORDS = ("若", "如果", "假如", "倘若", "一旦", "除非", "只有当", "条件", "触发")
 
-#: 🔴 2026-11-09（Mode C v2 审计实证）：「**已触发**」是**既成事实**，不是条件。
+#: 🔴（2026-11-09 独立审计实证）：「**已触发**」是**既成事实**，不是条件。
 #:    与解析器 `llm_final._FACT_TRIGGER_RE` **同口径**（探针与被测物必须一致）：
 #:    实测：LLM 最终表写「| **159929** | **卖出** | 0% | 已触发持仓MA60强制退出 …」
 #:    ⇒ 旧口径把「触发」当条件词 ⇒ 这条**真裁决**被当成条件句跳过
@@ -407,83 +407,268 @@ def _md_table_codes(block: list[str]) -> set[str]:
     return codes
 
 
+#: 表格「方向」列的**列名**候选（不写死某一份 md 的措辞：方向/操作/动作 都认）
+_MD_DIR_HEADER_KEYS = ("方向", "操作", "动作")
+#: 买侧方向词（`不`/`未` 前缀 ⇒ 否定式「不买/未买」**不算**买侧）
+_MD_BUY_DIR_RE = re.compile(r"(?<!不)(?:买入|增持|加仓|建仓|增配|买)")
+#: 卖侧方向词（同样排除否定式）
+_MD_SELL_DIR_RE = re.compile(r"(?<!不)(?:卖出|减持|减仓|清仓|卖清|降配|卖|减)")
+def _md_direction_cells(block: list[str]) -> list[str]:
+    """取表格块「方向」列的取值列表（**没有方向列** ⇒ 返回空表 ⇒ 不参与方向判定）。
+
+    🔴 为什么必须按**列**取而不是全格扫描：理由格/质询格里也会出现
+       「买入」「卖出」等词（散文性质）⇒ 全格扫描会把「提到了方向」当成「方向列」，
+       判据就失去意义（⇒ 又变成一个形同虚设的检查）。
+    """
+    header = _md_cells(block[0]) if block else []
+    idx = None
+    for i, cell in enumerate(header):
+        if any(k in cell for k in _MD_DIR_HEADER_KEYS):
+            idx = i
+            break
+    if idx is None:
+        return []
+    vals: list[str] = []
+    for line in block[2:]:  # 跳过表头 + 分隔行
+        cells = _md_cells(line)
+        if idx < len(cells):
+            vals.append(cells[idx].replace("**", "").replace("`", "").strip())
+    return vals
+
+
+def _md_rewrite_blocks(text: str, fn) -> str:
+    """按**表格块**重写 md：``fn(idx, block) -> 新块(list) 或 None(删掉该块)``。"""
+    out: list[str] = []
+    cur: list[str] = []
+    idx = 0
+
+    def flush() -> None:
+        nonlocal idx
+        if len(cur) >= _MIN_TABLE_ROWS:
+            new_block = fn(idx, cur)
+            idx += 1
+            if new_block is not None:
+                out.extend(new_block)
+        cur.clear()
+
+    for line in (text or "").splitlines():
+        if line.startswith("|"):
+            cur.append(line)
+            continue
+        flush()
+        out.append(line)
+    flush()
+    return "\n".join(out)
+
+
+def _mut_keep_one_coded_table(text: str) -> str:
+    """只留**第一张**含代码的表（模拟「多头表/空头表被整表切掉」）。"""
+    state = {"kept": False}
+
+    def fn(idx, block):
+        if not _md_table_codes(block):
+            return block
+        if state["kept"]:
+            return None
+        state["kept"] = True
+        return block
+
+    return _md_rewrite_blocks(text, fn)
+
+
+def _mut_set_direction(text: str, value: str) -> str:
+    """把**所有**含代码的表的方向列整列改成同一个方向词（模拟「某一侧整表消失」）。"""
+    def fn(idx, block):
+        if not _md_table_codes(block):
+            return block
+        header = _md_cells(block[0])
+        di = None
+        for i, cell in enumerate(header):
+            if any(k in cell for k in _MD_DIR_HEADER_KEYS):
+                di = i
+                break
+        if di is None or len(block) < 3:
+            return block
+        new_block = [block[0], block[1]]
+        for line in block[2:]:
+            cells = _md_cells(line)
+            if di < len(cells):
+                cells[di] = f"**{value}**"
+                new_block.append("|" + "|".join(cells) + "|")
+            else:
+                new_block.append(line)
+        return new_block
+
+    return _md_rewrite_blocks(text, fn)
+
+
+def _mut_unique_code_sets(text: str) -> str:
+    """每张表换成**自己独有的**代码 ⇒ 各表代码集合**两两不相交** ⇒ 「没有成对的表」。
+
+    🔴 2026-11-11 **随判据①换版一起校准**（负例必须跟着判据换版，否则会变成空跑）：
+       旧写法只给每张表**注入 1 个**唯一代码（表里其余代码照旧）
+       ⇒ 实测注入后 5 个表块**仍然两两重叠**（多头表 ∩ 最终表依旧 7 个代码）
+       ⇒ 在**新判据**（成对 = 代码集合**有实质重叠**）下这个负例**拦不住任何东西**
+         （变异后判据仍 PASS）⇒ 负例就失去「证明判据有牙」的作用。
+       ⇒ 现在改成**每张表的所有代码都换成它自己独有的**（各表代码集合两两不相交）
+       ⇒ 这才是新判据口径下的「**没有成对的表**」⇒ 判据必须 FAIL。
+       （旧写法只对**旧判据**（成对 = 集合完全相同）有效 —— 旧判据下它确实拦得住。）
+    """
+    def fn(idx, block):
+        codes = sorted(_md_table_codes(block))
+        if not codes:
+            return block
+        #: 每个表块一套**自己独有的**代码（900000 段，真实 md 里不会出现）
+        mapping = {c: f"{900000 + idx * 100 + n:06d}" for n, c in enumerate(codes)}
+        out = []
+        for line in block:
+            out.append(re.sub(r"(?<!\d)\d{6}(?!\d)",
+                              lambda m: mapping.get(m.group(0), m.group(0)), line))
+        return out
+
+    return _md_rewrite_blocks(text, fn)
+
+
+def _mut_add_orphan_table(text: str) -> str:
+    """凭空多出一张含**新代码**的孤表（不在任何**成对表**的代码并集里）。"""
+    orphan = [
+        "| 标的 | 当前权重 | 方向 | 调仓后目标 | 执行理由 |",
+        "|:--|--:|:--|--:|",
+        "| 900099 | 0.00% | 买入 | 10.00% | 凭空多出来的一张表 |",
+    ]
+    return (text or "").rstrip("\n") + "\n\n" + "\n".join(orphan) + "\n"
+
+
+#: 「成对表」判据的**共享代码数下限**（2026-11-11 判据换版时定下；**不写死代码/行数**）。
+_MD_PAIR_MIN_SHARED = 2
+
+
+def _md_pair_threshold(a: frozenset[str], b: frozenset[str]) -> int:
+    """两张表「**成对**」所需的最小共享代码数（口径见 `_md_table_invariant` 的 docstring）。
+
+    🔴 口径（2026-11-11 定）：共享代码数 ≥ **2** **且** ≥ **较小集合的一半**（向上取整）
+       ⇒ 要求「**实质重叠**」，而不是「碰巧共享 1 个代码」。
+       · 退化情形：两张表都是**同一个单代码**集合 ⇒ 阈值取 1（它们本来就是同一张表）。
+    """
+    smaller = min(len(a), len(b))
+    if smaller <= 1:
+        return 1
+    return max(_MD_PAIR_MIN_SHARED, -(-smaller // 2))  # ceil(smaller / 2)
+
+
 def _md_table_invariant(text: str) -> tuple[bool, str]:
     """**表格块不变量**（A19② 的口径）：判据依据是**与是哪一份 md 无关的结构不变量**。
 
-    **前置**：含代码的表格块 ≥2 个。
+    **前置**：含代码的表格块 ≥2 个（**不变**）。
 
-    **两条判据**（2026-11-09 起生效；① 于 2026-11-10 **换判据**，理由见下面注释）：
-    ① **孤表**必须被「已重复代码集合」的**并集**覆盖
-       （⇒ 只出现 1 次、且含有重复集合里没有的代码的表格块 ⇒ FAIL）；
-    ② **≥2 个不同的代码集合**各出现 ≥2 次（⇒ 多头表 + 空头头表**都在**）。
+    **三条判据**（① 于 2026-11-11 **换判据**，换版的**事实依据**见下面的注释）：
+    ① **成对**：含代码的表格块之间必须存在**代码集合实质重叠**的一对
+       （共享代码数 ≥ 2 **且** ≥ 较小集合的一半，向上取整 ⇒ 口径见 `_md_pair_threshold`）
+       ⇒ 一张都配不上 ⇒ FAIL；
+    ② **方向语义双向覆盖**（**不变**）：表格的「方向/操作/动作」列里必须**同时**
+       读得出买侧与卖侧（表格只有单侧、但**正文仍在讲另一侧** ⇒ FAIL）；
+    ③ **孤表**：每张含代码的表都必须被「**成对表**的代码**并集**」**完全覆盖**
+       （⇒ 凭空多出一张含新代码的表 ⇒ FAIL）。
 
-    ⇒ 两条判据能抓住的缺陷（**不依赖任何行数/代码阈值**）：
-      · **多头表腰斩 / 空头表整表切掉** ⇒ 重复出现的代码集合只剩 **1** 个
-        （多头表与空头表不再**成对出现**）⇒ **判据② 失效 ⇒ FAIL**；
-      · **多出一张含新代码的孤表** ⇒ 该表只出现 1 次、且它的代码不在重复集合的
-        并集里 ⇒ **判据① 失效 ⇒ FAIL**。
+    ⇒ 三条判据能抓住的缺陷（**不依赖任何行数/代码阈值**）：
+      · **多头表腰斩 / 空头表整表切掉** ⇒ 剩下的表不再**成对**（被腰斩那张的独有
+        代码变成孤码）⇒ **判据①/③ 失效 ⇒ FAIL**；
+      · **多出一张含新代码的孤表** ⇒ 该表与谁都不成对、它的代码也不在成对并集里
+        ⇒ **判据③ 失效 ⇒ FAIL**；
+      · **某一侧整表消失** ⇒ 方向列只剩单侧、正文却还有另一侧意图 ⇒ **判据② ⇒ FAIL**。
 
-    🔴 旧判据（③「重复出现的代码集合必须**同时是所有块里最大的**」）已被**替换**
-      （换掉的理由是**实测误红**，不是「比旧判据更强」）：
-      实测 2026-11-09 那一轮决策 md —— 多头表 / 空头表 / 研究经理三张表是
-      **同一个 9 代码集合**（出现 **3** 次），Trader 的最终表是 **10 代码集合**
-      （出现 **2** 次）⇒ 旧判据取「出现 3 次的 9 代码集合」当基准，
-      再看到「存在 10 代码的更大集合」⇒ 报「多出了半个表」
-      ⇒ **误红**（那一轮 md **并没有**半张表）。
+    🔴 2026-11-11 判据①**换版**的**事实依据**（**实测假红**，**不是「比旧判据更强」**）：
+       交付件快照 `20261111_122825` 的官方决策 md 里，5 个含代码的表格块的
+       **代码集合两两不同**（多头表 7 个 / 空头表 7 个 / 目标配置表 4 个 /
+       Trader 最终表 11 个 / 指标对照表 3 个）⇒ 旧判据①要求「**完全相同**的
+       代码集合在 ≥2 个表格块里重复出现」⇒ **一个都不重复** ⇒ **假红**；
+       而同链的 A19④「md == 用现版 `_tail` 从决策 json 重渲 ⇒ 逐字节相等」
+       **PASS**、且多头表/空头表**都在** ⇒ 这份 md **没有**被腰斩/切表。
+       ⇒ 实测交集：B1∩B4 = 7、B2∩B4 = 7、B3∩B4 = 4、B5∩B4 = 3
+         ⇒ 5 个块**全部成对**（成对表代码并集 = 最终表的 11 个代码）⇒ 新判据① PASS。
+       ⇒ 换版方向：旧判据要求「集合**完全相同**」太脆（LLM 每轮把多空写成
+         **不同的标的子集**就会误红）⇒ 新判据只要求「**实质重叠**」。
+       ⇒ **新判据不比旧判据更强**（覆盖面更宽 ⇒ 更容易 PASS）—— 换版的目的是
+         **消除实测假红**，同时保住「整表被切掉 ⇒ 没有成对表 ⇒ FAIL」这条牙
+         （`_tail` 侧的变异负例见 A19④；本判据自身的变异负例见 A19② 的 N-A19①~⑤）。
 
-    ⇒ 判据只看**代码集合的重复次数**（不写死代码集合、不写死行数）
-      ⇒ LLM 换表格写法不误红，而真腰斩 / 真切表仍红
-      （`_tail` 侧的变异负例见 A19④）。
+    🔴 历史（换版链，**每次都是实测误红 ⇒ 换判据**，不是「越换越强」）：
+       · 2026-11-09：旧判据「重复集合必须**同时是所有块里最大的**」⇒ 实测 9 代码
+         集合 ×3 vs 10 代码集合 ×2 ⇒ **误红** ⇒ 换成「孤表必须被重复集合并集覆盖」。
+       · 2026-11-10：判据① 又从「**全局最大**集合必须重复」换成「孤表必须被已重复
+         集合的并集覆盖」（19 代码的汇总表合法地只出现 1 次 ⇒ 旧判据**误红**）。
+       · 2026-11-11：判据① 再从「**完全相同**的集合重复出现」换成「**成对**
+         （代码集合有实质重叠）」—— 今天这份 md 的 5 个块代码集合**两两不同**、
+         但交集充分 ⇒ 旧判据**假红**（本条注释开头）。
     """
     blocks = _md_table_blocks(text)
     coded = [b for b in blocks if _md_table_codes(b)]
     if len(coded) < 2:
         return False, f"含代码的表格块只有 {len(coded)} 个（必须 ≥2）"
-    counts: dict[frozenset[str], int] = {}
-    for b in coded:
-        key = frozenset(_md_table_codes(b))
-        counts[key] = counts.get(key, 0) + 1
-    detail_sets = "；".join(
-        f"{sorted(s)}×{c}" for s, c in sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0]))))
-    # 🔴 2026-11-09（Mode C v2 审计实证）**判据修正**：
-    #    旧写法把「**出现次数最多**的集合」与「**最大**集合」当成同一个 ⇒ 误红。
-    #    实测 2026-11-09 这一轮决策 md：多头/空头/研究经理三张表是**同一个 9 代码集合**
-    #    （出现 3 次），Trader 的最终表是**10 代码集合**（出现 2 次）
-    #    ⇒ 旧判据取「出现 3 次的 9 代码集合」当基准，再发现「存在 10 代码的更大集合」
-    #    ⇒ 报「多出了半个表」⇒ **误红**（这一轮 md **没有**半张表）。
-    #    ⇒ 判据（**与旧判据不同** —— 不是「更强」而是「不误红」，仍不写死代码/行数）：
-    #      ① **孤表**必须被「已重复代码集合」的**并集**覆盖；
-    #      ② **≥2 个不同的代码集合**各出现 ≥2 次（⇒ 多头表 + 空头表**都在**
-    #         ⇒ 任一张被腰斩/整表切掉 ⇒ 重复的集合就只剩 1 个 ⇒ 立刻 FAIL）。
-    #    ⇒ 判据仍能抓住 docstring 列出的两类缺陷（多头表腰斩 / 空头表整表切掉、
-    #      凭空多出含新代码的孤表），`_tail` 侧的**变异负例**见 A19④
-    #      （真负例 ⇒ 不许 vacuous 通过）。
-    # 🔴 2026-11-10（实测红灯）：判据① 从「**全局最大**集合必须重复」换成
-    #    「**孤表**必须被已重复集合的**并集**覆盖」。换判据的**事实依据**（不是「变松」）：
-    #    本轮决策 md（750 行 / 110 表格行 / 10 块 / 6 个代码集合）——
-    #    多头表（行 174-185）与空头表（行 430-436）**都在且完整**，
-    #    重复集合有 2 个（5 代码 ×4、15 代码 ×2 ⇒ 判据② PASS）；
-    #    而那张 **19 代码**的表是**研究经理「各标的操作意见」汇总表**（行 686-706）
-    #    = 上面两个重复集合的**并集** ⇒ 它**合法地只出现 1 次**
-    #    ⇒ 旧判据①（「全局最大集合必须重复」）⇒ **误红**。
-    #    ⇒ 新判据①：只出现 1 次的表，必须是重复集合并集的**子集**（汇总表合法）
-    #      —— 含并集里没有的新代码 ⇒ **孤表** ⇒ FAIL。
-    max_size = max(len(s) for s in counts)
-    repeated_sets = [s for s, c in counts.items() if c >= 2]
-    if len(repeated_sets) < 2:
-        return False, (f"只有 {len(repeated_sets)} 个代码集合在 ≥2 个表格块里重复出现"
-                       f"（必须 ≥2 ⇒ 多头表与空头表都在；有一张被腰斩/切掉了）"
-                       f"｜各集合出现次数：{detail_sets}")
-    union = set().union(*repeated_sets) if repeated_sets else set()
-    orphans = [s for s, c in counts.items() if c == 1 and not set(s) <= union]
+    code_sets = [frozenset(_md_table_codes(b)) for b in coded]
+    detail_sets = "；".join(f"块{i} {sorted(s)}" for i, s in enumerate(code_sets))
+    # ---- 判据①：**成对**（代码集合有实质重叠 ⇒ 多头表与空头表是同一批标的的两种写法）----
+    pairs: list[tuple[int, int, frozenset[str]]] = []
+    for i in range(len(code_sets)):
+        for j in range(i + 1, len(code_sets)):
+            shared = code_sets[i] & code_sets[j]
+            if len(shared) >= _md_pair_threshold(code_sets[i], code_sets[j]):
+                pairs.append((i, j, shared))
+    if not pairs:
+        return False, (f"没有任何两张含代码的表**成对**"
+                       f"（成对 = 共享代码数 ≥{_MD_PAIR_MIN_SHARED} 且 ≥较小集合的一半）"
+                       f"（md 里没有成对的表 ⇒ 多半有一张被整表切掉）"
+                       f"｜各块代码集合：{detail_sets}")
+    paired_blocks = {i for i, _, _ in pairs} | {j for _, j, _ in pairs}
+    # ---- 判据③：**孤表**必须被「成对表的代码并集」完全覆盖 ----
+    #    🔴 「并集」= **成对块**的代码并集（不是「所有块」的并集）：
+    #       凭空多出的那张表与谁都不成对、它的代码也不在这个并集里 ⇒ **孤表** ⇒ FAIL。
+    covered = set().union(*[code_sets[i] for i in sorted(paired_blocks)])
+    orphans = [code_sets[i] for i in range(len(code_sets)) if not code_sets[i] <= covered]
     if orphans:
-        return False, (f"有 {len(orphans)} 张表含重复集合里没有的代码（孤表）"
+        return False, (f"有 {len(orphans)} 张表含成对表覆盖不到的代码（孤表）"
                        f"｜孤表代码集合={[sorted(s) for s in orphans]}"
-                       f"｜重复集合并集 {len(union)} 个代码｜各集合出现次数：{detail_sets}")
-    return True, (f"含代码的表格块 {len(coded)} 个｜最大代码集合 {max_size} 个代码"
-                  f"｜重复出现的代码集合 {len(repeated_sets)} 个"
-                  f"（并集 {len(union)} 个代码）｜孤表 0 张"
-                  f"｜各集合出现次数：{detail_sets}")
+                       f"｜成对表代码并集 {len(covered)} 个代码"
+                       f"｜各块代码集合：{detail_sets}")
+    dir_vals = []
+    for _b in coded:
+        dir_vals.extend(_md_direction_cells(_b))
+    has_buy = any(_MD_BUY_DIR_RE.search(_v) for _v in dir_vals)
+    has_sell = any(_MD_SELL_DIR_RE.search(_v) for _v in dir_vals)
+    # 🔴 「单侧」到底算不算缺陷 ⇒ 用**正文意图**交叉校验（而不是拍脑袋写死）：
+    #    · 表格里只有卖侧、但**正文仍在讲买入** ⇒ 多头表被腰斩/整表切掉 ⇒ FAIL；
+    #    · 表格里只有卖侧、且**正文也没有任何买入意图** ⇒ 这是「本轮清仓/持币」的
+    #      **合法**决策（LLM 决定全部留现金）⇒ **不判红**（否则又是一次误红）。
+    #    （实测两份真实 md 的正文都同时有买/卖意图 ⇒ 双侧表格 ⇒ 一律 PASS。）
+    prose = "\n".join(ln for ln in (text or "").splitlines() if not ln.startswith("|"))
+    prose_buy = _md_first_unnegated(prose, ("买入", "加仓", "增持", "建仓")) is not None
+    prose_sell = _md_first_unnegated(prose, ("卖出", "清仓", "减持", "减仓")) is not None
+    _sample = sorted({v for v in dir_vals})[:6]
+    if has_buy and has_sell:
+        dir_note = (f"方向语义：买侧 ✓ / 卖侧 ✓（方向列取值样本 {_sample}）")
+    elif has_sell and not has_buy:
+        if prose_buy:
+            return False, (f"表格的方向列里**只有卖侧**（买侧缺失），但**正文仍在讲买入**"
+                           f"⇒ 多头表被腰斩/整表切掉"
+                           f"｜方向列取值样本 {_sample}"
+                           f"｜各块代码集合：{detail_sets}")
+        dir_note = ("方向语义：只有卖侧，且**正文也没有买入意图**"
+                    "⇒ 本轮「清仓/持币」单侧决策合法 ⇒ 跳过双向判定")
+    elif has_buy and not has_sell:
+        if prose_sell:
+            return False, (f"表格的方向列里**只有买侧**（卖侧缺失），但**正文仍在讲卖出**"
+                           f"⇒ 空头表被腰斩/整表切掉"
+                           f"｜方向列取值样本 {_sample}"
+                           f"｜各块代码集合：{detail_sets}")
+        dir_note = "方向语义：只有买侧，且正文也没有卖出意图 ⇒ 跳过双向判定"
+    else:
+        dir_note = ("方向语义：方向列里读不出买/卖方向（全是「持有/不买」之类）"
+                    "⇒ 跳过双向判定（由 A19①/③/④ 与 A20 承担）")
+    return True, (f"含代码的表格块 {len(coded)} 个｜成对表 {len(pairs)} 对"
+                  f"（成对块 {len(paired_blocks)} 个）"
+                  f"｜成对表代码并集 {len(covered)} 个代码｜孤表 0 张"
+                  f"｜{dir_note}"
+                  f"｜各块代码集合：{detail_sets}")
 
 
 def _md_table_structure(text: str) -> tuple[bool, str]:
@@ -680,6 +865,13 @@ def _md_clause_codes(clause: str) -> list[str]:
     return group
 
 
+#: 「卖出超配部分」「卖出部分」等**部分卖出**写法（2026-11-11 日常链真件）。
+_MD_SELL_PARTIAL_RE = re.compile(r"(?:卖出|卖掉)　?[^\uff0c\uff1b。|]{0,6}?部分")
+
+#: 「保留/持有/维持/留下」等**持有语义**词（「卖超配、留底仓」口径）。
+_MD_KEEP_TOKENS: tuple[str, ...] = ("保留", "持有", "维持", "留下", "留着", "保底仓")
+
+
 def _md_clause_zero_word(clause: str) -> str | None:
     """子句里写明的**零方向**（清仓 / 卖出全部 / 不买 / 不建仓）；没有则 None。
 
@@ -701,8 +893,58 @@ def _md_clause_zero_word(clause: str) -> str | None:
         return None
     sell = _md_first_unnegated(text, ("卖出", "卖掉"))
     if sell:
+        # 🔴 2026-11-11（真误伤 · 每日链快照 `20261111_142244`）：
+        #    「…**`512800`卖出超配部分、保留16%核心」
+        #    ⇒ 裸「卖出」命中零方向规则 ⇒ 探针把 512800 判成**清仓**
+        #    ⇒ 而计划里 512800 是「减至 16%」⇒ **假红**（A20．）。
+        #    ⇒ 口径：卖出子句里出现**持有语义**（保留/持有/维持/留下）
+        #      ⇒ 这是「卖超配、留底仓」⇒ **部分卖出**，不是零方向。
+        #    （清仓/清零分支不受影响 ⇒ 真清仓仍然判零方向）
+        if any(w in text for w in _MD_KEEP_TOKENS) or _MD_SELL_PARTIAL_RE.search(text):
+            return None
         return sell
     return _md_first_unnegated(text, _ZERO_NOBUY_WORDS)
+
+
+#: 「部分卖出（减仓）」标记（**照抄解析器** `llm_final._PARTIAL_SELL_MARKERS`）
+_MD_PARTIAL_SELL_MARKERS: tuple[str, ...] = ("减仓", "减持", "减掉")
+
+#: 「减仓」标记后**多远**以内出现代码 ⇒ 认为该标记**点名**那只标的
+#:    （**照抄解析器** `llm_final._PARTIAL_SELL_NAMED_TAIL`）
+_MD_PARTIAL_SELL_NAMED_TAIL = 12
+
+
+def _md_sentence_partial_sell_codes(sentence: str) -> set[str]:
+    """句子里被**明确**说成「减仓 / 部分卖出」的代码集合。
+
+    🔴 2026-11-11 实测事故（A20⑥ 假红）：真机交付件里 LLM 写
+       「最终决策是：**卖出（Sell）512800，但属于减仓而非清仓式看空。**」
+       ⇒ 子句切分在「，」处把**限定语**切掉了 ⇒ 只剩「卖出（Sell）512800」
+       ⇒ 裸「卖出」规则命中 ⇒ 512800 被判成**零方向（清仓）**
+       ⇒ 而计划里 512800 是「减仓至 12%」⇒ 探针报「原文写明零方向，但计划目标=12.0」
+       ⇒ **探针误杀**（真缺陷在解析器侧早已修好，探针口径没跟上）。
+
+    🔴 口径（与解析器 `llm_final._sentence_partial_sell_codes` **同源**，只多一条保守规则）：
+       · 标记后 ≤ `_MD_PARTIAL_SELL_NAMED_TAIL` 字内出现代码 ⇒ 该标记**点名**那只标的；
+       · 标记后**没有**代码 ⇒ 标记是**泛指**表述
+         ⇒ 解析器会泛指到**句内所有代码**；**探针只在该句只有一只代码（无歧义）时才泛指**
+         ⇒ 宁可漏判、不可误杀（探针的职责是「发现矛盾」，不是替解析器兜底）。
+
+    🔴 为什么不能只靠子句级规则：限定语「但属于减仓而非清仓」就在**下一个子句**里
+       ⇒ 子句级永远看不见 ⇒ 必须回到**句级**。
+    """
+    out: set[str] = set()
+    text = sentence or ""
+    #: 🔴 **去重**（同一只代码在句里出现多次也算「只有一只」）
+    codes = list(dict.fromkeys(m.group(1) for m in _CODE_RE.finditer(text)))
+    for marker in _MD_PARTIAL_SELL_MARKERS:
+        for mm in re.finditer(re.escape(marker), text):
+            named = _CODE_RE.search(text[mm.end():mm.end() + _MD_PARTIAL_SELL_NAMED_TAIL])
+            if named:
+                out.add(named.group(1))
+            elif len(codes) == 1:
+                out.add(codes[0])
+    return out
 
 
 def _md_has_partial_action(clause: str) -> bool:
@@ -777,9 +1019,19 @@ def _md_zero_direction_codes(md_text: str) -> tuple[set[str], str]:
     for sentence in _md_sentences(section):
         if _md_is_conditional(sentence):
             continue
+        #: 句级「部分卖出」护栏（见 `_md_sentence_partial_sell_codes`）
+        #: 🔴 子句级规则看不见「，但属于减仓而非清仓」这类**句尾限定语** ⇒ 必须句级兜底
+        _partial = _md_sentence_partial_sell_codes(sentence)
         for clause in _md_clauses(sentence):
-            if _md_clause_zero_word(clause):
-                from_prose.update(_md_clause_codes(clause))
+            _zw = _md_clause_zero_word(clause)
+            if not _zw:
+                continue
+            _codes = _md_clause_codes(clause)
+            if (_zw in ("卖出", "卖掉") and _codes
+                    and all(c in _partial for c in _codes)):
+                # 句级护栏：这是「减仓」不是「清仓」⇒ 不进零方向集合
+                continue
+            from_prose.update(_codes)
     codes = from_table | from_prose
     return codes, (f"最终裁决章节：表格方向列 {len(from_table)} 个代码"
                    f"｜散文子句 {len(from_prose)} 个代码｜合计 {len(codes)} 个")
@@ -797,6 +1049,34 @@ def _synthetic(decision_md: Path, body: str, total_assets: float | None = None) 
     #    （不传 ⇒ 折算不出来 ⇒ 该行被丢 ⇒ 探针会误判成「建议列没认出来」）。
     return F._llm_target_views(str(decision_md), total_assets)
 
+
+
+def _zero_guard_neutralized(mod=F):
+    """把 ZERO 方向守卫**同时回退**（变回「旧实现」的样子）。
+
+    🔴 2026-11-11：生产代码新增了「ZERO 方向（卖/清仓/不买…）⇒ 目标权重必然 0%」
+       的守卫（`_ZERO_DIR_WORDS`）。它**先于**任何数字路径生效 ⇒ 下面几个
+       **变异反例**（A15 / A17 ⑤ / A17 ⑥）即使把被测守卫回退掉，ZERO 守卫
+       仍会把结果压成 0.0 ⇒ 反例**变成真空**（永远拿不到期望的错误值）。
+    ⇒ 变异时必须**连 ZERO 守卫一起回退**，才能真正重现「旧实现」的错误行为。
+
+    🔴 2026-11-11 修（审计：参数名骗人 ⇒ 静默中和错对象）：
+       旧签名是 `_zero_guard_neutralized(fn)`，但函数体里**一次都没用到 `fn`** ⇒
+       实际改的是**模块全局 `F`** ⇒ 传 `LF` 也会去中和 `F` ⇒ **静默中和错对象**。
+       ⇒ 现在按参数 `mod` 走（默认 `F` ⇒ 行为不变），改的就是 `mod._ZERO_DIR_WORDS`。
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        old_words = mod._ZERO_DIR_WORDS
+        try:
+            mod._ZERO_DIR_WORDS = ()
+            yield
+        finally:
+            mod._ZERO_DIR_WORDS = old_words
+
+    return _cm()
 
 def main() -> int:
     SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -1089,17 +1369,18 @@ def main() -> int:
               v15c_800.get("target_pct") == 15.0,
               f"512800 target_pct={v15c_800.get('target_pct')}")
         # 🔴 **真负例**（reviewer C2）：回退到「负号被吃掉」的旧实现 ⇒ A15 必须失效
-        _old_fn_pre = F._extract_target_pct
-        try:
-            F._extract_target_pct = _old_extract_pre_ML
-            _old15 = _synthetic(tmp, body15)
-            _old15_690 = (_old15.get("512690") or [{}])[0]
-            check("A15 负例：回退「负号被吃掉」的旧实现 ⇒ A15 必须失效（目标变 18.91）",
-                  _old15_690.get("target_pct") == 18.91,
-                  f"旧实现下 512690 target_pct={_old15_690.get('target_pct')}"
-                  f"（必须 = 18.91 ⇒ 证明是新实现修好的，不是「本来就过」）")
-        finally:
-            F._extract_target_pct = _old_fn_pre
+        with _zero_guard_neutralized(F):
+            _old_fn_pre = F._extract_target_pct
+            try:
+                F._extract_target_pct = _old_extract_pre_ML
+                _old15 = _synthetic(tmp, body15)
+                _old15_690 = (_old15.get("512690") or [{}])[0]
+                check("A15 负例：回退「负号被吃掉」的旧实现 ⇒ A15 必须失效（目标变 18.91）",
+                      _old15_690.get("target_pct") == 18.91,
+                      f"旧实现下 512690 target_pct={_old15_690.get('target_pct')}"
+                      f"（必须 = 18.91 ⇒ 证明是新实现修好的，不是「本来就过」）")
+            finally:
+                F._extract_target_pct = _old_fn_pre
 
         # ---- A16：**真实官方决策**全行扫描：任何一行的目标权重都不得等于
         #      该行**任何一格**里处于**盈亏/价格/当前语境**的百分数（**正负都算**）
@@ -1199,17 +1480,18 @@ def main() -> int:
               (v17d.get("512690") or [{}])[0].get("target_pct") == 0.0,
               f"512690 target_pct={(v17d.get('512690') or [{}])[0].get('target_pct')}"
               f"（方向=卖 ⇒ 必须 0%，18.91% 是涨跌幅）")
-        _old_fn_pnl = F._pnl_column_indices
-        try:
-            F._pnl_column_indices = lambda cells: set()
-            _old17d = _synthetic(tmp, body17d)
-            check("A17 ⑤ 负例：回退「排除涨跌幅列」⇒ 必须失效（锚定取到 18.91%）",
-                  (_old17d.get("512690") or [{}])[0].get("target_pct") == 18.91,
-                  f"旧实现下 512690 target_pct="
-                  f"{(_old17d.get('512690') or [{}])[0].get('target_pct')}"
-                  f"（必须 = 18.91 ⇒ 证明是本轮修复起的作用）")
-        finally:
-            F._pnl_column_indices = _old_fn_pnl
+        with _zero_guard_neutralized(F):
+            _old_fn_pnl = F._pnl_column_indices
+            try:
+                F._pnl_column_indices = lambda cells: set()
+                _old17d = _synthetic(tmp, body17d)
+                check("A17 ⑤ 负例：回退「排除涨跌幅列」⇒ 必须失效（锚定取到 18.91%）",
+                      (_old17d.get("512690") or [{}])[0].get("target_pct") == 18.91,
+                      f"旧实现下 512690 target_pct="
+                      f"{(_old17d.get('512690') or [{}])[0].get('target_pct')}"
+                      f"（必须 = 18.91 ⇒ 证明是本轮修复起的作用）")
+            finally:
+                F._pnl_column_indices = _old_fn_pnl
 
         body17e = (
             "# 合成决策17e\n\n## 空头\n\n"
@@ -1232,21 +1514,22 @@ def main() -> int:
         check("A17 ⑥ 目标格里的**正数**浮盈不得变成目标权重（当前18.91%浮盈 ⇒ 0%）",
               (v17f.get("512690") or [{}])[0].get("target_pct") == 0.0,
               f"512690 target_pct={(v17f.get('512690') or [{}])[0].get('target_pct')}")
-        _old_fn_nog = F._extract_target_pct
-        try:
-            F._extract_target_pct = _old_extract_no_guard
-            _old17e = _synthetic(tmp, body17e)
-            _old17f = _synthetic(tmp, body17f)
-            check("A17 ⑥ 负例：回退「无语境守卫」⇒ 必须失效（方向格取到 18.91%）",
-                  (_old17e.get("512690") or [{}])[0].get("target_pct") == 18.91,
-                  f"旧实现下 方向格 target_pct="
-                  f"{(_old17e.get('512690') or [{}])[0].get('target_pct')}")
-            check("A17 ⑥ 负例：回退「无语境守卫」⇒ 必须失效（目标格取到 18.91%）",
-                  (_old17f.get("512690") or [{}])[0].get("target_pct") == 18.91,
-                  f"旧实现下 目标格 target_pct="
-                  f"{(_old17f.get('512690') or [{}])[0].get('target_pct')}")
-        finally:
-            F._extract_target_pct = _old_fn_nog
+        with _zero_guard_neutralized(F):
+            _old_fn_nog = F._extract_target_pct
+            try:
+                F._extract_target_pct = _old_extract_no_guard
+                _old17e = _synthetic(tmp, body17e)
+                _old17f = _synthetic(tmp, body17f)
+                check("A17 ⑥ 负例：回退「无语境守卫」⇒ 必须失效（方向格取到 18.91%）",
+                      (_old17e.get("512690") or [{}])[0].get("target_pct") == 18.91,
+                      f"旧实现下 方向格 target_pct="
+                      f"{(_old17e.get('512690') or [{}])[0].get('target_pct')}")
+                check("A17 ⑥ 负例：回退「无语境守卫」⇒ 必须失效（目标格取到 18.91%）",
+                      (_old17f.get("512690") or [{}])[0].get("target_pct") == 18.91,
+                      f"旧实现下 目标格 target_pct="
+                      f"{(_old17f.get('512690') or [{}])[0].get('target_pct')}")
+            finally:
+                F._extract_target_pct = _old_fn_nog
 
         body17g = (
             "# 合成决策17g\n\n## 空头\n\n"
@@ -1349,6 +1632,25 @@ def main() -> int:
             _inv_ok, _inv_detail = _md_table_invariant(_md_text)
             check("A19② 官方决策 md 必须**同时含多头表与空头表**（表格块不变量，不写死代码/行数）",
                   _inv_ok, _inv_detail)
+            # 🔴 2026-11-11：判据换版（见 `_md_table_invariant` docstring）后**必须**补变异负例
+            #    ⇒ 证明新判据**没有变松**（每一类缺陷都仍然拦得住），否则不许合入。
+            for _m_name, _m_text in (
+                ("N-A19① 只留一张含代码的表（整表被切掉）",
+                 _mut_keep_one_coded_table(_md_text)),
+                ("N-A19② 方向列全改成「买入」（空头侧消失，正文仍在讲卖出）",
+                 _mut_set_direction(_md_text, "买入")),
+                ("N-A19③ 方向列全改成「卖出」（多头侧消失，正文仍在讲买入）",
+                 _mut_set_direction(_md_text, "卖出")),
+                ("N-A19④ 每张表换成自己独有的代码（没有成对的表）",
+                 _mut_unique_code_sets(_md_text)),
+                ("N-A19⑤ 凭空多出一张含新代码的孤表",
+                 _mut_add_orphan_table(_md_text)),
+            ):
+                _m_ok, _m_detail = _md_table_invariant(_m_text)
+                check(f"A19② 负例：{_m_name} ⇒ 判据必须 FAIL（若 PASS = 断言被改松）",
+                      not _m_ok,
+                      f"变异后判据 = {'FAIL（拦住了）' if not _m_ok else 'PASS（没拦住！）'}"
+                      f"｜{_m_detail[:200]}")
             # ③ **表格结构自洽**（不写死行数）：每块 ≥2 行 + 第 2 行是**分隔行**
             #    + 表格总行数 == Σ(各块行数)（⇒ 没有游离在块外的孤立表格行 = 腰斩残行）
             #    ⇒ 能抓住：表格块内部被截断（分隔行被切掉）/ 混进非表格行 / 出现孤立残行。

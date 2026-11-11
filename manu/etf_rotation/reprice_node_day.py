@@ -308,11 +308,26 @@ def _recompute(
         target_weight = plan_target_weight
         cur = int(current_shares.get(code, int(act.get("current_shares") or 0)))
         price, price_date, price_note = _resolve_price(act, code, prices, node_date)
-        target_amount = target_weight * total_assets if total_assets else 0.0
-        target_shares = _round_lot(target_amount / price) if target_amount > 0 else 0
-        delta_shares = target_shares - cur
-        est_amount = delta_shares * price
-        est_fee = abs(est_amount) * fee_rate
+        # 🔴 2026-11-11（审计缺陷 1 · **阻断**）：**被 TA 一票否决但仍在持仓**的行
+        #    ⇒ 语义 =「保持现仓」⇒ **既不买也不卖**。
+        #    ⚠️ 旧实现按 `target_weight × total_assets` 在**节点日价**上重算目标股数
+        #      ⇒ 节点日价 ≠ 快照价 ⇒ delta ≠ 0 ⇒ 生成**卖出挂单**
+        #      ⇒ 违反「TA 一票否决 ⇒ 不卖」这条红线（`--live-trade` 下会被当真）。
+        #    ⇒ 修法：与 `final_rebalance_plan.py` 的 `_is_ta_hold` **同口径** ——
+        #      目标股数 = **当前股数**、delta = 0、动作 =「维持」。
+        _is_ta_hold = bool(act.get("ta_rejected")) and bool(act.get("held_not_touched"))
+        if _is_ta_hold:
+            target_amount = cur * price if price else 0.0
+            target_shares = cur
+            delta_shares = 0
+            est_amount = 0.0
+            est_fee = 0.0
+        else:
+            target_amount = target_weight * total_assets if total_assets else 0.0
+            target_shares = _round_lot(target_amount / price) if target_amount > 0 else 0
+            delta_shares = target_shares - cur
+            est_amount = delta_shares * price
+            est_fee = abs(est_amount) * fee_rate
         lot_note = ""
         if target_amount > 0 and price * LOT > target_amount:
             lot_note = (
@@ -350,10 +365,15 @@ def _recompute(
                     f"目标金额 {target_amount:.0f} 元 < 一手({LOT} 份 × {price:.3f} = "
                     f"{price * LOT:.0f} 元) ⇒ 整手口径下本轮无法按目标权重建仓"
                 )
+            if _is_ta_hold:
+                # 🔴 情景覆盖**不得**推翻「TA 一票否决 ⇒ 保持现仓」⇒ 下面统一复位。
+                target_amount = cur * price if price else 0.0
+                target_shares = cur
+                target_weight = plan_target_weight
             delta_shares = target_shares - cur
             est_amount = delta_shares * price
             est_fee = abs(est_amount) * fee_rate
-            if kind == "none":
+            if kind == "none" and not _is_ta_hold:
                 action_label = "不建仓"
             elif target_shares > cur:
                 action_label = "买入"
@@ -412,6 +432,9 @@ def _recompute(
                     if slot_breach else ""
                 ),
             })
+        if _is_ta_hold:
+            #: 🔴 动作强制「维持」（不被情景覆盖改写）
+            action_label = "维持"
         _row = {
             "code": code,
             "name": act.get("name") or "",
@@ -441,6 +464,14 @@ def _recompute(
             #: 🔴 情景字段**只在情景模式下出现** ⇒ 默认（规则层）产物逐字节不变
             _row.update(scenario_fields)
             _row["action"] = action_label
+        if _is_ta_hold:
+            #: 🔴 2026-11-11（审计缺陷 1）：把 `ta_rejected` / `held_not_touched`
+            #    **透传**给下游 —— `daily/agents_rebalance.py` 的执行卡分支
+            #    （delta=0 / 动作=维持 / 不下单）**靠这个标记才生效**。
+            #: 🔴 只在 True 时写 ⇒ 默认路径（无 TA 维持行）产物**逐字节不变**。
+            _row["action"] = "维持"
+            _row["ta_rejected"] = True
+            _row["held_not_touched"] = True
         actions.append(_row)
 
     # ---- 「买不进的席位」权重归现金（口径同 final_rebalance_plan）----

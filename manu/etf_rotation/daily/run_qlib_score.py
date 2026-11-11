@@ -210,12 +210,7 @@ def ensure_scores_fresh(
 
     🔴 `merge=False`：打分**只落本次目录**，**严禁合并回 canonical** `stock_scores.csv`
     ⇒ canonical 的哈希**保持不变**（本函数会实测并披露）。
-    ⚠️ **2026-11-10 订正**（上一版注释指向**已删除**的路径，作废）：
-    ① 「Mode C 影子链实际走的是 `agents_rebalance._refresh_scores(merge=False)`」——
-       **Mode C 已于 2026-11-09 整体废除**（单一流水线 ＋ 快照制），
-       且 `_refresh_scores` **根本没有 `merge` 参数**（签名是
-       `_refresh_scores(*, scores_path, notes, end_date=None)`）⇒ 这句是错的。
-    ② 今天真正保证「canonical 不被写」的是**另一套机制**：
+    🔴 **2026-11-10 订正**：真正保证「canonical 不被写」的是**另一套机制**：
        `agents_rebalance._refresh_scores` 只写**本快照内**的 `scores_path`，
        并在前后对 canonical `stock_scores.csv` 做 md5 对照取证；
        本函数的 `merge` 参数**只在本函数自己的 `__main__` 里以默认 `True` 使用**

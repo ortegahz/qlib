@@ -27,7 +27,9 @@ sys.path.insert(0, str(ROOT))
 import account  # noqa: E402
 
 import config as C  # noqa: E402  （研究链根已在上面的 sys.path 里 ⇒ 落点常量单一事实源）
+import pandas as pd  # noqa: E402
 from report_fingerprint import report_content_sha1  # noqa: E402
+import overlap as overlap_mod  # noqa: E402  （候选池重合度筛查：唯一口径来源）
 
 
 def _fmt_pct(x: float | None, digits: int = 2) -> str:
@@ -56,9 +58,89 @@ def _req(d: dict, key: str, label: str | None = None) -> float:
     return d[key]
 
 
+
+def compute_crowding(prices: pd.DataFrame | None, codes: list[str],
+                      asof: str) -> dict[str, dict]:
+    """🔴 2026-11-11（文档 §三.2）：算**拥挤度**（放量倍数 + 池内分位）。
+
+    【口径】对每只 ETF：``近 20 日日均成交额 ÷ 基期 120 日日均成交额``
+    （>1 = 放量 = 拥挤上升；数据不足 ⇒ **不参与**，**不编造**）。
+    判定「拥挤」= 放量倍数 ≥ `C.CROWDING_RATIO_THRESHOLD` **或** 池内分位 ≥
+    `C.CROWDING_PERCENTILE_THRESHOLD`。
+    【为什么】文档要求 TA 负责「检查行业重叠度与**拥挤度**」⇒ 此前只做了重叠度，
+    拥挤度**未实现** ⇒ 这里补上，并**如实披露**数据可得性。
+    """
+    out: dict[str, dict] = {}
+    if prices is None or len(prices) == 0:
+        return out
+    need = {"code", "date", "amount"}
+    if not need.issubset(set(prices.columns)):
+        return out
+    df = prices.copy()
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df[df["date"].notna()]
+    if asof:
+        _asof = pd.to_datetime(asof, errors="coerce")
+        if _asof is not None and not pd.isna(_asof):
+            df = df[df["date"] <= _asof]
+    recent_w = int(getattr(C, "CROWDING_RECENT_WINDOW", 20))
+    base_w = int(getattr(C, "CROWDING_BASE_WINDOW", 120))
+    for code in codes:
+        code = str(code).zfill(6)
+        sub = df[df["code"] == code].sort_values("date")
+        if len(sub) < min(recent_w, base_w):
+            continue      # 数据不足 ⇒ 不参与（不猜）
+        amt = pd.to_numeric(sub["amount"], errors="coerce").dropna()
+        if len(amt) < min(recent_w, base_w):
+            continue
+        recent = float(amt.tail(recent_w).mean())
+        base = float(amt.tail(base_w).mean())
+        if base <= 0:
+            continue
+        out[code] = {
+            "ratio": recent / base,
+            "recent_amount": recent,
+            "base_amount": base,
+            "n_obs": int(len(amt)),
+        }
+    # 池内分位（放量倍数越大 ⇒ 越拥挤）
+    ratios = sorted(v["ratio"] for v in out.values())
+    n = len(ratios)
+    for code, v in out.items():
+        rank = sum(1 for x in ratios if x < v["ratio"])
+        v["pct"] = (rank / (n - 1)) if n > 1 else 1.0
+        v["crowded"] = bool(
+            v["ratio"] >= float(getattr(C, "CROWDING_RATIO_THRESHOLD", 1.5))
+            or v["pct"] >= float(getattr(C, "CROWDING_PERCENTILE_THRESHOLD", 0.80))
+        )
+    return out
+
+
+def _resolve_prices_path(run_root: Path, asof: str, explicit: str | None = None) -> Path:
+    """🔴 2026-11-11（审查发现 3.5）：**行情源必须与规则层同源**。
+
+    规则层（`final_rebalance_plan`）读的是**本轮**的
+    `etf_prices_effective_{asof}.csv`；而本脚本原先读 canonical `C.ETF_PRICES_CSV`
+    ⇒ 两边 `corr120` / 拥挤度可能对不上，且 canonical 过期时 `corr120` 会全 0。
+    ⇒ 取价优先级：显式 `--prices` → 本轮 `etf_prices_effective_{asof}.csv`
+    → 本轮 `etf_prices_daily_{asof}.csv` → canonical 兜底。
+    """
+    if explicit:
+        return Path(explicit)
+    if asof:
+        _stamp = str(asof).replace("-", "")
+        for pat in (f"etf_prices_effective_{_stamp}.csv", f"etf_prices_daily_{_stamp}.csv"):
+            cand = Path(run_root) / pat
+            if cand.exists():
+                return cand
+    return Path(C.ETF_PRICES_CSV)
+
+
 def build(run_root: Path, report_md: Path, backtest_new: Path | None,
           backtest_old: Path | None, backtest_mid: Path | None = None,
-          quality: Path | None = None) -> tuple[str, dict]:
+          quality: Path | None = None, prices_path: str | None = None
+          ) -> tuple[str, dict]:
     rep = json.loads((run_root / "etf_analysis_report.json").read_text(encoding="utf-8"))
     rec = json.loads((run_root / "rebalance_recommendation.json").read_text(encoding="utf-8"))
     summary = account.account_summary()
@@ -142,17 +224,120 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
     # ---- 3. 候选清单 ----
     add("## 3. 候选清单（Top-N，按最终分降序）")
     add("")
-    add("| 代码 | 名称 | 最终分 | E(W×S) | mom120 | 覆盖 | 入选 |")
-    add("|:--|:--|--:|--:|--:|--:|:--:|")
+    add("| 代码 | 名称 | 主题 | 最终分 | E(W×S) | mom120 | 覆盖 | 入选 |")
+    add("|:--|:--|:--|--:|--:|--:|--:|:--:|")
     for c in rep["candidates"]:
         e_score = c.get("e_score")
         cover = c.get("coverage")
-        add(f"| {c['code']} | {c.get('name', '—')} | {c.get('final_score', float('nan')):.4f} | "
+        theme = c.get("theme_id")
+        add(f"| {c['code']} | {c.get('name', '—')} | "
+            f"{'—' if not theme else theme} | "
+            f"{c.get('final_score', float('nan')):.4f} | "
             f"{'—' if e_score is None else format(e_score, '.4f')} | "
             f"{_fmt_pct(c.get('mom120'))} | "
             f"{'—' if cover is None else format(cover, '.2f')} | "
             f"{'✔' if c.get('selected') else '✘'} |")
     add("")
+
+    # ---- 3.5 候选池重合度筛查（一票否决依据）----
+    #    🔴 数据来自**落盘产物**（etf_holdings.csv / etf_prices.csv），
+    #       口径复用 `manu/etf_rotation/overlap.py`（唯一实现）⇒ 与规则层同源。
+    _cands = rep.get("candidates", []) or []
+    _ov_codes = [str(c.get("code") or "").zfill(6) for c in _cands if c.get("code")]
+    _ov_names = {str(c.get("code") or "").zfill(6): str(c.get("name") or "") for c in _cands}
+    _ov_pairs: list[dict] = []
+    _ov_available = False
+    _ov_reason = ""
+    _prices_file = _resolve_prices_path(Path(run_root), str(rep["meta"]["asof"]), prices_path)
+    # 🔴 2026-11-11：拥挤度与 meta 字段（文档 §三.2）—— 算不出来就**如实标注不可得**，不编造。
+    _crowding: dict[str, dict] = {}
+    _crowding_reason = ""
+    try:
+        _ov_holdings, _ov_prices = overlap_mod.load_overlap_inputs(
+            holdings_path=C.ETF_HOLDINGS_CSV, prices_path=_prices_file)
+        if _ov_holdings is None:
+            _ov_reason = f"成分权重表不可得（{C.ETF_HOLDINGS_CSV}）"
+        else:
+            _ov_pairs = overlap_mod.compute_overlap_pairs(
+                holdings=_ov_holdings, prices=_ov_prices, codes=_ov_codes,
+                asof=rep["meta"]["asof"], names=_ov_names)
+            _ov_available = True
+    except Exception as exc:  # noqa: BLE001 —— 算不出来就**整节省略**，不喂假数据
+        _ov_available = False
+        _ov_reason = f"重合度计算异常：{type(exc).__name__}"
+        _ov_pairs = []
+    if _ov_available:
+        add("## 3.5. 候选池重合度筛查（一票否决依据）")
+        add("")
+        add("> 规则层已按「**成分重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95**」逐对拦截"
+            "（冲突对不共存）；下表是**更宽口径**的预警"
+            "（成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 或同族）——"
+            "**这张表就是你行使一票否决权的合法依据**："
+            "凡表中**同族**、或成分重叠/相关性明显偏高的候选对，"
+            "你都可以据此**否决**其中一只"
+            "（否决 ⇒ 该标的从候选池剔除 ⇒ 规则层顺延补位）。"
+            "**否决后的确定性后果**：规则层会**顺延挑选下一个不同主题的资产**"
+            "（等权口径不变：顺延者沿用被否决者的目标权重；"
+            "顺延者必须与已入选集合**不同族**，且不构成规则层冲突对）；"
+            "候选池里没有合格顺延者时**不强行补**（宁缺毋滥）。")
+        add("")
+        _flagged = [p for p in _ov_pairs if p.get("screen_flag")]
+        if not _flagged:
+            add(f"本轮候选池（{len(_ov_codes)} 只）内**没有**触发更宽口径预警的高重合对。")
+            add("")
+        else:
+            add("| 代码A | 名称A | 代码B | 名称B | 成分重叠系数 | 120 日相关性 | 同族 | 规则层冲突对 |")
+            add("|:--|:--|:--|:--|--:|--:|:--:|:--:|")
+            for p in _flagged:
+                add(f"| {p['a']} | {p.get('a_name') or '—'} | {p['b']} | "
+                    f"{p.get('b_name') or '—'} | {float(p['weight_overlap']):.3f} | "
+                    f"{float(p['corr120']):.3f} | "
+                    f"{'是' if p.get('same_theme') else '否'} | "
+                    f"{'**是**' if p.get('rule_conflict') else '否'} |")
+            add("")
+        # ---- 拥挤度（文档 §三.2「检查行业重叠度与**拥挤度**」）----
+        # 🔴 2026-11-11：此前**只**做了重叠度，拥挤度未实现 ⇒ 这里按
+        #    「近 20 日日均成交额 ÷ 基期 120 日日均成交额」算放量倍数 + 池内分位。
+        _crowding = compute_crowding(_ov_prices, _ov_codes, str(rep["meta"]["asof"]))
+        if _crowding:
+            add("### 3.5b. 候选池拥挤度（放量倍数）")
+            add("")
+            add(f"> 口径：**近 {int(getattr(C, 'CROWDING_RECENT_WINDOW', 20))} 日日均成交额 ÷ "
+                f"基期 {int(getattr(C, 'CROWDING_BASE_WINDOW', 120))} 日日均成交额**"
+                f"（>1 = 放量 = 拥挤上升）；"
+                f"判「拥挤」= 放量倍数 ≥ "
+                f"{float(getattr(C, 'CROWDING_RATIO_THRESHOLD', 1.5)):.2f} "
+                f"**或** 池内分位 ≥ "
+                f"{float(getattr(C, 'CROWDING_PERCENTILE_THRESHOLD', 0.80)):.0%}。"
+                "**拥挤度是风险提示，不是选股依据** —— 它提醒你「同主题 + 高拥挤」的组合"
+                "在反身性上更脆弱（资金撤离时同向踩踏），"
+                "可作为**否决某一只**的补充理由。")
+            add("")
+            add("| 代码 | 名称 | 放量倍数 | 池内分位 | 拥挤 |")
+            add("|:--|:--|--:|--:|:--:|")
+            for _c in _ov_codes:
+                _cv = _crowding.get(_c)
+                if not _cv:
+                    continue
+                add(f"| {_c} | {_ov_names.get(_c) or '—'} | {float(_cv['ratio']):.2f} | "
+                    f"{float(_cv['pct']):.0%} | {'**是**' if _cv.get('crowded') else '否'} |")
+            add("")
+            _crowded_codes = [c for c, v in _crowding.items() if v.get("crowded")]
+            if _crowded_codes:
+                add(f"⚠️ 本轮判为**拥挤**的候选：{'、'.join(sorted(_crowded_codes))}"
+                    f"（共 {len(_crowded_codes)} 只）")
+            else:
+                add("ℹ️ 本轮**无**候选被判为拥挤。")
+            add("")
+        else:
+            _crowding_reason = (
+                "拥挤度数据不可得（成交额字段缺失 / 样本不足 / 行情不可得）")
+            add(f"> ℹ️ **拥挤度不可得**：{_crowding_reason} ⇒ 本轮**不得**据此下任何判断。")
+            add("")
+    else:
+        _ov_reason = _ov_reason or "重合度数据不可得"
+        _crowding_reason = f"依赖同一份行情（{_ov_reason}）⇒ 拥挤度一并不可得"
+
 
     # ---- 4. 个股层统计 + RankIC ----
     add("## 4. 个股穿透层（E=W×S 的上游）")
@@ -237,6 +422,30 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
 
     add("## 7. 任务")
     add("")
+    # 🔴 2026-11-11：把 TA 的**身份 / 权力 / 职责**写进任务节。
+    #    旧版只问了三个问题 ⇒ TA 不知道自己是「合规陪审团」、
+    #    不知道自己能一票否决、也不知道否决之后规则层会顺延补位
+    #    ⇒ 文档要求的「主题过度集中预警」职责事实上无法落地（TA 没有被授权）。
+    add("### 7.1 你的身份与权力（合规陪审团，不是操盘手）")
+    add("")
+    add("- **身份**：你是**合规陪审团**，只「审」不「操盘」——"
+        "不替规则层选股，也不替账户下单。")
+    add("- **正式权力只有一票否决**：对**候选池里的标的**你可以行使**一票否决**"
+        "（黑天鹅：成分股突发财务/政策风险；主题过度集中：底层资产高度重合）。"
+        "否决后规则层把该标的从候选池剔除，并**顺延挑选下一个不同主题的资产**"
+        "（等权口径不变，见 3.5 节）。")
+    add("- **没有的权力**：❌ 不许推荐**候选池之外**的标的；"
+        "❌ 不许自行指定**买多少股**——股数与权重由规则层用确定性数学算"
+        "（等权口径 + 现金预留比例）；你只给方向与理由。")
+    add("- **职责之一（主题过度集中 / 重合度审查）**：对照 **3.5 节**的重合度筛查表，"
+        "检查排名靠前的两只是否底层资产高度重合（如「银行ETF」与「金融ETF」）；"
+        "若重合度过高，请**明确点名否决**其中一只，别只在论据里提一句。")
+    add("- **仓位建议（方向性，可选）**：你可以就**组合总仓位（权益敞口）**给方向性建议"
+        "（例如极端逆风期建议压降权益上限、其余留现金）；"
+        "**具体股数/权重由规则层算**。"
+        "若你给出权益上限建议，请**写明数值与依据**"
+        "（例如「权益上限 50%，依据：…」）。")
+    add("")
     # 🔴 任务里的前提必须**从真实账户现算**（2026-11-04 夜实测：旧文案写死
     #    「当前 5 个仓位里有 3 只货币 ETF（合计 60%）」，而真实持仓里**一只货币 ETF 都没有**
     #    ⇒ LLM 花大量篇幅"纠正"一个不存在的前提，Bear 的整个方案也建立在纠正之上）。
@@ -293,6 +502,14 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
         #    ⚠️ 旧格式 meta 没有这个键 ⇒ 调用方回落 raw md sha1（向后兼容）。
         "report_content_sha1": report_content_sha1(rep),
         "recommendation_sha1": _sha1(run_root / "rebalance_recommendation.json"),
+        # 🔴 「候选池重合度筛查」小节是否可用（算不出来 ⇒ 整节省略，**不喂假数据**）
+        "overlap_screen_available": bool(_ov_available),
+        "overlap_screen_reason": _ov_reason,
+        # 🔴 2026-11-11（文档 §三.2）：拥挤度（放量倍数）可得性
+        "crowding_available": bool(_crowding),
+        "crowding_reason": _crowding_reason,
+        # 🔴 2026-11-11（审查发现 3.5）：行情源必须与规则层同源（记下来便于审计）
+        "prices_source": str(_prices_file),
     }
     return text, meta
 
@@ -311,6 +528,8 @@ def main() -> int:
     ap.add_argument("--backtest-mid", default=None)
     ap.add_argument("--cluster-quality", default=None)
     ap.add_argument("--out", default=None)
+    # 🔴 2026-11-11（审查发现 3.5）：显式指定**与规则层同源**的行情文件
+    ap.add_argument("--prices", default=None)
     args = ap.parse_args()
 
     run_root = Path(args.run_root)
@@ -322,6 +541,7 @@ def main() -> int:
         Path(args.backtest_old) if args.backtest_old else run_root / "probe_cluster_legacy.json",
         Path(args.backtest_mid) if args.backtest_mid else run_root / "etf_rotation_backtest_v4_prefer0.json",
         Path(args.cluster_quality) if args.cluster_quality else run_root / "probe_cluster_quality.json",
+        prices_path=args.prices,
     )
     out.write_text(text, encoding="utf-8")
     (run_root / "ta_context_meta.json").write_text(

@@ -39,7 +39,9 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from report_fingerprint import report_content_sha1_from_file  # noqa: E402
 import config as C  # noqa: E402  （落点常量单一事实源）
+import direction_vocab  # noqa: E402  （LLM 方向词表单一事实源：与语义守卫同表）
 import llm_final as llm_final_mod  # noqa: E402
+import overlap as overlap_mod  # noqa: E402  （候选池重合度筛查：唯一口径来源）
 
 LOT = 100  # ETF 最小交易单位：100 股（一手）
 
@@ -402,7 +404,7 @@ _LLM_DIR_CELL = re.compile(
     r"Buy|Sell|Hold|Overweight|Underweight|Neutral)",
     re.IGNORECASE,
 )
-#: 🔴 2026-11-09（Mode C v2 独立审计实证）：**否定式买入**的长前缀。
+#: 🔴 2026-11-09（独立审计实证）：**否定式买入**的长前缀。
 #:    实测事故：LLM 最终表写「**不作为防守仓买入**」⇒ 旧方向抽取拿到「买入」
 #:    ⇒ 目标权重 0% 与方向「买入」矛盾 ⇒ 交付件自带的「方向-权重语义自洽」守卫
 #:    必然 FAIL（买 ⇒ 目标必须 >0%）。
@@ -412,10 +414,22 @@ _LLM_DIR_CELL = re.compile(
 _NEG_BUY_PREFIX = ("不作为", "不作", "不予以", "不当", "不打算", "不计划")
 #: 方向 ∈ 下列集合 ⇒ 目标权重**必然是 0%**（与 `llm_final.py` 的 `_ACTION_RULES` 同口径：
 #:    清仓类 ⇒ 卖 + 0%｜裸「卖出」⇒ 卖 + 0%｜不买/不建仓 ⇒ 0%）。
-_ZERO_DIR_WORDS = ("卖", "卖出", "卖掉", "清仓", "清掉", "清零",
-                   "不买", "不建仓", "退出")
+#: 🔴 2026-11-11（critic 审计 · 高危）：本词表与守卫 `verify_artifacts.LLM_DIRECTION_ZERO`
+#:    **原本是两份分叉的副本** ⇒ 解析器吐得出的「清」「Sell」不在解析器 ZERO 档里
+#:    （⇒ 同类「清掉+8%」只被守卫拦死、不被强制归零），而「卖掉/清零/不建仓」是死条目。
+#:    ⇒ 现在两边都从 `direction_vocab` 取（**单一事实源**），分叉从根上消失。
+_ZERO_DIR_WORDS = direction_vocab.ZERO
+#: markdown 噪声（强调/代码标记）—— 与 llm_final.py `_MD_NOISE` **同口径**
+_MD_NOISE = r"[\s*`_~]*"
 #: 「卖出约 2,600 股」= **部分卖出**（减），**不是**清仓 ⇒ 与 llm_final.py `_ACTION_RULES` ② 同口径
-_PARTIAL_SELL_RE = re.compile(r"卖出\s*(?:约)?\s*[\d,]+(?:\.\d+)?\s*(?:股|份)")
+#: 🔴 2026-11-11（critic 审计 · 中危）：旧正则 `卖出\s*(?:约)?\s*\d+` **吃不掉 markdown 噪声**
+#:    ⇒ 实测「卖出**约2,600份**」漏判成**清仓** ⇒ ZERO 守卫把它**强制归零**且语义自洽 ⇒
+#:    **静默降级**（部分卖出被写成整仓清零，守卫还放行）。
+#:    ⇒ 修法：动词与数量之间允许夹 **强调/代码标记**（`_MD_NOISE`，与 llm_final 同口径）。
+_PARTIAL_SELL_RE = re.compile(
+    r"(?:卖出|卖掉)" + _MD_NOISE + r"(?:约)?" + _MD_NOISE
+    + r"[\d,]+(?:\.\d+)?" + _MD_NOISE + r"(?:股|份)"
+)
 #: 方向词里属「买入」语义的那些（用于否定式判定）
 _POS_DIR_WORDS = ("买", "买入", "加仓", "增持", "加", "增")
 #: 🔴 2026-11-10（服务器实跑 20261110_120420 实证）：**后置否定** ——
@@ -475,7 +489,7 @@ def _negated_buy_suffix(cell: str) -> bool:
 def _classify_dir_cell(cell: str) -> str:
     """从表格单元格抽方向词（**否定式优先 → 长词优先**）。
 
-    🔴 2026-11-09（Mode C v2 审计实证）修的两个真缺陷：
+    🔴 2026-11-09（独立审计实证）修的两个真缺陷：
       ① **否定式买入**：旧实现用 `search` 取**最左**匹配 ⇒ 「条件式小买，否则不买」
          取到「买」（POS）⇒ 目标 0% 与方向矛盾 ⇒ 守卫 FAIL；
          「不作为防守仓买入」取到「买入」⇒ 同样矛盾。
@@ -823,6 +837,18 @@ def _is_anchored_pct(cell: str, start: int) -> bool:
     return bool(_LLM_TARGET_ANCHOR_RE.search(seg))
 
 
+#: 🔴 2026-11-11（真机实测）：**区间**写法（两个百分数之间是区间分隔符）
+#:    ——「0%—10%」「10%~12%」「8% 至 10%」等（容忍 markdown 噪声）。
+_LLM_RANGE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*%[\s*`_~]*(?:—|–|-|~|～|至|到)[\s*`_~]*(\d+(?:\.\d+)?)\s*%"
+)
+#: 🔴 2026-11-11：区间**之后**若出现这些标记 ⇒ 后面的百分数才是**说话人的落点**
+#:    （「基准约10%」「中枢8%」「目标 6%」「以 12% 为准」）。
+_LLM_BASELINE_MARK_RE = re.compile(
+    r"(?:基准(?:值)?|中枢|目标(?:值)?|以[^，,。;；\s]{0,8}为准)"
+)
+
+
 def _extract_target_pct(cell: str, anchor_required: bool = False) -> float | None:
     """从格内文本抽**目标权重**（M-N 统一口径，①②③ 三条路径共用）。
 
@@ -831,9 +857,19 @@ def _extract_target_pct(cell: str, anchor_required: bool = False) -> float | Non
       ② 越界（<0 或 >100）⇒ 丢弃；
       ③ **盈亏/价格/动量语境**（数字前后紧邻窗口命中非目标词）⇒ 丢弃；
       ④ 「从/由 A% … 到/至/升/降/调至 B%」⇒ 取**落点 B**（reviewer A3）；
+      ④' 「**区间在前、基准在后**」⇒ 取**基准值**（2026-11-11 真机实测，见下）；
       ⑤ 否则取**第一个**存活值（**区间口径：取下界**，reviewer A4：
          「目标(区间) 8%—10%」⇒ 8；Trader 那行「约9%，执行区间8%—10%」⇒ 9）；
       ⑥ 全都取不到 ⇒ ``None``（**不猜、不补 0**）⇒ 该行按「判不出目标」处理。
+
+    🔴 2026-11-11（服务器真机实测 · 真缺陷）：④' 这条是补 reviewg A4 未覆盖的写法。
+       LLM 的 Trader 最终裁决把目标写成「**区间在前 + 基准在后**」：
+         `| 512800 | 22.54% | 减仓 | **0%—10%，基准约10%** | … |`
+       ⇒ 旧口径「取第一个存活值」取到区间**下沿 0%** ⇒ 说话人明说「保留约 10%」
+         被写成**目标 0%（清仓）** ⇒ 交付件的 LLM 目标全被抽空 ⇒ 分歧表空 ⇒
+         情景生成器与三个闸门探针连环失败（且该错误**不会**被任何守卫拦下）。
+       ⇒ 修法：**区间之后**若出现「基准 / 中枢 / 目标 / 以…为准」标记的百分数
+         ⇒ 取**那个**（说话人的落点）；没有基准标记时**保持旧口径**（取下界）。
 
     ``anchor_required=True``：只在**带「目标类锚点」**的百分数里挑
     （兜底路径用 ⇒ 不会把理由栏里「不接受20%目标」的 20% 当成目标）。
@@ -853,6 +889,19 @@ def _extract_target_pct(cell: str, anchor_required: bool = False) -> float | Non
         _b = float(_ft.group(2))
         if _pct_ok(_b) and not _is_non_target_pct(scope, _ft.start(2), _ft.end(2)):
             return _b
+    # 🔴 2026-11-11（真机实测）：**区间在前、基准在后** ⇒ 取**基准值**，不取区间下沿。
+    #    「**0%—10%，基准约10%**」⇒ 说话人明说「保留约 10%」⇒ 必须取 10.0，
+    #    旧口径取第一个存活值 = 0.0 ⇒ 把「减仓到 10%」静默写成「清仓 0%」。
+    _rg = _LLM_RANGE_RE.search(scope)
+    if _rg is not None:
+        _tail = scope[_rg.end():]
+        _bm = _LLM_BASELINE_MARK_RE.search(_tail)
+        if _bm is not None:
+            _pm = _LLM_PCT_LOOSE.search(_tail, _bm.end())
+            if _pm is not None:
+                _pv = float(_pm.group(1))
+                if _pct_ok(_pv) and not _is_non_target_pct(scope, _pm.start(), _pm.end()):
+                    return _pv
     for m in hits:
         value = float(m.group(1))
         if not _pct_ok(value):
@@ -1033,24 +1082,44 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
             for _idx, cell_text in enumerate(cells):
                 if cell_text == code:
                     continue
+                # 🔴 2026-11-11（critic 审计 · 高危）：**理由列不许当方向列**
+                #    理由栏是散文（「逢高卖出部分，保留底仓」）⇒ 里面的方向词**不是裁决**
+                #    ⇒ 旧实现会把理由列认成方向列 ⇒ 随后的 ZERO 强制归零把合法目标改写成 0%。
+                if _ri is not None and _idx == _ri:
+                    continue
                 if _LLM_DIR_CELL.search(cell_text):
                     _ai = _idx
                     break
         direction = ""
+        _dir_idx: int | None = None
         if _ai is not None and _ai < len(cells):
             direction = _classify_dir_cell(cells[_ai])
+            if direction:
+                _dir_idx = _ai
         if not direction:
-            for c in cells:
+            for _idx, c in enumerate(cells):
                 if c == code:
                     continue
-                direction = _classify_dir_cell(c)
-                if direction:
+                _d = _classify_dir_cell(c)
+                if _d:
+                    direction = _d
+                    _dir_idx = _idx
                     break
         if not direction:
             continue
+        # 🔴 2026-11-11（critic 审计 · 高危）：方向**只**能从**理由列**兜底扫出来时
+        #    （表头没指认方向列 / 方向列写「—」⇒ `_ai` 作废后落到兜底扫描），
+        #    这个方向词是**散文里的词**，不是 LLM 的方向裁决
+        #    ⇒ **不许**拿它去强制归零：那会把一个合法目标**静默改成 0%**，
+        #      而语义守卫因为「方向=卖 + 目标=0%」自洽还会**放行** ⇒ 静默降级。
+        #    实测复现：`| 512800 | — | 10% | 逢高卖出部分，保留底仓 |`
+        #      修复前：10.0 会被守卫**响亮报错**；修复后（盲目归零）：0.0 静默通过。
+        #    ⇒ 修法：方向来源是理由列 ⇒ **不强制归零**（保留原值），
+        #      让「LLM 方向-权重语义自洽」守卫**响亮拦截**（把歧义暴露出来，而不是替 LLM 猜）。
+        _dir_from_reason = (_ri is not None and _dir_idx == _ri)
         # 🔴 2026-11-09：ZERO 方向（卖/清仓/不买…）⇒ 目标权重**必然是 0%**，
         #    且**先于任何数字路径生效**（见下面 ④ 之前的说明）。
-        _force_zero = direction in _ZERO_DIR_WORDS
+        _force_zero = direction in _ZERO_DIR_WORDS and not _dir_from_reason
 
         # ---- 目标权重列：三条可靠路径，按优先级；**都判不出来 ⇒ 丢弃该行** ----
         # 🔴 F6（2026-11-04 21:2x E2E 实测事故）：
@@ -1065,9 +1134,20 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
         #   ⇒ 修法：① 表头指认「目标列」就用它；② 否则以**方向列为锚**，
         #     取方向列**紧邻的下一格**的百分比（本轮两种表头都符合这个结构）；
         #     ③ 仍判不出来就**丢弃该行**（宁可少报一条，不可乱报）。
-        target_pct = None
+        # 🔴 2026-11-11（真机跑批 · 审计）：ZERO 方向（卖/清仓/不买…）⇒ 目标权重
+        #    **必然是 0%**，且**先于任何数字路径生效**（上面那句注释写的就是这个
+        #    意图，但**旧实现只挡住了「金额→百分比」折算**，其它数字路径照样生效）。
+        #    实测事故（空头表真实行）：
+        #      `| 515450 | 未持有 | 不买/观察 | 若必须配置权益，条件性上限8%，绝非16% | … |`
+        #    ⇒ 目标列里的「**条件性上限** 8%」被当成**目标权重** ⇒ 方向「不买」配目标 8%
+        #    ⇒ 交付件自带的「LLM 方向-权重语义自洽」守卫 FAIL
+        #    （`verify_artifacts._check_llm_direction_semantics` + `probe_llm_parser` I1）。
+        #    ⇒ 修法：`_force_zero` 时 `target_pct` **直接置 0.0**，
+        #      且**所有**取数路径（表头目标列 / 方向列下一格 / 目标锚定 / 方向格自带百分比）
+        #      一律跳过（它们都以 `target_pct is None` 为前提 ⇒ 天然被挡住）。
+        target_pct = 0.0 if _force_zero else None
         _ti = row_roles.get("target") if row_roles else None
-        if _ti is not None and _ti != _ri:
+        if _ti is not None and _ti != _ri and not _force_zero:
             _cell = cells[_ti]
             # 表头指认「目标列」：列数对齐时用**统一取数**（允许「一手，约33.5%」
             # 「减至约 20%」这种带前缀的，同时**挡住**盈亏语境，reviewer B2）；
@@ -1084,7 +1164,7 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
         #    ⇒ 多头「仅10%试仓」这类**真实分歧**永远进不了冲突表（信息丢失）。
         #    修法：表头指认的目标格里若**只有「元」没有「%」**，按 total_assets 折成百分比。
         if target_pct is None and _ti is not None and _ti != _ri and not _force_zero:
-            # 🔴 2026-11-09（Mode C v2 审计实证）：**ZERO 方向下不许做「金额→百分比」折算**。
+            # 🔴 2026-11-09（独立审计实证）：**ZERO 方向下不许做「金额→百分比」折算**。
             #    实测事故：多头表「| **159929** | **卖** | 清仓，约3,335元 | …」⇒
             #    3,335 元是**卖出金额**（＝清掉 11.17% 的现有仓位），却被折成
             #    **11.17% 的「目标权重」** ⇒ 方向「卖」配目标 11.17% ⇒ 语义守卫必然 FAIL。
@@ -1206,7 +1286,9 @@ def _llm_target_views(decision_md: str | None, total_assets: float | None = None
     return views
 
 def _build_llm_final_decision(args, plans: list[dict], llm_targets: dict,
-                              llm_conflicts: list[dict]) -> dict:
+                              llm_conflicts: list[dict],
+                              ta_rejected: list[dict] | None = None,
+                              ta_moved_out: list[dict] | None = None) -> dict:
     """把 Trader 的**最终裁决**抽出来，并与规则层 / 多头表 / 空头表**对账**。
 
     🔴 2026-11-05 04:4x（M-P）**为什么必须加这一层**：
@@ -1221,6 +1303,13 @@ def _build_llm_final_decision(args, plans: list[dict], llm_targets: dict,
     🔴 **口径**：本函数**不改动** `llm_targets` / `llm_conflicts`（金标 A1 必须不变）
        ⇒ 只**新增**一个独立字段 `llm_final_decision`。
        抽不出的数字一律 `None`（**不许编造**），每条都带**原文证据句**。
+
+    🔴 2026-11-11（审计缺陷 D）：被 TA **一票否决**的代码原先会从本表里**静默消失**
+       （表是按 `plans` 派生的，而被否决者已被剔除）⇒ 正文写着「**以本节为准**」，
+       交付件却对该代码只字不提 ⇒ 自相矛盾。
+       ⇒ 被否决的代码**单列一行**（规则层目标 = 0%，注明「TA 一票否决」）；
+         若它**因否决而移出**了冲突表 ⇒ 在 `ta_moved_out` 里**显式标注**
+         「因 TA 否决而移出」（不动 `llm_conflicts` 本体 ⇒ 金标 A1 不变）。
     """
     raw = llm_final_mod.load_from_decision(getattr(args, "decision", None))
     out: dict = {
@@ -1237,6 +1326,31 @@ def _build_llm_final_decision(args, plans: list[dict], llm_targets: dict,
     }
     if not out["available"]:
         return out
+
+    # 🔴 2026-11-11（真实决策 md 实跑实证）：Trader 把目标权重写在**不带代码**的句子里
+    #    （实测 2026-11-03 那一轮：「将当前22.54%的仓位降至**基准约10%、硬上限10%**
+    #      的战术观察仓」—— 这句**没有代码** ⇒ 散文层的**句级归属**拿不到标的
+    #      ⇒ `target_pct=None`）
+    #    ⇒ 旧口径 ⇒ 计划里 512800 的最终裁决「没有目标权重」
+    #    ⇒ `make_decision_options` 判它「抽不出数字」⇒ **真实分歧（规则层 20% vs
+    #      LLM 10%）被静默丢掉** ⇒ 「待拍板分歧 0 项」
+    #    ⇒ `make_decision_scenarios` 抛错 ⇒ 重建链转红。
+    #    ⇒ 修法：用**同一份决策 md 的「最终裁决表」**（`llm_targets` 里 `who == "final"`
+    #      的那一档 —— 它本来就是**按代码归档**的 ⇒ **不存在猜归属**）回填目标权重，
+    #      并把**口径来源**写进 `target_pct_source`（**不冒充**「散文原文抽到」）。
+    #    ⇒ 只在「散文抽不到」时回填 ⇒ 散文抽得到的**一律以散文为准**（口径不被污染）。
+    for _code, _t in (out.get("targets") or {}).items():
+        if not isinstance(_t, dict) or _t.get("target_pct") is not None:
+            continue
+        _v = (llm_targets or {}).get(_code)
+        if not isinstance(_v, dict) or _v.get("who") != "final":
+            continue
+        if _v.get("target_pct") is None:
+            continue
+        _t["target_pct"] = float(_v["target_pct"])
+        _t["target_pct_source"] = (
+            "最终裁决表（调仓后目标列）｜散文原文未抽到目标权重"
+            "（数字写在不带代码的句子里）")
 
     rule_map = {str(p.get("code")): float(p.get("target_weight") or 0.0) * 100.0
                 for p in plans}
@@ -1303,7 +1417,39 @@ def _build_llm_final_decision(args, plans: list[dict], llm_targets: dict,
             "notes": notes,
             "evidence": t.get("evidence", ""),
         })
+    # 🔴 2026-11-11（缺陷 D）：被 TA 一票否决的代码**单列一行**（不许静默消失）
+    for r in (ta_rejected or []):
+        code = str(r.get("code") or "").zfill(6)
+        if not code or any(x["code"] == code for x in rows):
+            continue
+        _eff = rule_eff_map.get(code)
+        _notes = [
+            "🛡️ **TA 一票否决** ⇒ 本轮不建仓 / 不卖出（规则层目标作废 = 0%）",
+        ]
+        if _eff is not None and float(_eff) > 0:
+            _notes.append(
+                f"**仍在持仓** ⇒ 保留为『维持』席位（实际落地 = 当前权重 "
+                f"{float(_eff):.1f}%，**不买不卖**）"
+            )
+        else:
+            _notes.append("本轮**不在目标组合**里（实际落地 0%）")
+        rows.append({
+            "code": code,
+            "name": r.get("name") or name_map.get(code, ""),
+            "final_target_pct": None,
+            "final_direction": None,
+            "rule_target_pct": 0.0,
+            "rule_effective_pct": round(float(_eff), 4) if _eff is not None else 0.0,
+            "bull_pct": bull_map.get(code),
+            "bear_pct": bear_map.get(code),
+            "gap_vs_rule_pp": None,
+            "status": "TA 一票否决（移出本轮候选）",
+            "notes": _notes,
+            "evidence": str(r.get("reason") or ""),
+        })
     out["reconciliation"] = rows
+    # 🔴 2026-11-11（缺陷 D）：因 TA 否决而**移出**冲突表的代码 ⇒ 显式标注
+    out["ta_moved_out"] = list(ta_moved_out or [])
     diff = [r for r in rows if r["status"] == "与规则层不一致"]
     out["n_divergent"] = len(diff)
     out["summary_text"] = (
@@ -1446,6 +1592,27 @@ def _sha1_file(path: Path) -> str:
     return hashlib.sha1(Path(path).read_bytes()).hexdigest()
 
 
+def _context_equivalent(src: Path, cur: Path) -> bool:
+    """两个 `ta_research_context.md` **内容是否等价**。
+
+    🔴 2026-11-11 修（假 stale 的根因）：context 正文里嵌了**本快照的绝对路径**
+       （末行「完整报告：…/snapshots/<快照号>/etf_analysis_report.md」）⇒
+       **同一个数据源**在两个快照里生成的 context **只差这一行** ⇒ sha1 必然不同。
+    ⇒ 比对时**只把各自的快照目录归一化成占位符**，其余**逐字**比。
+    ⚠️ 归一化**只限「自己的快照目录」这一段** ⇒ 任何其它内容差异（分数变了、
+       结论变了……）都判不等价 ⇒ 该报 stale 还是报 stale。
+    """
+
+    def _norm(path: Path) -> str:
+        txt = Path(path).read_text(encoding="utf-8")
+        return txt.replace(str(Path(path).absolute().parent), "<SNAPSHOT>")
+
+    try:
+        return _norm(src) == _norm(cur)
+    except OSError:
+        return False
+
+
 def _llm_staleness(args) -> dict:
     """检查 LLM 意见是不是**基于当前这版报告**跑出来的。
 
@@ -1494,14 +1661,14 @@ def _llm_staleness(args) -> dict:
     #    ⇒ 用 `absolute()`（**不跟随软链**）⇒ 取「调用方传入路径所在的目录」。
     ctx_dir = dec.absolute().parent
     meta_path = ctx_dir / "ta_context_meta.json"
-    # 🔴 2026-11-09 15:55 实测修（Mode C 带 LLM 首跑暴露）：
+    # 🔴 2026-11-09 15:55 实测修（带 LLM 首跑暴露）：
     #    决策 JSON 的名字**必须跟着决策文件走**（上面那段注释自己就要求
-    #    「三件套跟着决策文件走」）⇒ 影子模式（Mode C）里决策 md/json 叫
-    #    `shadow_decision.md/.json`（为的是**不覆盖**根目录金标
-    #    `tradingagents_decision.md`）⇒ 旧代码硬编码 `tradingagents_decision.json`
+    #    「三件套跟着决策文件走」）⇒ 历史上存在过一份**不同名**的决策件
+    #    （为的是不覆盖根目录金标 `tradingagents_decision.md`）
+    #    ⇒ 旧代码硬编码 `tradingagents_decision.json`
     #    ⇒ 三件套**永远缺件** ⇒ sha1 链**永远验不了**
     #    ⇒ 明明是**本轮刚跑出来**的 LLM 第二意见，被判成「已过期 ⇒ 不可作数」
-    #    （实测：2026-11-09 15:55 的 Mode C 计划里 `llm_stale.unverifiable_reason`
+    #    （实测：2026-11-09 15:55 的影子期计划里 `llm_stale.unverifiable_reason`
     #      = "上下文三件套**缺件** ['tradingagents_decision.json']"，
     #      冲突表 5 条**全部**被标 stale ⇒ LLM 第二意见**整个作废**）。
     #    ⇒ 修法：由决策 md 推出决策 json（`<stem>.json`，与
@@ -1587,11 +1754,40 @@ def _llm_staleness(args) -> dict:
             _d = json.loads(dec_json.read_text(encoding="utf-8"))
             _cs = ((_d.get("meta") or {}).get("context_sha1")) or ""
             if _cs and _cs != _sha1_file(ctx_path):
-                out["stale"] = True
-                out["reasons"].append(
-                    f"决策文件是基于**旧版 research_context** 跑出来的"
-                    f"（context sha1 {str(_cs)[:8]} → 现 {_sha1_file(ctx_path)[:8]}）"
-                )
+                # 🔴 2026-11-11 修（**假 stale**：跨快照复用决策件 ⇒ 路径不同 ≠ 内容过期）：
+                #    `--skip-llm` 复用**另一个快照**的决策件时，新快照的 context 与
+                #    决策件当初吃到的 context **只差「快照路径行」**（实测两文件 diff 仅 1 行）
+                #    ⇒ sha1 必然不同 ⇒ 旧口径把「路径不同」当成「内容过期」
+                #    ⇒ 交付件**谎报**「LLM 第二意见已过期 ⇒ 不可作数」
+                #    （实测：把 512800 那条**真冲突**整条标成作废 ⇒ 交付件自相矛盾）。
+                #    ⇒ 修法：**逐字比对**决策件 meta 里记录的**上游 context**
+                #      （`meta.context_path`，且它的 sha1 必须等于决策件记录的 `context_sha1`
+                #        ⇒ 证明「这就是当初喂给 LLM 的那份」）与本快照 context
+                #      （**只把各自的快照目录**归一化成占位符）⇒ 内容一致 ⇒ **不算过期**。
+                #    ⚠️ **不伪造 sha1、不放宽「内容变了必须报过期」**：任何非路径差异仍判 stale。
+                _src_ctx = str(((_d.get("meta") or {}).get("context_path")) or "")
+                _equivalent = False
+                if _src_ctx:
+                    try:
+                        _src_p = Path(_src_ctx)
+                        if _src_p.exists() and _src_p.is_file() and _sha1_file(_src_p) == _cs:
+                            if _context_equivalent(_src_p, ctx_path):
+                                _equivalent = True
+                                out["context_source_path"] = str(_src_p)
+                                out["context_source_snapshot"] = _src_p.parent.name
+                                out["context_equivalence_note"] = (
+                                    f"决策件来自快照 **{_src_p.parent.name}**；"
+                                    f"本快照 context 与其**逐字一致**（仅快照路径行不同）"
+                                    f"⇒ **未过期**（内容未变）"
+                                )
+                    except OSError:
+                        _equivalent = False
+                if not _equivalent:
+                    out["stale"] = True
+                    out["reasons"].append(
+                        f"决策文件是基于**旧版 research_context** 跑出来的"
+                        f"（context sha1 {str(_cs)[:8]} → 现 {_sha1_file(ctx_path)[:8]}）"
+                    )
             elif not _cs and dec.stat().st_mtime < ctx_path.stat().st_mtime:
                 # 旧版决策文件没有 context_sha1 ⇒ 退化成时间戳比对
                 out["stale"] = True
@@ -1607,6 +1803,468 @@ def _llm_staleness(args) -> dict:
                 "⇒ **未通过**新鲜度校验"
             )
     return out
+
+
+#: 🛡️ TA 合规筛选：**顺延时跳过同族**的开关（生产恒为 True）。
+#:    ⇒ 探针用它做**变异负例**（关掉它 ⇒ 顺延会选到同族标的 ⇒ 断言必须转红）。
+_SKIP_SAME_THEME_ON_SUBSTITUTE = True
+
+#: 🛡️ TA 合规筛选：**顺延时跳过规则层冲突对**的开关（生产恒为 True）。
+#:    ⇒ 同上，探针用它做变异负例。
+_SKIP_CONFLICT_ON_SUBSTITUTE = True
+
+#: 🔴 2026-11-11（审计缺陷 A · 席位交互）：TA 合规筛选后的**权益上限**
+#:    = 1 − 现金预留比例（单一事实源 = `config.CASH_RESERVE_RATIO`；**不写死 0.2**）。
+#:    「被否决且在持仓」的那一行**仍占席位**（保留为『维持』）⇒ 若再顺延补位，
+#:    就是**多出一席** ⇒ 权益可能超配 ⇒ 补位前必须过这道闸。
+_EQUITY_CAP = 1.0 - float(C.CASH_RESERVE_RATIO)
+
+
+#: 🔴 2026-11-11（Beta 避险落地）：TA 的**权益上限压降建议**在规则层的落地口径。
+#:    ① **只认目标动词**（`llm_final.post_trade.equity_target_pct`）⇒ 陈述句
+#:       （「组合层权益约 56%」）**不算建议**；
+#:    ② **只许压降、不许抬高** ⇒ 建议值 ≥ 规则层硬上限 ⇒ **忽略**；
+#:    ③ 解析不出 ⇒ **完全保持原行为**（不压降，产物逐字节不变）。
+_TA_CAP_REASONS = (
+    "no_ta_advice",        # 没有决策文件 / 决策不可用
+    "not_a_target",        # 有决策，但没读到「目标动词」口径的权益上限
+    "out_of_range",        # 数字越界（不在 0~100）
+    "at_or_above_base_cap",  # 建议值 ≥ 规则层硬上限 ⇒ 忽略（只许压降）
+    "accepted",            # **采纳**：压降权益上限
+)
+
+
+def _resolve_ta_equity_cap(llm_raw: dict | None) -> dict:
+    """🔴 2026-11-11（Beta 避险落地）：解析 TA 的**组合权益上限压降建议**。
+
+    文档口径（「三.3 极端行情下的仓位建议」）：TA 可以建议**压降组合权益上限**，
+    其余资金留现金 ⇒ 规则层**采纳**这个建议（否则 TA 的建议只是「披露」，不是「建议」）。
+
+    返回 ``{"pct": float|None, "evidence": str, "reason": str}``：
+      * ``pct``   = TA 建议的**权益上限**（0~1 小数）；解析不出 ⇒ ``None``
+                    （⇒ 调用方**完全保持原行为**）。
+      * 🔴 **输入单位 = 百分点**（`post_trade.equity_target_pct = 36.0` 表示 **36%**），
+        与 `llm_final` 写出的口径**一致**；小数形式（0.36）⇒ 判 ``out_of_range``（**不静默压降**）。
+      * ``evidence`` = 原文证据句（可回放；没有就是空串，**不编造**）。
+      * ``reason`` ∈ ``_TA_CAP_REASONS``。
+    """
+    out: dict = {"pct": None, "evidence": "", "reason": "no_ta_advice"}
+    if not isinstance(llm_raw, dict) or not llm_raw.get("available"):
+        return out
+    pt = llm_raw.get("post_trade") or {}
+    if not isinstance(pt, dict):
+        return out
+    raw_pct = pt.get("equity_target_pct")
+    if raw_pct is None:
+        out["reason"] = "not_a_target"
+        return out
+    try:
+        pct = float(raw_pct)
+    except (TypeError, ValueError):
+        out["reason"] = "out_of_range"
+        return out
+    # 🔴 2026-11-11（审计缺陷 C）：**输入单位 = 百分点**（36.0 表示 36%）。
+    #    小数形式（0.36）**无法与「0.36%」区分** ⇒ 一律判越界（**不许**静默压降 100 倍）。
+    if not (0.0 <= pct <= 100.0) or 0.0 < pct < 1.0:
+        out["reason"] = "out_of_range"
+        return out
+    out["evidence"] = str(pt.get("equity_target_pct_evidence") or "")
+    cap = pct / 100.0
+    out["pct"] = cap
+    out["reason"] = "accepted" if cap < _EQUITY_CAP - 1e-12 else "at_or_above_base_cap"
+    return out
+
+
+def apply_ta_screening(
+    *,
+    actions: list[dict] | None = None,
+    candidates: list[dict] | None = None,
+    rejections: list[dict] | None = None,
+    held_codes: list[str] | None = None,
+    current_weights: dict[str, float] | None = None,
+    holdings=None,
+    prices=None,
+    asof=None,
+    names: dict[str, str] | None = None,
+    equity_cap: float | None = None,
+) -> dict:
+    """🛡️ TA 合规筛选：**剔除**被 TA 点名否决的候选 + **顺延**补位。
+
+    🔴 **只改副本**：返回的是**新的** action 列表，调用方的原对象一字不动。
+
+    口径
+    ----
+    ① **剔除**：被 TA 点名否决的代码，其 action 从候选 action 列表里**移除**
+       （**不是**「卖出」⇒ 目标权重**不写 0**）。
+       🔴 2026-11-11（审计缺陷 A）：若它本来就在**持仓**里 ⇒ 那一行**不许消失**
+       （旧行为只记 `held_not_touched=true`，行本身从计划里彻底消失 ⇒ 市值凭空蒸发
+       ⇒ 权益被低估 ⇒ 「权益 ≤ 1−现金预留比例」的闸门拿偏小的数去判 ⇒ 闸门可被绕过）。
+       ⇒ 改记进 `ta_screening["orphaned_holdings"]`（**被否决且在持仓的代码列表**）
+       + `ta_screening["orphaned_holding_rows"]`（逐只明细：当前权重 / 席位预算），
+       由 `build_plan` 落成一行「**维持**」（目标权重 = **当前权重**（不是 0）、
+       `ta_rejected=True`、`held_not_touched=True`）⇒
+         - 它**计入**权益/现金口径 ⇒ 计划权益/现金/总资产恒等式**自洽**；
+         - 它**不进**买入/卖出挂单（目标股数 = 当前股数 ⇒ 既不买也不卖）。
+       ⚠️ 返回的 `actions` 里**不含**它（剔除 ≠ 权重 0：被否决者不得留在候选 action 列表里）。
+    ② **顺延**：从候选池里按 `final_score` 降序找**第一个**合格者补位，
+       合格条件**全部**满足：
+         - 不在否决名单里；
+         - `selected` 为 False（原本没入选）；
+         - `broken` / `entry_ma_ok` / `above_ma60` / **覆盖闸门** 全部通过；
+           - 🔴 2026-11-11（审计缺陷 B）：覆盖闸门原先判 `c.get("coverage_ok")`，
+             而报告候选字典（`analyze.py::_build_candidates`）**只有 `coverage`、
+             **没有** `coverage_ok` ⇒ 该合格条件**永不触发**（死代码）⇒
+             改用 `coverage` 与 **`C.MIN_E_COVERAGE`**（既有常量，语义 = E 的最低覆盖率）
+             比较：`coverage` **存在但为空/算不出** ⇒ **按不达标处理（fail-closed）**；
+             `coverage` **低于阈值** ⇒ 不达标；`coverage` 字段**不存在** ⇒ 该闸门
+             **不适用**（与其它闸门同口径：字段不存在 ⇒ 视为通过，不编数据；
+             报告口径下 `coverage` **恒存在** ⇒ 生产链路上覆盖闸门**始终生效**）。
+         - 与「剔除后仍入选的标的集合」**不构成规则层冲突对**
+           （重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95 ⇒ 跳过）；
+         - 与「剔除后仍入选的集合」**不同族**（`theme_id` 相同 ⇒ 跳过），
+           **且**与**被否决者**也不同族（否则「否决一只银行 ETF、换来另一只银行 ETF」
+           ⇒ 否决形同虚设）；
+         - 该族未达 `C.MAX_PER_THEME`；
+         - 🔴 2026-11-11（缺陷 A · 席位交互）：补位后**权益合计不得突破**
+           `1 − CASH_RESERVE_RATIO`（被否决且在持仓者**仍占席位** ⇒ 再补一席 = 多一席）。
+    ③ 顺延者的**目标权重 = 被否决者的目标权重**（保持等权口径）。
+    ④ 找不到合格顺延者 ⇒ **不强行补**（宁缺毋滥）⇒ 记 `no_substitute_reason`。
+
+    参数 ``equity_cap``
+        本轮**生效的权益上限**（默认 = 规则层硬上限 ``1 − 现金预留比例``）。
+        🔴 2026-11-11（Beta 避险）：当 TA 明确建议压降组合权益时，调用方把
+        ``min(规则层上限, TA 建议)`` 传进来 ⇒ 顺延补位也必须过这道闸
+        ⇒ **不许**出现「上限被压到 36%，却顺延补位到 80%」的自相矛盾。
+
+    返回 ``{"actions": [...], "ta_screening": {...}}``。
+    """
+    #: 本轮**生效**的权益上限（Beta 避险 ⇒ 可低于规则层硬上限；**永不低于**调用方给的硬上限口径）
+    _cap = float(equity_cap) if equity_cap is not None else _EQUITY_CAP
+    acts = [dict(a) for a in (actions or [])]
+    cands = [dict(c) for c in (candidates or [])]
+    rejected = [dict(r) for r in (rejections or [])]
+    rejected_codes = {str(r.get("code") or "").zfill(6) for r in rejected if r.get("code")}
+    held = {str(c).zfill(6) for c in (held_codes or [])}
+    cw = {str(k).zfill(6): (_f(v, 0.0) or 0.0) for k, v in (current_weights or {}).items()}
+    #: 规则层原始动作行（按代码索引）⇒ 用来取「被否决者的席位预算 / 原目标权重」
+    rule_action: dict[str, dict] = {}
+    for a in acts:
+        _c = str(a.get("code") or "").zfill(6)
+        if _c:
+            rule_action[_c] = a
+
+    def _cur_weight(code: str) -> float:
+        """该代码的**当前权重**（小数口径）⇒ 维持现仓时目标权重就取它。
+
+        取数顺序：`current_weights` 参数（账户真值，来自持仓诊断）→ 规则层动作行的
+        `current_weight` → 0.0（**拿不到就不编数字**，退化成 0 ⇒ 维持行权重为 0）。
+        """
+        w = _f(cw.get(code))
+        if w is None:
+            w = _f(rule_action.get(code, {}).get("current_weight"))
+        return float(w or 0.0)
+
+    cand_by_code: dict[str, dict] = {}
+    for c in cands:
+        code = str(c.get("code") or "").zfill(6)
+        if code:
+            cand_by_code[code] = c
+
+    name_map: dict[str, str] = {str(k): str(v) for k, v in (names or {}).items()}
+    for code, c in cand_by_code.items():
+        if c.get("name"):
+            name_map.setdefault(code, str(c.get("name")))
+    for a in acts:
+        code = str(a.get("code") or "").zfill(6)
+        if a.get("name"):
+            name_map.setdefault(code, str(a.get("name")))
+
+    def _theme_of(code: str) -> str:
+        c = cand_by_code.get(code)
+        if c and c.get("theme_id"):
+            return str(c.get("theme_id"))
+        return code
+
+    def _gate_ok(c: dict) -> tuple[bool, str]:
+        """破位 / 入场 MA / MA60 / **覆盖**：逐项判定 ⇒ 返回 (是否合格, 不合格原因)。
+
+        🔴 2026-11-11（审计缺陷 B）：覆盖闸门原先判 `c.get("coverage_ok")`，
+        而报告候选字典（`analyze.py::_build_candidates`）**只有 `coverage`、没有
+        `coverage_ok`** ⇒ 该合格条件**永不触发**（死代码）⇒ 顺延池里 coverage
+        不达标的标的照样能被选中。
+        ⇒ 改用 `coverage` 与既有常量 **`C.MIN_E_COVERAGE`**（语义 = E 的最低覆盖率）
+        直接比较（**不新造语义不同的常量**）：
+          - `coverage` **存在但为空 / 算不出** ⇒ **不达标（fail-closed）**
+            （E 根本算不出来 ⇒ 分数不可信）；
+          - `coverage` **低于阈值** ⇒ 不达标；
+          - `coverage` 字段**不存在** ⇒ 该闸门**不适用**（与 `broken` /
+            `entry_ma_ok` / `above_ma60` 同口径：字段不存在 ⇒ 视为通过，不编数据）；
+            报告口径下 `coverage` **恒存在** ⇒ 生产链路上覆盖闸门**始终生效**。
+        """
+        if bool(c.get("broken")):
+            return False, "已破位（跌破入场均线）"
+        if c.get("entry_ma_ok") is False:
+            return False, "入场均线过滤不通过"
+        if c.get("above_ma60") is False:
+            return False, "仍在 MA60 之下"
+        if "coverage" in c:
+            cov = _f(c.get("coverage"))
+            if cov is None:
+                return False, "coverage 缺失（E 算不出来）⇒ 按不达标处理"
+            if float(cov) < float(C.MIN_E_COVERAGE):
+                return False, (
+                    f"coverage {float(cov):.0%} < 阈值 {float(C.MIN_E_COVERAGE):.0%}"
+                    " ⇒ 覆盖不达标"
+                )
+        return True, ""
+
+    def _sort_key(c: dict) -> tuple[int, float]:
+        v = _f(c.get("final_score"))
+        if v is None:
+            return (1, 0.0)          # 分数算不出来 ⇒ 排最后
+        return (0, -float(v))
+
+    # ---- ① 剔除：被否决的 action 从候选列表里移除（**不是卖出**）----
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for a in acts:
+        code = str(a.get("code") or "").zfill(6)
+        if code in rejected_codes:
+            dropped.append(a)
+            continue
+        kept.append(a)
+
+    # ---- 🔴 2026-11-11（缺陷 A）：被否决 ∩ 在持仓 ⇒「孤儿持仓」----
+    #    旧行为：那几行**从计划里彻底消失** ⇒ 它们的市值在口径里凭空蒸发
+    #    ⇒ 计划权益被低估 ⇒「权益 ≤ 1−现金预留比例」的闸门拿偏小的数去判 ⇒ 可被绕过。
+    #    ⇒ 现在：**保留成一行「维持」**（目标权重 = **当前权重**，不是 0），
+    #      由 `build_plan` 落进计划 ⇒ 计入权益/现金口径，但**不进**买卖挂单。
+    orphan_codes = sorted(rejected_codes & held)
+    orphan_rows: list[dict] = []
+    for _code in orphan_codes:
+        _a = rule_action.get(_code, {})
+        _w = _cur_weight(_code)
+        orphan_rows.append({
+            "code": _code,
+            "name": str(_a.get("name") or name_map.get(_code) or ""),
+            # 维持现仓 ⇒ 目标权重 = **当前权重**（账户真值），不是 0
+            "current_weight": _w,
+            "target_weight": _w,
+            # 规则层原本给它分配的席位预算（披露用：当前权重超出它 ⇒ 超配席位）
+            "rule_target_weight": float(_f(_a.get("target_weight"), 0.0) or 0.0),
+            "reason": (
+                "🛡️ TA 一票否决 ⇒ 保持现仓不卖出（保留为『维持』席位："
+                "目标权重 = 当前权重，**不买不卖**，但**计入**权益/现金口径）"
+            ),
+            "ta_rejected": True,
+            "held_not_touched": True,
+        })
+
+    #: 席位账（用于权益上限闸门）：
+    #:   权益合计 = 规则层全部席位 − 被否决者（原行） + 孤儿维持行 + 顺延补位行
+    _s_all = sum(float(_f(a.get("target_weight"), 0.0) or 0.0) for a in acts)
+    _s_drop = sum(float(_f(a.get("target_weight"), 0.0) or 0.0) for a in dropped)
+    _s_orph = sum(float(r["current_weight"]) for r in orphan_rows)
+    _s_sub = 0.0
+
+    # ---- 顺延池：候选池里「原本没入选」的，按 final_score 降序 ----
+    pool = [c for c in cands
+            if str(c.get("code") or "").zfill(6) not in rejected_codes
+            and not bool(c.get("selected"))]
+    pool.sort(key=_sort_key)
+
+    # ---- 已入选集合（剔除后仍留在目标组合里的标的）----
+    def _selected_codes(acts_list: list[dict]) -> list[str]:
+        out: list[str] = []
+        for a in acts_list:
+            tw = _f(a.get("target_weight"), 0.0) or 0.0
+            if tw > 0:
+                out.append(str(a.get("code") or "").zfill(6))
+        return out
+
+    # ---- 规则层冲突对：一次性算好（重叠 ≥ 0.90 或 corr120 ≥ 0.95）----
+    sel0 = _selected_codes(kept)
+    all_codes = sorted(set(sel0) | {str(c.get("code") or "").zfill(6) for c in pool}
+                       | rejected_codes)
+    pair_conflict: dict[tuple[str, str], bool] = {}
+    overlap_ready = holdings is not None
+    if all_codes:
+        try:
+            for p in overlap_mod.compute_overlap_pairs(
+                holdings=holdings, prices=prices, codes=all_codes,
+                asof=asof, names=name_map,
+            ):
+                pair_conflict[(p["a"], p["b"])] = bool(p["rule_conflict"])
+                pair_conflict[(p["b"], p["a"])] = bool(p["rule_conflict"])
+        except Exception:  # noqa: BLE001 —— 重合度算不出来 ⇒ 视为不可用（不编结论）
+            pair_conflict = {}
+            overlap_ready = False
+
+    substituted: list[dict] = []
+    used: set[str] = set()
+    no_reason: str | None = None
+    #: 因「权益合计超上限」而**放弃**的顺延补位（披露用）
+    cap_skipped: list[dict] = []
+    for a in dropped:
+        code_rej = str(a.get("code") or "").zfill(6)
+        name_rej = str(a.get("name") or name_map.get(code_rej) or "")
+        tw = _f(a.get("target_weight"), 0.0) or 0.0
+        if tw <= 0:
+            # 被否决的标的**原本目标权重就是 0**（规则层本就打算卖出它）
+            # ⇒ 否决 = **不动持仓**，没有「替补席位」可言 ⇒ 不顺延。
+            if no_reason is None:
+                no_reason = (
+                    f"{code_rej} {name_rej} 被 TA 否决，但它原本的目标权重就是 0"
+                    "（规则层本就打算卖出）⇒ 否决 = **不动持仓**，**无席位可替补**"
+                )
+            continue
+        sel_codes = _selected_codes(kept)
+        # 🔴 顺延必须是「**不同主题**的资产」：
+        #    既不能与「剔除后仍入选的集合」同族，**也不能**与被否决者同族
+        #    （否则否决一只银行 ETF、换来另一只银行 ETF ⇒ 否决形同虚设）。
+        sel_themes = {_theme_of(c) for c in sel_codes} | {_theme_of(code_rej)}
+        picked: dict | None = None
+        gate_fail: list[str] = []
+        for c in pool:
+            code = str(c.get("code") or "").zfill(6)
+            if not code or code in rejected_codes or code in used:
+                continue
+            if code in sel_codes:
+                continue
+            _ok, _why = _gate_ok(c)
+            if not _ok:
+                if _why and len(gate_fail) < 6:
+                    gate_fail.append(f"{code}（{_why}）")
+                continue
+            theme = _theme_of(code)
+            if _SKIP_SAME_THEME_ON_SUBSTITUTE and theme in sel_themes:
+                continue      # 同族 ⇒ 跳过（文档口径：「顺延挑选下一个**不同主题**的资产」）
+            if sum(1 for x in sel_codes if _theme_of(x) == theme) >= C.MAX_PER_THEME:
+                continue
+            if _SKIP_CONFLICT_ON_SUBSTITUTE:
+                if not overlap_ready:
+                    continue      # 重合度数据不可得 ⇒ **不强行补**（宁缺毋滥）
+                if any(pair_conflict.get((code, x), False) for x in sel_codes):
+                    continue
+            picked = c
+            break
+        if picked is None:
+            if no_reason is None:
+                no_reason = (
+                    f"候选池里**没有合格的顺延者**（{code_rej} {name_rej} 被 TA 否决）："
+                    "合格条件 = 原本未入选 / 未破位 / 未被 MA 过滤 / 覆盖达标（coverage "
+                    f"≥ {float(C.MIN_E_COVERAGE):.0%}，缺失按不达标）/ "
+                    "与已入选集合及被否决者均不同族 / 与已入选集合不构成规则层冲突对 / "
+                    "该族未达 MAX_PER_THEME"
+                    + ("（且成分权重数据不可得 ⇒ 无法核验冲突对）" if not overlap_ready else "")
+                    + ("；被闸门挡下的候选：" + "、".join(gate_fail) if gate_fail else "")
+                )
+            continue
+        # 🔴 2026-11-11（缺陷 A · 席位交互）：被否决者若**仍在持仓** ⇒ 它**占着席位**
+        #    （保留为『维持』行）⇒ 再顺延一个补位者 = **多出一席** ⇒ 权益可能超配。
+        #    ⇒ 补位前必须过「权益合计 ≤ 1 − 现金预留比例」这道闸；过不了 ⇒ **不补位**
+        #      （宁缺毋滥），并在 `no_substitute_reason` 写明原因。
+        _s_after = _s_all - _s_drop + _s_orph + _s_sub + tw
+        if _s_after > _cap + 1e-9:
+            cap_skipped.append({
+                "code": str(picked.get("code") or "").zfill(6),
+                "name": str(picked.get("name") or name_map.get(str(picked.get("code") or "").zfill(6)) or ""),
+                "substituted_for": code_rej,
+                "equity_weight_after": round(_s_after, 6),
+                "equity_cap": round(_cap, 6),
+                "reason": (
+                    f"被否决者 {code_rej} {name_rej} **仍在持仓**（保留为『维持』席位、仍占席位）"
+                    f" ⇒ 再顺延补位会让权益合计达 {_s_after:.1%} > 上限 {_cap:.1%}"
+                    "（本轮生效的权益上限）⇒ **不补位**（避免多出一席、权益超配）"
+                ),
+            })
+            if no_reason is None:
+                no_reason = (
+                    f"{code_rej} {name_rej} 被 TA 否决且**仍在持仓**（保留为『维持』席位、仍占席位）"
+                    f" ⇒ 顺延补位会让权益合计达 {_s_after:.1%} > 上限 {_cap:.1%}"
+                    "（本轮生效的权益上限）⇒ **不补位**（宁缺毋滥，避免多出一席、权益超配）"
+                )
+            continue
+        code = str(picked.get("code") or "").zfill(6)
+        name = str(picked.get("name") or name_map.get(code) or "")
+        kept.append({
+            "code": code,
+            "name": name,
+            "action": "买入",
+            "target_weight": tw,
+            "current_weight": cw.get(code, 0.0),
+            "reason": (f"🛡️ TA 合规筛选**顺延补位**（替补被否决的 {code_rej} {name_rej}；"
+                       "目标权重沿用被否决者，保持等权口径）"),
+            "ta_substitute": True,
+            "ta_substituted_for": code_rej,
+        })
+        used.add(code)
+        _s_sub += tw
+        substituted.append({
+            "code": code,
+            "name": name,
+            "final_score": _f(picked.get("final_score")),
+            "theme": _theme_of(code),
+            "substituted_for": code_rej,
+            "substituted_for_name": name_rej,
+            "reason": (f"原候选 {code_rej} {name_rej} 被 TA 否决 ⇒ 顺延挑选下一个"
+                       f"**不同主题**的资产（最终分 {_f(picked.get('final_score'))}）"),
+        })
+
+    # ---- 披露用：候选池里被**更宽口径**标记为高重合的对 ----
+    screen_pairs: list[dict] = []
+    screen_note = ""
+    pool_codes = sorted({str(c.get("code") or "").zfill(6) for c in cands} | rejected_codes)
+    if pool_codes and holdings is not None:
+        try:
+            for p in overlap_mod.compute_overlap_pairs(
+                holdings=holdings, prices=prices, codes=pool_codes,
+                asof=asof, names=name_map,
+            ):
+                if p.get("screen_flag"):
+                    screen_pairs.append(p)
+        except Exception:  # noqa: BLE001
+            screen_pairs = []
+            screen_note = "重合度计算失败（异常）⇒ 本次无高重合预警对"
+    elif pool_codes:
+        screen_note = "成分权重数据不可得 ⇒ 本次无高重合预警对"
+
+    rejected_rows = []
+    for r in rejected:
+        code = str(r.get("code") or "").zfill(6)
+        rejected_rows.append({
+            "code": code,
+            "name": str(r.get("name") or name_map.get(code) or ""),
+            "reason": str(r.get("reason") or ""),
+            "source_section": str(r.get("source_section") or ""),
+        })
+
+    ta_screening = {
+        "enabled": True,
+        "rejected": rejected_rows,
+        "substituted": substituted,
+        "no_substitute_reason": no_reason,
+        "screen_pairs": screen_pairs,
+        # 🔴 被否决的标的**若本来就在持仓里** ⇒ 只剔除候选、**不动持仓**
+        "held_not_touched": bool(rejected_codes & held),
+        "screen_note": screen_note,
+        # 🔴 2026-11-11（缺陷 A）：**被否决且在持仓**的代码列表（便于审计）
+        #    ⇒ 它们在计划里各占一行「维持」（目标权重 = 当前权重），不进买卖挂单。
+        "orphaned_holdings": orphan_codes,
+        "orphaned_holding_rows": orphan_rows,
+        # 🔴 席位交互：因权益上限而放弃的顺延补位
+        "cap_skipped": cap_skipped,
+        # 🔴 2026-11-11（Beta 避险）：`equity_cap` = **规则层硬上限**（1 − 现金预留比例）
+        #    ⇒ **恒为 0.8**（验收脚本按它断言，不许被 TA 改写）；
+        #    `equity_cap_effective` = **本轮生效**的上限（= min(硬上限, TA 建议)）。
+        "equity_cap": round(_EQUITY_CAP, 6),
+        "equity_cap_effective": round(_cap, 6),
+        # 🔴 **不可消除**的超配：账户在「被否决且仍在持仓」这只上的权重**超过**它在
+        #    规则层的席位预算 ⇒ 即使**一点也不顺延**，权益合计也已经突破上限
+        #    （TA 一票否决 ⇒ 不许卖 ⇒ 这个超配是**事实**，不许粉饰 ⇒ 如实披露）。
+        "equity_cap_breach": round(max(0.0, _s_all - _s_drop + _s_orph - _cap), 6),
+    }
+    return {"actions": kept, "ta_screening": ta_screening}
 
 
 def build_plan(args) -> dict:
@@ -1651,6 +2309,22 @@ def build_plan(args) -> dict:
     prices = load_prices(args.prices, asof)
     universe = load_universe(args.universe)
     account = load_account(args.account)
+    # 🔴 2026-11-11（审计缺陷 C）：**顺延池 = 报告的 `candidates`**（= analyze.py 的 Top-N）。
+    #    报告 JSON **没有**「完整候选池」字段（只有 `candidates` 与
+    #    `filter_stats.n_candidate_pool` = 池子**总数**）⇒ 若 `--top-n` 小于真实池大小，
+    #    池内第 N+1 名以后**不可见** ⇒ 会误报「候选池里没有合格的顺延者」。
+    #    ⇒ 这里**显式核对**两者 ⇒ 截断了就**报警**（不静默）。
+    _pool_n = _f((report.get("filter_stats") or {}).get("n_candidate_pool"))
+    _vis_n = len(report.get("candidates") or [])
+    _pool_truncated = ""
+    if _pool_n is not None and _vis_n and float(_pool_n) > float(_vis_n):
+        _pool_truncated = (
+            f"🔴 **顺延池被截断**：报告的候选池真实 {int(_pool_n)} 只，但报告只带了 "
+            f"{int(_vis_n)} 只（analyze.py 的 --top-n 截断）⇒ 第 {int(_vis_n) + 1} 名以后"
+            "**不可见** ⇒ 顺延可能漏人（每日链已把 --top-n 调到 100；"
+            "研究链 run_pipeline.sh 若用默认值 15 ⇒ 必须自己调大）"
+        )
+
     # 🔴 2026-11-05 01:3x（M-K 收尾）：当前权重的**账户真值**（百分比）。
     #    解析 LLM 表格时用它当「当前权重」，不再从相邻格子里乱读。
     account_weights, account_weight_warnings = build_account_weights(
@@ -1661,8 +2335,119 @@ def build_plan(args) -> dict:
         str(h.get("code", "")).zfill(6): h for h in (diag.get("holdings") or [])
     }
 
+    # 🛡️ TA 合规筛选（否决 + 顺延）：**在构建 plans 之前**执行。
+    #    🔴 只改**副本**（`rec` 原对象一字不动）⇒ 被否决的标的是「从本轮候选里剔除 + 顺延」，
+    #    **不是**「卖出」⇒ 目标权重不写 0；如果它本来就在持仓里 ⇒ 只剔除候选、不动持仓。
+    _ov_holdings, _ov_prices = overlap_mod.load_overlap_inputs(
+        holdings_path=C.ETF_HOLDINGS_CSV, prices_path=args.prices)
+    # 🔴 2026-11-11（缺陷 A）：「维持」行的目标权重 = **当前权重** ⇒ 当前权重的取数
+    #    必须**完整**：持仓诊断（报告口径）为准，**账户快照 CSV 兜底**
+    #    （诊断里没有、但账户确实持有 ⇒ 否则那一行的权重会被算成 0）。
+    _acct_w: dict[str, float] = {}
+    if total_assets:
+        for _c, _row in (account or {}).items():
+            _mv = _f(_row.get("market_value"))
+            if _mv is not None:
+                _acct_w[str(_c).zfill(6)] = float(_mv) / float(total_assets)
+    _screen_cw = {
+        **_acct_w,
+        **{str(k).zfill(6): (_f(v.get("current_weight"), 0.0) or 0.0)
+           for k, v in holdings_by_code.items()},
+    }
+    # 🔴 2026-11-11（Beta 避险落地）：**采纳** TA 的组合权益上限压降建议。
+    #    口径：只认 `llm_final.post_trade.equity_target_pct`（**目标动词**口径，
+    #    陈述句不算建议）、**只许压降**（建议 ≥ 规则层硬上限 ⇒ 忽略）、
+    #    解析不出 ⇒ **完全保持原行为**。
+    _ta_cap = _resolve_ta_equity_cap(
+        llm_final_mod.load_from_decision(getattr(args, "decision", None))
+    )
+    _effective_cap = (
+        _EQUITY_CAP if _ta_cap["pct"] is None else min(_EQUITY_CAP, float(_ta_cap["pct"]))
+    )
+    # 🔴 一票否决**只认权威裁决段落**（观点段落没有否决权）——
+    #    真实决策件里空头说「暂不买入 515450/515650」、激进派说「清仓512800，
+    #    等于放弃…」⇒ 旧实现（扫全文）误伤 3 只 ⇒ 见 llm_final.AUTHORITY_SECTIONS。
+    _rejections = llm_final_mod.extract_authority_rejections(args.decision)
+    # 🔴 「维持」行（被 TA 否决但**仍在持仓**）**占席位**（目标权重 = 当前权重）
+    #    ⇒ 席位预算必须先扣掉它 ⇒ 否则「维持行 + 席位行」会突破本轮生效的上限。
+    _orphan_weight = sum(
+        float(_screen_cw.get(str(r.get("code") or "").zfill(6), 0.0) or 0.0)
+        for r in _rejections
+        if str(r.get("code") or "").zfill(6) in _screen_cw
+    )
+    #: 🔴 席位等比缩放：把规则层席位预算压到「本轮生效上限 − 维持行占额」。
+    #:    ⚠️ 无 TA 建议 ⇒ `_scale == 1.0` ⇒ **产物逐字节不变**（既有金标不动）。
+    _rule_actions = list(rec.get("actions") or [])
+    _seat_base = sum(float(_f(a.get("target_weight"), 0.0) or 0.0) for a in _rule_actions)
+    _seat_cap = max(0.0, _effective_cap - _orphan_weight)
+    _scale = 1.0
+    if _seat_base > 0 and _effective_cap < _EQUITY_CAP - 1e-12:
+        _scale = min(1.0, _seat_cap / _seat_base)
+    _scaled_actions = [
+        {**a, "target_weight": float(_f(a.get("target_weight"), 0.0) or 0.0) * _scale}
+        for a in _rule_actions
+    ]
+    _ta_screen = apply_ta_screening(
+        actions=_scaled_actions,
+        candidates=report.get("candidates") or [],
+        rejections=_rejections,
+        held_codes=sorted(set(holdings_by_code) | set(account)),
+        current_weights=_screen_cw,
+        holdings=_ov_holdings,
+        prices=_ov_prices,
+        asof=asof,
+        equity_cap=_effective_cap,
+    )
+    _screen_actions = list(_ta_screen["actions"])
+    _ta_screening = _ta_screen["ta_screening"]
+
+    # 🔴 2026-11-11（Beta 避险落地）：把「TA 建议 / 生效上限 / 席位缩放」**写进披露**
+    #    （用户必须看得见：TA 说压降到多少、规则层实际按多少落地、席位缩了多少）。
+    _ta_screening["equity_cap_ta_recommendation"] = {
+        "pct": None if _ta_cap["pct"] is None else round(float(_ta_cap["pct"]), 6),
+        "pct_display": (None if _ta_cap["pct"] is None
+                        else round(float(_ta_cap["pct"]) * 100, 2)),
+        "evidence": _ta_cap["evidence"],
+        "reason": _ta_cap["reason"],
+        "base_cap": round(_EQUITY_CAP, 6),
+        "effective_cap": round(_effective_cap, 6),
+        "note": (
+            "TA 的**权益上限压降建议**（只认『降至/定为/控制在』这类目标动词；"
+            "陈述句不算建议）；**只许压降、不许抬高**；解析不出 ⇒ 不压降"
+        ),
+    }
+    _ta_screening["equity_cap_scale"] = {
+        "factor": round(_scale, 6),
+        "seat_base_weight": round(_seat_base, 6),
+        "seat_cap_weight": round(_seat_cap, 6),
+        "orphan_hold_weight": round(_orphan_weight, 6),
+        "note": (
+            "席位目标权重**等比缩放**到「本轮生效上限 − 维持行占额」"
+            "（『维持』行 = 被 TA 否决但仍在持仓者 ⇒ 目标权重 = 当前权重，权重不动）"
+        ),
+    }
+
+    # 🔴 2026-11-11（审计缺陷 A）：**被 TA 否决且仍在持仓**的代码 ⇒ 保留成一行
+    #    「维持」（语义 = 持有不动仓）：
+    #      - 目标权重 = **当前权重**（不是 0）⇒ 它**计入**权益/现金口径
+    #        ⇒ 计划权益 / 计划现金 / 总资产恒等式**自洽**（不再凭空蒸发市值）；
+    #      - 目标股数 = **当前股数** ⇒ delta = 0 ⇒ **既不买也不卖**（不进挂单）。
+    #    ⚠️ 它**不在** `apply_ta_screening` 返回的候选 action 列表里（剔除 ≠ 权重 0），
+    #      是**持仓行**⇒ 由这里单独接进来。
+    for _r in (_ta_screening.get("orphaned_holding_rows") or []):
+        _screen_actions.append({
+            "code": _r.get("code"),
+            "name": _r.get("name") or "",
+            "action": "维持",
+            "target_weight": _f(_r.get("target_weight"), 0.0) or 0.0,
+            "current_weight": _f(_r.get("current_weight"), 0.0) or 0.0,
+            "reason": _r.get("reason") or "",
+            "ta_rejected": True,
+            "held_not_touched": True,
+        })
+
     plans = []
-    for act in rec.get("actions", []) or []:
+    for act in _screen_actions:
         code = str(act.get("code", "")).zfill(6)
         name = str(act.get("name", "")) or universe.get(code, {}).get("name", "")
         held = account.get(code, {})
@@ -1693,15 +2478,26 @@ def build_plan(args) -> dict:
                 price = _f(_u.get("last_price"))
                 price_date = _upd
         target_weight = _f(act.get("target_weight"), 0.0) or 0.0
-        target_amount = target_weight * total_assets if total_assets else None
-        target_shares = (
-            _round_lot(target_amount / price)
-            if (price is not None and target_amount is not None)
-            else None
-        )
+        #: 🔴 2026-11-11（缺陷 A）：「维持」行（被 TA 否决但仍在持仓）⇒
+        #    目标股数 = **当前股数**（**不卖不买**）；目标金额按**执行价**口径
+        #    （= 当前股数 × 执行价）⇒ 与 `target_shares × price` 自洽（不触发
+        #    「实际买入额 > 目标金额」的超配守卫），与其它行的差异就是**价格基差**。
+        _is_ta_hold = bool(act.get("ta_rejected"))
+        if _is_ta_hold:
+            target_amount = (current_shares * price) if price is not None else None
+            target_shares = current_shares
+        else:
+            target_amount = target_weight * total_assets if total_assets else None
+            target_shares = (
+                _round_lot(target_amount / price)
+                if (price is not None and target_amount is not None)
+                else None
+            )
         delta_shares = (target_shares - current_shares) if target_shares is not None else None
         est_amount = delta_shares * price if (delta_shares is not None and price) else None
-        if delta_shares is None:
+        if _is_ta_hold:
+            action = "维持"
+        elif delta_shares is None:
             action = str(act.get("action", ""))
         elif delta_shares > 0:
             action = "买入"
@@ -1730,6 +2526,10 @@ def build_plan(args) -> dict:
             "est_fee": fee,
             "final_score": priority.get(code),
             "reason": str(act.get("reason", "")),
+            # 🔴 2026-11-11（缺陷 A）：否决/维持标记随行走 ⇒ 交付层与每日链
+            #    （执行卡挂单）都能认出「这一行不许动」。
+            "ta_rejected": bool(act.get("ta_rejected")),
+            "held_not_touched": bool(act.get("held_not_touched")),
             "broken": holdings_row.get("broken"),
             "ma20_ok": holdings_row.get("ma20_ok"),
             "ma60_ok": holdings_row.get("ma60_ok"),
@@ -1743,6 +2543,44 @@ def build_plan(args) -> dict:
     # 追加口径事实（2026-11-04 夜修）：① 跌破 MA60 ⇒ 持仓强制退出（比「E 算不出」更贴切）；
     # ② 入选标的补 E(W×S) 与动量数字；③ 目标股数是**按 asof 价**折算的，执行日必须重算。
     for p in plans:
+        # 🔴 2026-11-11（审计缺陷 B）：**执行说明必须每行都有**（含「维持」行）。
+        #    `probe_execution_date` 的 P9 要求**每一条** action 的 `execution_note`
+        #    同时写「信号日」与「执行日」；旧实现里「维持」行（被 TA 一票否决但仍在持仓）
+        #    在 `execution_note` **赋值之前**就 `continue` 了
+        #    ⇒ 一旦 TA 否决了**在持仓**的标的，计划就**缺执行说明** ⇒ P9 必红。
+        #    ⚠️ 之所以长期没暴露：本轮「维持」行数 = 0（TA 只否决了未持仓候选）
+        #    ⇒ 缺陷**潜伏**，直到某轮 TA 否决了持仓才会炸（跑批时不出声 ⇒ 极难排查）。
+        #    ⇒ 修法：日期口径**提到分支之前**算好（与循环无关），
+        #      「维持」行走**专用文案**（写明「不建仓也不卖出」+ 信号日/执行日），
+        #      **不污染**「跌破 MA60 ⇒ 强制退出」这类卖出文案（缺陷 A 的修法不受影响）。
+        _node_date = str((next_rb or {}).get("signal_date")
+                         or (next_rb or {}).get("target_date") or "")
+        _exec_date = str((next_rb or {}).get("execution_date") or "")
+        _exec_tail = (
+            f"于**执行日 {_exec_date}** 收盘下单"
+            if _exec_date else "执行日算不出来（报告未给）⇒ 不许编日期"
+        )
+        # 🔴 2026-11-11（缺陷 A）：「维持」行（被 TA 一票否决但仍在持仓）**不卖**
+        #    ⇒ 不许被「跌破 MA60 ⇒ 持仓强制退出」这类**规则层卖出**文案污染
+        #    （否则同一行既写『维持』又写『强制退出』⇒ 交付件自相矛盾）。
+        if p.get("ta_rejected"):
+            # 「维持」行：**不卖** ⇒ 不追加「跌破 MA60 ⇒ 强制退出」这类**卖出**文案
+            #    （否则同一行既写『维持』又写『强制退出』⇒ 交付件自相矛盾）；
+            #    但 **E / 动量**等**中性事实**照常披露（不藏数据）。
+            if p["e_score"] is not None:
+                p["reason"] += (f"；E(W×S)={float(p['e_score']):.4f}"
+                                + (f"，mom120={float(p['mom120']):+.2%}"
+                                   if p["mom120"] is not None else ""))
+            # 🔴 2026-11-11（审计缺陷 B）：「维持」行**也必须有**执行说明
+            #    （P9 要求每行都写「信号日」+「执行日」）。
+            p["execution_note"] = (
+                f"**维持当前持仓**（本轮被 TA 一票否决 ⇒ 既不建仓也不卖出；"
+                f"目标股数＝当前股数 {p.get('current_shares')} 股，不做整手重算）；"
+                f"自**信号日（{_node_date or '报告未给日期'}）**收盘起按当日价格盯市，"
+                f"至**执行日（{_exec_date or '报告未给日期'}）**收盘前复核"
+                f"（本轮不产生任何买卖动作）"
+            )
+            continue
         if p["current_shares"] and p["ma60_ok"] is False:
             p["reason"] = (p["reason"] + "；**已跌破 MA60 ⇒ 持仓强制退出（不看排名）**").strip("；")
         if p["e_score"] is not None:
@@ -1756,13 +2594,7 @@ def build_plan(args) -> dict:
         #   ⇒ 那等于拿 **11-03 的旧信号**、用 12-01 的价格成交 ⇒ 比回测口径早一天，
         #   **不在回测假设内**（§十四.7 的持仓区间也是按 exec 日算的）。
         #   ⇒ 执行说明必须同时给出**信号日**（重算股数）与**执行日**（下单）。
-        _node_date = str((next_rb or {}).get("signal_date")
-                         or (next_rb or {}).get("target_date") or "")
-        _exec_date = str((next_rb or {}).get("execution_date") or "")
-        _exec_tail = (
-            f"于**执行日 {_exec_date}** 收盘下单"
-            if _exec_date else "执行日算不出来（报告未给）⇒ 不许编日期"
-        )
+        #    （日期口径已在循环开头算好 —— 见「审计缺陷 B」的注释。）
         p["execution_note"] = (
             f"目标股数按 {p['price_date']} 收盘价 {p['price']} 折算；"
             f"实际在**信号日（{_node_date or '报告未给日期'}）**收盘后按当日价格重新折算整手股数，"
@@ -1770,6 +2602,8 @@ def build_plan(args) -> dict:
 
     # 目标金额不足一手（100 份）时，标出来 —— 不静默变成 0
     for p in plans:
+        if p.get("ta_rejected"):
+            continue      # 「维持」行不建仓 ⇒ 不适用「买不进」口径
         if (
             p["target_amount"] is not None
             and p["price"] is not None
@@ -2020,7 +2854,34 @@ def build_plan(args) -> dict:
     # 🔴 2026-11-05 04:4x（M-P）：Trader 的**最终裁决**单独成块（**不改** llm_targets /
     #    llm_conflicts ⇒ 金标 A1 不动）⇒ 交付件必须让用户看见「最终结论」而不是
     #    「与规则层差得最远的子智能体视图」。
-    llm_final_decision = _build_llm_final_decision(args, plans, llm_targets, llm_conflicts)
+    # 🔴 2026-11-11（审计缺陷 D）：被 TA 一票否决的代码 ⇒ 最终裁决表里**单列一行**
+    #    （原先它们从表里静默消失 ⇒ 与正文「以本节为准」自相矛盾）；
+    #    其中**因否决而移出**本轮组合的 ⇒ 显式标注「因 TA 否决而移出」。
+    _ta_rejected_rows = [
+        {
+            "code": str(r.get("code") or "").zfill(6),
+            "name": str(r.get("name") or ""),
+            "reason": str(r.get("reason") or ""),
+        }
+        for r in (_ta_screening.get("rejected") or [])
+        if r.get("code")
+    ]
+    _plan_codes = {str(pl.get("code")) for pl in plans}
+    _ta_moved_out = [
+        {
+            "code": r["code"],
+            "name": r["name"],
+            "reason": "因 TA 一票否决而移出本轮候选（冲突表里的对应条目随之移除）",
+            "had_llm_view": bool(llm_views.get(r["code"])),
+            "llm_views": llm_views.get(r["code"]) or [],
+        }
+        for r in _ta_rejected_rows
+        if r["code"] not in _plan_codes
+    ]
+    llm_final_decision = _build_llm_final_decision(
+        args, plans, llm_targets, llm_conflicts,
+        ta_rejected=_ta_rejected_rows, ta_moved_out=_ta_moved_out,
+    )
     plan = {
         "meta": {
             "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2104,8 +2965,20 @@ def build_plan(args) -> dict:
         "llm_targets": llm_targets,
         "llm_conflicts": llm_conflicts,
         "llm_final_decision": llm_final_decision,
+        # 🛡️ TA 合规筛选（否决 / 顺延）——**独立字段**：
+        #    不改 `llm_targets` / `llm_conflicts`（金标 A1 不动）⇒ 只新增披露与执行结果。
+        "ta_screening": _ta_screening,
         "risk_disclosure": report.get("risk_disclosure", []),
-        "warnings": list(report.get("warnings", [])) + list(account_weight_warnings) + ([
+        "warnings": list(report.get("warnings", [])) + list(account_weight_warnings)
+        + ([_pool_truncated] if _pool_truncated else [])
+        + ([(
+            f"🔴 **权益超配（不可消除）**：账户在「被 TA 一票否决但仍在持仓」的标的上的"
+            f"权重，合计已超出**本轮生效上限** "
+            f"{float(_ta_screening.get('equity_cap_effective') or _ta_screening.get('equity_cap') or 0.8):.1%}"
+            f"（规则层硬上限 {float(_ta_screening.get('equity_cap') or 0.8):.1%}）"
+            f"达 {float(_ta_screening.get('equity_cap_breach') or 0.0):.2%}"
+            "（TA 一票否决 ⇒ **不许卖** ⇒ 该超配是事实）⇒ 需人工决定是否豁免"
+        )] if float(_ta_screening.get("equity_cap_breach") or 0.0) > 1e-9 else []) + ([
             ("ℹ️ 未找到 LLM 决策文件 ⇒ 本计划**只有 qlib 规则层结论**（无 LLM 第二意见、无冲突表）"
              if not (args.decision and Path(args.decision).exists())
              else "ℹ️ LLM 决策文件存在但**本轮未完成**（失败占位）⇒ 本计划**只有 qlib 规则层结论**"
@@ -2324,6 +3197,127 @@ def render_markdown(plan: dict) -> str:
     else:
         lines += ["现金约束：**全部买入均可执行**（无需削减）。", ""]
 
+    # ---- 🛡️ TA 合规筛选（否决 / 顺延）——**独立章节**，与 LLM 冲突表并列 ----
+    _scr = plan.get("ta_screening") or {}
+    if _scr.get("enabled"):
+        _rej = _scr.get("rejected") or []
+        _sub = _scr.get("substituted") or []
+        _pairs = _scr.get("screen_pairs") or []
+        lines += ["## 二之四、🛡️ TA 合规筛选（否决 / 顺延）", ""]
+        lines += [
+            "> 口径：TA（TradingAgents）拥有**一票否决权** ⇒ 被点名否决的标的"
+            "**从本轮候选里剔除**（**不是卖出**，目标权重不写 0），并**顺延**挑选"
+            "下一个**不同主题**的资产补位；规则层的重合度判定口径**不变**。",
+            "",
+        ]
+        # 🔴 2026-11-11（Beta 避险落地）：披露「TA 建议的权益上限 ⇒ 本轮生效上限」。
+        #    ⚠️ 只有**读到** TA 的目标口径权益建议时才加这段 ⇒ 没有建议 ⇒ 产物逐字节不变。
+        _cap_rec = _scr.get("equity_cap_ta_recommendation") or {}
+        if _cap_rec.get("pct") is not None:
+            _cap_eff = _scr.get("equity_cap_effective")
+            _cap_base = _scr.get("equity_cap")
+            _cap_scale = _scr.get("equity_cap_scale") or {}
+            if _cap_rec.get("reason") == "accepted":
+                lines += [
+                    "**Beta 避险（TA 建议压降组合权益上限）**：TA 建议本轮权益上限 **"
+                    f"{float(_cap_rec.get('pct') or 0.0) * 100:.1f}%** ⇒ 本轮**生效上限 = "
+                    f"{float(_cap_eff or 0.0) * 100:.1f}%**（规则层硬上限 "
+                    f"{float(_cap_base or 0.0) * 100:.1f}% = 1 − 现金预留比例；"
+                    "**只许压降、不许抬高**）⇒ 席位目标权重**等比缩放**（系数 "
+                    f"{float(_cap_scale.get('factor') or 1.0):.4f}），差额**留现金**。",
+                    "",
+                    f"> TA 原文证据：{str(_cap_rec.get('evidence') or '（未记录证据句）')[:200]}",
+                    "",
+                ]
+            else:
+                lines += [
+                    "**Beta 避险（权益上限）**：TA 提到的组合权益 "
+                    f"**{float(_cap_rec.get('pct') or 0.0) * 100:.1f}%** "
+                    "**不低于**规则层硬上限 "
+                    f"{float(_cap_base or 0.0) * 100:.1f}% ⇒ **不采纳**（只许压降）"
+                    "⇒ 本轮生效上限不变。",
+                    "",
+                ]
+        if not _rej:
+            lines += ["本轮 TA **未点名否决**任何标的 ⇒ 候选池与规则层计划**逐条一致**。", ""]
+        else:
+            lines += [f"TA **一票否决**了 **{len(_rej)}** 只标的（已从本轮候选中剔除）：", ""]
+            lines += ["| 代码 | 名称 | 理由（原文） | 出处章节 |", "|:--|:--|:--|:--|"]
+            for r in _rej:
+                _why = (r.get("reason") or "—").replace("|", "／")[:160]
+                lines.append(f"| {r.get('code')} | {r.get('name') or '—'} | {_why} | "
+                             f"{r.get('source_section') or '—'} |")
+            lines += [""]
+            if _scr.get("held_not_touched"):
+                lines += ["> 🔴 被否决的标的里有**当前持仓** ⇒ 本轮**只剔除候选、"
+                          "不动持仓**（不生成卖出动作）。", ""]
+            _orph = _scr.get("orphaned_holdings") or []
+            if _orph:
+                _orph_rows = {str(r.get("code")): r
+                              for r in (_scr.get("orphaned_holding_rows") or [])}
+                lines += [
+                    f"🔴 **孤儿持仓（{len(_orph)} 只）**：被否决且**仍在持仓** ⇒ "
+                    "在「一、逐只操作清单」里**各占一行『维持』**（目标权重 = **当前权重**，"
+                    "**不买不卖**，但**计入**权益/现金口径 ⇒ 计划权益/现金/总资产恒等式自洽）。",
+                    "",
+                    "| 代码 | 名称 | 当前权重（= 目标权重） | 规则层原席位预算 |",
+                    "|:--|:--|--:|--:|",
+                ]
+                for _c in _orph:
+                    _r = _orph_rows.get(str(_c), {})
+                    _cw = _r.get("current_weight")
+                    _rt = _r.get("rule_target_weight")
+                    lines.append(
+                        f"| {_c} | {_r.get('name') or '—'} | "
+                        f"{'—' if _cw is None else format(float(_cw) * 100, '.2f') + '%'} | "
+                        f"{'—' if _rt is None else format(float(_rt) * 100, '.2f') + '%'} |"
+                    )
+                lines += [""]
+            _cap_skip = _scr.get("cap_skipped") or []
+            if _cap_skip:
+                lines += [
+                    f"🔴 **席位交互（权益上限）**：权益上限 = 1 − 现金预留比例 = "
+                    f"{float(_scr.get('equity_cap') or 0.8) * 100:.1f}%。"
+                    "被否决且仍在持仓者**仍占席位** ⇒ 顺延补位若会让权益合计突破上限 ⇒ "
+                    "**不补位**（宁缺毋滥，避免多出一席、权益超配）：",
+                    "",
+                ]
+                for _c in _cap_skip:
+                    lines.append(f"- {_c.get('code')} {_c.get('name') or ''}："
+                                 f"{_c.get('reason') or ''}")
+                lines += [""]
+        if _sub:
+            lines += ["**顺延记录**（补位者 ← 被否决者）：", ""]
+            lines += ["| 补位代码 | 补位名称 | 最终分 | 主题 | 替补对象 | 替补对象名称 |",
+                      "|:--|:--|--:|:--|:--|:--|"]
+            for s in _sub:
+                _fs = s.get("final_score")
+                lines.append(
+                    f"| {s.get('code')} | {s.get('name') or '—'} | "
+                    f"{'—' if _fs is None else format(float(_fs), '.4f')} | "
+                    f"{s.get('theme') or '—'} | {s.get('substituted_for') or '—'} | "
+                    f"{s.get('substituted_for_name') or '—'} |")
+            lines += [""]
+        elif _rej:
+            lines += [f"**顺延**：本轮**没有**顺延补位 ⇒ "
+                      f"{_scr.get('no_substitute_reason') or '（原因未记录）'}", ""]
+        if _pairs:
+            lines += ["**高重合预警对**（**更宽口径**：成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 "
+                      "或同族 ⇒ **只提示**，不改变规则层判定；规则层仍按"
+                      "「重叠 ≥ 0.90 或相关性 ≥ 0.95」逐对拦截）：", "",
+                      "| 代码A | 名称A | 代码B | 名称B | 成分重叠 | 120日相关性 | 同族 | 规则层冲突对 |",
+                      "|:--|:--|:--|:--|--:|--:|:--:|:--:|"]
+            for p in _pairs:
+                lines.append(
+                    f"| {p.get('a')} | {p.get('a_name') or '—'} | {p.get('b')} | "
+                    f"{p.get('b_name') or '—'} | {float(p.get('weight_overlap') or 0.0):.3f} | "
+                    f"{float(p.get('corr120') or 0.0):.3f} | "
+                    f"{'是' if p.get('same_theme') else '否'} | "
+                    f"{'**是**' if p.get('rule_conflict') else '否'} |")
+            lines += [""]
+        elif _scr.get("screen_note"):
+            lines += [f"（高重合预警：{_scr['screen_note']}）", ""]
+
     # ---- 🔴 2026-11-05 04:4x（M-P）：Trader 的**最终裁决**（独立于冲突表） ----
     _final = plan.get("llm_final_decision") or {}
     if _final.get("available"):
@@ -2361,6 +3355,23 @@ def render_markdown(plan: dict) -> str:
                     f"{_dir} | {_pct(r.get('rule_target_pct'))} | "
                     f"{_pct(r.get('rule_effective_pct'))} | {_pct(r.get('bull_pct'))} | "
                     f"{_pct(r.get('bear_pct'))} | {_stxt} | {_ev} |")
+            lines += [""]
+        # 🔴 2026-11-11（缺陷 D）：因 TA 一票否决而**移出**本轮组合的代码
+        #    ⇒ 冲突表里的对应条目随之移除 ⇒ 这里**显式标注**，不让它悄悄消失。
+        _ta_moved = _final.get("ta_moved_out") or []
+        if _ta_moved:
+            lines += [
+                "> 🔴 **因 TA 一票否决而移出**：下列代码**不在本轮目标组合**里 ⇒ "
+                "「二之三 冲突表」里的对应条目已随之移除（本节表格仍**单列一行**以示否决）：",
+                "",
+            ]
+            for _m in _ta_moved:
+                lines.append(
+                    f"- **{_m.get('code')} {_m.get('name') or ''}**："
+                    f"{_m.get('reason') or '因 TA 一票否决而移出本轮候选'}"
+                    + ("（LLM 表里原本有它的条目 ⇒ 该分歧已不在冲突表里）"
+                       if _m.get("had_llm_view") else "（LLM 表里没有它的条目）")
+                )
             lines += [""]
         if _diff:
             lines += ["**🔴 最终裁决与规则层不一致之处（须用户拍板）**："]

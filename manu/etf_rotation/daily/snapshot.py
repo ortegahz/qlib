@@ -3,7 +3,7 @@
 【为什么存在（2026-11-09 架构瘦身）】
 旧形态：每日链把产物写进**根目录全局共享文件**（canonical ``stock_scores.csv`` /
 ``tradingagents_decision.md`` / ``rebalance_recommendation.json``）⇒
-① 同一根目录被多条链共享 ⇒ **跨链路污染**（影子推演曾覆盖生产金标）；
+① 同一根目录被多条链共享 ⇒ **跨链路污染**（旧影子链曾覆盖生产金标）；
 ② 两份跑的产物混在一处 ⇒ **无法 diff**，回答不了「11:30 那次和 15:05 那次差在哪」；
 ③ 「不写全局文件」只能靠 if 分支守 ⇒ 改一处漏一处就污染。
 
@@ -207,7 +207,6 @@ class Snapshot:
             "snapshot_root": str(self.root),
             "snapshot_path": str(self.path),
             "live_trade": self.live_trade,
-            "mode": "unified",
             "stages": list(self._stages),
             "skipped": list(self._skipped),
             "notes": list(self._notes),
@@ -289,6 +288,49 @@ def latest_snapshot(root: str | Path, *, exclude: str | Path | None = None,
         if matched:
             return matched[-1]
     return ordered[-1]
+
+
+def snapshots_with_file(root: str | Path, filename: str, *,
+                        exclude: str | Path | None = None,
+                        asof: str | None = None) -> list[Path]:
+    """快照根下**确实含有 ``filename``** 的快照列表（**从新到旧**）。
+
+    🔴 2026-11-11（第九轮续）：`latest_snapshot_with_file` 只给「最新一份」，
+       而复用决策件时**最新那份未必可用**（实测 `20261111_161126`：它复用了别的
+       快照的决策件、却没把**那份上下文**一起带过来 ⇒ 决策件的 `context_sha1`
+       与它自己的 context md 对不上 ⇒ sha1 链断裂）。
+       ⇒ 调用方要能**按顺序试**多个候选 ⇒ 这里给出**列表**版本。
+    """
+    base = Path(root)
+    if not base.is_dir():
+        return []
+    excluded = Path(exclude).name if exclude is not None else None
+    candidates = [
+        item for item in base.iterdir()
+        if item.is_dir() and item.name != excluded and not item.name.startswith(".")
+    ]
+    ordered = sorted(candidates, key=lambda p: p.name, reverse=True)
+    if asof:
+        ordered = [item for item in ordered if manifest_asof(item) == str(asof)]
+    return [item for item in ordered if (item / filename).is_file()]
+
+
+def latest_snapshot_with_file(root: str | Path, filename: str, *,
+                             exclude: str | Path | None = None,
+                             asof: str | None = None) -> Path | None:
+    """快照根下**最新且确实含有 ``filename``** 的那份快照（找不到 ⇒ ``None``）。
+
+    🔴 2026-11-11（真机跑批事故）：`--skip-llm` 复用底座时，旧口径只取
+       「**最新**一份快照」⇒ 若那份是**被中断的不完整快照**（没有决策件），
+       就**复制不到任何决策件**⇒ 本轮**静默变成「无 TA 意见」**
+       ⇒ 交付件里写「本轮无 TA 否决」、🛡 TA 合规筛选整节失效（且**不报错**）。
+    ⇒ 现在：按目录名**从新到旧**找**第一个真的有该文件**的快照。
+
+    🔴 **asof 语义不变**：只考虑 manifest ``asof`` **相同**的快照
+       （复用别个信号日的决策件 ⇒ 交付件嵌的是另一个信号日的意见 ⇒ 口径错误）。
+    """
+    found = snapshots_with_file(root, filename, exclude=exclude, asof=asof)
+    return found[0] if found else None
 
 
 def resolve_scores_base(snapshot_root: str | Path, canonical_csv: str | Path,

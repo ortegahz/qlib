@@ -204,10 +204,12 @@ bash manu/etf_rotation/run_pipeline.sh --asof 2026-11-03 --reuse-decision   # �
 - 修法：`--send-only` 改为在 `SNAPSHOT_ROOT` 下 glob 最新快照里的 `email_draft_<date>.json`；
   或 `_persist_draft` 同时写 `RUN_ROOT` 兼容位。同步修 `daily/README.md:368`。
 
-### P0-2 「模式 A/B 分诊」概念未随 Mode C 一并删除（违反 `rules.md:1971`）
+### P0-2 「模式」分诊概念未随影子链一并删除（违反 `rules.md:1971`）—— **已修**
+
+🔴 已于 2026-11-10 收口：CLI `--mode` 参数已删、`mode_router.py` 已更名 `run_paths.py`、模式相关的 API 已下线。
 - `daily/mode_router.py:106` `route()` 仍返回 mode `"A"/"B"`；
   `daily/calendar_gate.py:61` `MODE_A/MODE_B` + `:283 resolve_mode()` + `:295 describe_mode()`
-  （后者仍写「走模式 B：…下发执行卡」）；`daily/__init__.py:7,10,14` 模块表仍写「模式分流」。
+  （后者仍写「走『调仓节点』：…下发执行卡」）；`daily/__init__.py:7,10,14` 模块表仍写「模式分流」。
 - `daily/tests/test_agents_rebalance.py:272,281,305` 仍断言 `MR.route(...) == "A"/"B"`（实测 32 passed ⇒ 残留是活的）。
 - 运行时无影响（流水线无调用点），但**需求 1「精简到只有 modelB」未收口**。
 - 修法：删 `mode_router.route()`、`calendar_gate.MODE_A/MODE_B/resolve_mode/describe_mode`
@@ -350,19 +352,19 @@ bash manu/etf_rotation/run_pipeline.sh --asof 2026-11-03 --reuse-decision   # �
 - 新增测试 `daily/tests/test_send_only_draft.py`（5 条：快照命中 / 最新优先 / 旧目录回落 /
   无草稿不抛异常 / `--send-only --full` ⇒ rc2）。
 
-### P0-2 「模式 A/B 分诊」概念未删（需求 1 未收口）—— **已修**
+### P0-2 「模式」分诊概念未删（需求 1 未收口）—— **已修**
 - 删除：`daily/mode_router.py::route()` 与 `_calendar_days()`（随之成为死代码）；
   `daily/calendar_gate.py::MODE_A` / `MODE_B` / `resolve_mode()` / `describe_mode()`。
 - 新增 `daily/calendar_gate.py::describe_day(date_str)`：**只给事实**
   （`date` / `is_silent_defense` / `is_signal_date` / `execution_date` / `reason`），
-  **不再有 `mode` 键**；`reason` 文案也不再出现「走模式 A/B」。
-- 清理残留字样：`agents_rebalance.py`（章节标题 + **报错文案**「模式 B 第 N 步」→「第 N 步」）、
+  **不再有 `mode` 键**；`reason` 文案也不再出现「走『调仓节点』」这类模式措辞。
+- 清理残留字样：`agents_rebalance.py`（章节标题 + **报错文案**「『调仓节点 第 N 步』→「第 N 步」」）、
   `calendar_gate.py` docstring/章节头、`daily_config.py`、`account_state.py`、
   `stage1_rolling_increment.py`、`daily/__init__.py` 模块表。
 - 测试同步**换成新契约**（不是删测试）：
   `test_agents_rebalance.py` 新增「`mode_router`/`calendar_gate` **不许**再有 mode API」+
   「当日口径只给事实、**不带 mode 键**」；`test_calendar_gate.py` 同理替换旧的两条。
-- 复查：全仓（排除 `manu/report/` 历史归档与 `manu/memory/` 历史叙事）**已无「模式 A/B」字样**；
+- 复查：全仓（排除 `manu/report/` 历史归档与 `manu/memory/` 历史叙事）**已无字母模式名字样**；
   剩下的 README 提及都是在**说明该概念已废除**（有意保留）。
 
 ### 本地验证证据（uav env）
@@ -372,7 +374,7 @@ bash manu/etf_rotation/run_pipeline.sh --asof 2026-11-03 --reuse-decision   # �
   - 回退 `daily/main.py` ⇒ send-only 新单测 **4 failed**（`AttributeError: _resolve_draft`）
   ⇒ 两组新测试都是 **load-bearing** 的，不是凑数
 - `probe_snapshot_contract` **37/0**、`probe_score_smoothing` **55/0**
-- CLI 闸门：`--mode B` ⇒ rc2｜`--dry-run --live-trade` ⇒ rc2｜`--send-only --full` ⇒ rc2
+- CLI 闸门：`--mode <任意旧取值>` ⇒ rc2｜`--dry-run --live-trade` ⇒ rc2｜`--send-only --full` ⇒ rc2
 
 ### 🔴 明早同步顺序（**顺序错 ⇒ 指纹表必红**）
 1. 等服务器步骤 2/3/4 跑完（**跑批期间不许同步**）

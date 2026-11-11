@@ -54,6 +54,7 @@ ARTIFACT_ROOT=""
 LOG=""
 SKIP_REPRO=0
 QL_PY="${QL_PY:-/home/huangzhe/anaconda3/envs/ql/bin/python}"
+
 #: repro 段的信号日（M-S3 基准口径，照抄产物根 _run_scripts/_run_gates_ms2.sh）
 ASOF="2026-11-03"
 
@@ -94,39 +95,55 @@ trap cleanup EXIT
 cd "$REPO_ROOT" || die "进不去仓库根：$REPO_ROOT"
 : > "$LOG" || die "日志写不进去：$LOG"
 
+#: 🔴 2026-11-11：候选池条数（**单一事实源** = `config.ANALYZE_TOP_N`）。
+#:    每日链用 100 ⇒ TA 顺延补位能看到第 16 名以后的候选；
+#:    repro 段必须**同口径** ⇒ 否则「重跑件 vs 基线」比对必红（口径漂移，不是真缺陷）。
+#: 🔴 2026-11-11（审计 P2-6）：**必须在 `cd "$REPO_ROOT"` 之后读** ——
+#:    `sys.path.insert(0,'manu/etf_rotation')` 是**相对仓库根**的相对路径
+#:    ⇒ CWD 不在仓库根（例如从 /tmp 执行本脚本）⇒ `import config` 失败
+#:    ⇒ 旧写法 `2>/dev/null || echo 100` 把失败**静默兜底**成 100
+#:    ⇒ 候选池口径漂移 ⇒ repro 段「重跑件 vs 基线」必红（**假红**，不是真缺陷）。
+#:    ⇒ 位置移到 cd 之后；且**兜底不许静默**（读不到就 WARNING 到 stderr + 日志）。
+ANALYZE_TOP_N="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import config; print(config.ANALYZE_TOP_N)" 2>>"$LOG")"
+_rc_top_n=$?
+case "$ANALYZE_TOP_N" in
+  ''|*[!0-9]*) _bad_top_n=1 ;;
+  *)            _bad_top_n=0 ;;
+esac
+if [ "$_rc_top_n" -ne 0 ] || [ "$_bad_top_n" -ne 0 ]; then
+  echo "WARNING: 读不到 config.ANALYZE_TOP_N（rc=$_rc_top_n，读到=${ANALYZE_TOP_N:-<空>}）⇒ 回退默认 100：候选池口径可能与每日链漂移 ⇒ 闸门可能假红" >&2
+  echo "WARNING: 读不到 config.ANALYZE_TOP_N（rc=$_rc_top_n，读到=${ANALYZE_TOP_N:-<空>}）⇒ 回退默认 100：候选池口径可能与每日链漂移 ⇒ 闸门可能假红" >> "$LOG"
+  ANALYZE_TOP_N=100
+fi
+
 # =============================================================================
 # 闸门断言对象（交付件根）解析
 # =============================================================================
 # 🔴 2026-11-10（架构迁移在闸门层的落地）：流水线**不再回写 canonical 根目录的交付件**
 #    （每次运行落 `snapshots/<YYYYMMDD_HHMMSS>/`）⇒ 闸门断言对象默认取
 #    `$SNAPSHOT_ROOT` 下**最新且完整**的快照目录。
-#    「完整」= 同时存在 snapshot_manifest.json + etf_analysis_report.json + etf_analysis_report.md。
+#    「完整」分两级（🔴 2026-11-11 D-2 修复）：
+#      · **LLM 完整快照** = snapshot_manifest.json + etf_analysis_report.json
+#        + etf_analysis_report.md + ta_research_context.md + ta_context_meta.json
+#        + tradingagents_decision.json
+#      · **基础完整快照** = snapshot_manifest.json + etf_analysis_report.json
+#        + etf_analysis_report.md（**没有 LLM 三件套** ⇒ 典型来源：`--skip-llm` 复跑）
+#    🔴 旧判据只认「基础完整」⇒ `--skip-llm` 快照会被选成闸门断言对象 ⇒
+#       结构上过不了 LLM 链（verify_artifacts 三件套断言红 + probe_llm_stage_repro 崩）
+#       ⇒ **不是代码回归，是断言对象选错了**。
+#    ⇒ 新判据：**优先取最新 LLM 完整快照**；一个都没有才回落「最新基础完整快照」
+#       （此时 LLM 类阶段会如实判红/不适用 ⇒ 语义正确，不许假装通过）。
 #    一个完整快照都找不到 ⇒ 回落 canonical（**显式打印**，不许静默）。
 if [ -n "$ARTIFACT_ROOT" ]; then
   [ -d "$ARTIFACT_ROOT" ] || die "交付件根不存在：$ARTIFACT_ROOT"
   ARTIFACT_NOTE="显式指定（--artifact-root）"
 else
-  ARTIFACT_ROOT=""
-  _snap_list=""
-  for _d in "$SNAPSHOT_ROOT"/*/; do
-    [ -d "$_d" ] || continue
-    _snap_list="${_snap_list}${_d}"$'\n'
-  done
-  #: 目录名按 `YYYYMMDD_HHMMSS`（字典序 == 时间序）**倒序** ⇒ 第一个完整的就是最新的
-  while IFS= read -r _d; do
-    [ -n "$_d" ] || continue
-    if [ -f "$_d/snapshot_manifest.json" ] && [ -f "$_d/etf_analysis_report.json" ] \
-       && [ -f "$_d/etf_analysis_report.md" ]; then
-      ARTIFACT_ROOT="${_d%/}"
-      break
-    fi
-  done < <(printf '%s' "$_snap_list" | LC_ALL=C sort -r)
-  if [ -n "$ARTIFACT_ROOT" ]; then
-    ARTIFACT_NOTE="缺省 = 最新完整快照"
-  else
-    ARTIFACT_ROOT="$RUN_ROOT"
-    ARTIFACT_NOTE="未找到完整快照 ⇒ 回落 canonical"
-  fi
+  #: 🔴 2026-11-11（D-2）：选取逻辑抽到独立脚本 `lib/select_artifact_root.sh`
+  #:    ⇒ 可被 pytest 单独回归（两轮判据：LLM 完整快照 → 基础完整快照 → canonical）
+  _sel_out="$(bash "$REPO_ROOT/manu/etf_rotation/lib/select_artifact_root.sh" \
+                  "$SNAPSHOT_ROOT" "$RUN_ROOT")"
+  ARTIFACT_ROOT="$(printf '%s\n' "$_sel_out" | sed -n '1p')"
+  ARTIFACT_NOTE="$(printf '%s\n' "$_sel_out" | sed -n '2p')"
 fi
 echo "闸门断言对象（交付件根）：$ARTIFACT_ROOT（$ARTIFACT_NOTE）" | tee -a "$LOG"
 
@@ -144,7 +161,7 @@ run_stage(){  # run_stage <名字> <说明> <命令...>
 }
 
 # =============================================================================
-# 26 个探针阶段（顺序与基准脚本 _run_gates_ms2.sh 完全一致；M-S5 新增第 15 个 probe_node_basis；
+# 27 个探针阶段（顺序与基准脚本 _run_gates_ms2.sh 完全一致；M-S5 新增第 15 个 probe_node_basis；
 #                       M-S6 新增第 16 个 probe_llm_stage_repro（LLM 阶段可复现闸门）、
 #                       第 17 个 check_memory_tables（memory 表格结构检查器，**只读**）、
 #                       第 18 个 probe_decision_scenarios（三项分歧组合矩阵闸门）与
@@ -152,8 +169,10 @@ run_stage(){  # run_stage <名字> <说明> <命令...>
 #                       2026-11-09 新增第 22 个 probe_qlib_provider（provider 单一事实源闸门））、
 #                       第 23 个 probe_score_smoothing（穿透分时间平滑闸门）；
 #                       2026-11-09 架构瘦身：**第 21 个阶段改成 probe_snapshot_contract
-#                       （快照契约闸门）—— 旧的 Mode A/B/C 分诊阶段已废除）；
-#                       2026-11-10 新增第 24 个 probe_snapshot_lookahead（快照结构 + 无未来函数闸门））
+#                       （快照契约闸门）—— 旧的「模式」分诊阶段已废除）；
+#                       2026-11-10 新增第 24 个 probe_snapshot_lookahead（快照结构 + 无未来函数闸门）、
+#                       第 25 个 probe_ta_screening（TA 合规筛选闸门：否决 + 顺延 + 重合度）、
+#                       第 26 个 probe_ta_veto_scope（一票否决作用域闸门：只认权威裁决段落））
 # =============================================================================
 
 ### verify_artifacts —— 交付产物完整性/指纹/内部一致性校验
@@ -332,6 +351,33 @@ run_stage probe_qlib_provider "qlib provider 单一事实源闸门（路径唯�
 run_stage probe_score_smoothing "穿透分时间平滑闸门（脉冲压噪+EWMA/滚动手算+LOCF+冷启动回退+稳定性None+变异反证）" \
   "$QL_PY" manu/etf_rotation/probes/probe_score_smoothing.py
 
+### probe_ta_screening —— **TA 合规筛选闸门**（新增第 25 个探针阶段）
+###   钉死「TA 只审不选」这条架构红线：① 候选池两两重合度（重叠度 / corr120 / 同族）；
+###   ② **一票否决解析**（否定式 / 「一票否决权」/ 范围级表述 **不得**误判为否决）；
+###   ③ 顺延补位必须满足全部合格条件（未入选 / 未破位 / 未被 MA 过滤 / 覆盖达标 /
+###      不与已入选集合构成规则层冲突 / 与已入选集合**及被否决者**均不同族 / 未达同族上限）；
+###   ④ 找不到合格顺延者 ⇒ **不强行补**，只记理由；
+###   ⑤ **两条变异反证**（关掉「跳过同族」/「跳过冲突对」⇒ 对应约束必须转红 ⇒ 闸门有牙）；
+###   ⑥ 端到端 `build_plan` + `render_markdown`（计划件 MD 必须含合规筛选章节）。
+###   🔴 合成夹具自足；**不联网、不读生产数据、不写任何目录**。
+run_stage probe_ta_screening "TA合规筛选闸门（重合度+一票否决解析+顺延合格条件+2条变异反证+端到端）" \
+  "$QL_PY" manu/etf_rotation/probes/probe_ta_screening.py
+
+### probe_ta_veto_scope —— **一票否决作用域闸门**（新增第 26 个探针阶段）
+###   🔴 钉死「**否决（一票否决）只认权威裁决段落，分析师观点没有否决权**」：
+###   ① 真实决策件（高保真裁剪夹具）⇒ 权威提取**恰好 13 只**、不多不少；
+###   ② **零误伤**：TA 最终裁决明确「买 / 减」的 515450 / 515650 / 512800 不得被否；
+###   ③ **护栏 load-bearing**：观点段落单独解析**确实会**命中这 3 只（否则 A2 是硬编码蒙的）；
+###   ④ `.md` 兜底路径同样 13 只、零误伤（JSON 缺失时**不许**退化成"扫全文"）；
+###   ⑤ **变异反证 + 正反对照**：权威段说「买」则不否、说「0 仓观察」则否
+###      （⇒ 否决结果跟着权威段落走，不是硬编码名单）；
+###   ⑥ **Fail-safe**：决策件缺失/损坏 ⇒ 返回空且不抛异常。
+###   🔴 2026-11-11 真机跑批事故：空头「暂不买入 515450/515650」、激进派「清仓512800，等于放弃…」
+###      被当成最终否决 ⇒ 真实 13 只被判成 16 只 ⇒ 计划被掏空 ⇒ 闸门连环转红。
+###   🔴 合成夹具自足；**不联网、不读生产数据、不写任何目录**。
+run_stage probe_ta_veto_scope "一票否决作用域闸门（只认权威裁决段落+零误伤+变异反证+fail-safe）" \
+  "$QL_PY" manu/etf_rotation/probes/probe_ta_veto_scope.py
+
 ### probe_snapshot_lookahead —— **快照结构 + 无未来函数闸门**（新增第 24 个探针阶段）
 ###   🔴 **断言对象 = 本轮运行生成的快照目录**（不是产物根里的旧件）—— 这是用户架构正本
 ###   §三 第 2 条「把断言目标改成当前运行生成的快照目录」的直接落地：
@@ -363,14 +409,19 @@ else
   rc_a=1; rc_r=1; rc_f=1; rc_p=1
   HOLD="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import account; w=account.current_weights(); print(','.join(str(k)+':'+format(v,'.6f') for k,v in sorted(w.items())))" 2>>"$LOG")"
   rc_h=$?
+  # 🔴 2026-11-11：入场闸门已由 MA20 改为 MA60（`config.ENTRY_MA_FILTER_WINDOW=60`）
+  #    ⇒ repro 段若仍写死入场均线 20，重跑产物与基线必然不一致 ⇒ 闸门假红
+  #    （与 `run_pipeline.sh` 同一分叉类）。此处从 config 单一事实源读取。
+  _ENTRY_MA="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import config; print(config.ENTRY_MA_FILTER_WINDOW)" 2>>"$LOG" || echo 60)"
+  _EXIT_MA="$("$QL_PY" -c "import sys; sys.path.insert(0,'manu/etf_rotation'); import config; print(config.EXIT_MA_FILTER_WINDOW)" 2>>"$LOG" || echo 60)"
   if [ "$rc_h" -ne 0 ]; then
     echo "FATAL: 取当前持仓权重失败（rc=$rc_h）⇒ repro 段判失败" >> "$LOG"
   else
     PYTHONHASHSEED=0 "$QL_PY" manu/etf_rotation/analyze.py --out-dir "$REPRO_TMP" --asof "$ASOF" \
-      --stock-prices "$RUN_ROOT/stock_prices.csv" >> "$LOG" 2>&1
+      --stock-prices "$RUN_ROOT/stock_prices.csv" --top-n "$ANALYZE_TOP_N" >> "$LOG" 2>&1
     rc_a=$?
     PYTHONHASHSEED=0 "$QL_PY" manu/etf_rotation/recommend.py --out-dir "$REPRO_TMP" --asof "$ASOF" \
-      --pool-mode e_covered --entry-ma-window 20 --exit-ma-window 60 --holdings "$HOLD" >> "$LOG" 2>&1
+      --pool-mode e_covered --entry-ma-window "$_ENTRY_MA" --exit-ma-window "$_EXIT_MA" --holdings "$HOLD" >> "$LOG" 2>&1
     rc_r=$?
     PYTHONHASHSEED=0 "$QL_PY" manu/etf_rotation/final_rebalance_plan.py \
       --report "$REPRO_TMP/etf_analysis_report.json" --decision "$RUN_ROOT/tradingagents_decision.md" \

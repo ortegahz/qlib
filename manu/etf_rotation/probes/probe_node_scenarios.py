@@ -375,7 +375,7 @@ def main() -> int:
                          f"来源 {len(combos)} 个、notes {len(agg.get('notes', []))} 条、"
                          f"断言 {len(agg.get('assertions', []))} 条全 PASS")
 
-        # 🔴 2026-11-09 修（Mode C v2 独立审计后补）：**空情景集合会制造「空洞 PASS」** ——
+        # 🔴 修（2026-11-09 独立审计实证）：**空情景集合会制造「空洞 PASS」** ——
         #    P5~P8/P10 都是「逐情景遍历 ⇒ 没找到违例 ⇒ PASS」的结构 ⇒ 情景为 0 条时
         #    它们会「零违例通过」，而 detail 还会谎报「全部情景手推全对」。
         #    （实测：上游生成器崩掉时聚合件为空 ⇒ P5 的 min() 直接抛 ValueError ⇒

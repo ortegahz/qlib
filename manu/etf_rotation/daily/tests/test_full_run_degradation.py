@@ -145,7 +145,6 @@ def _install_stubs(monkeypatch, *, holdings: dict | None,
         for name in artifacts:
             (run_path / name).write_text("{}", encoding="utf-8")
         return {
-            "mode": "unified",
             "live_trade": bool(kw.get("live_trade")),
             "asof": ASOF,
             "execution_date": None,
