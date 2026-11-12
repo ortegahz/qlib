@@ -166,6 +166,18 @@ def _read_calendar(provider_dir: str | Path) -> list[str]:
     return [line.strip() for line in lines if line.strip()]
 
 
+def _safe_calendar(provider_dir: str | Path) -> list[str]:
+    """读日历；目录/文件还不存在 ⇒ 返回空列表（**不抛**）。
+
+    🔴 用于「**可能还没落盘**」的目录（如 dry-run 的自建增量派生库）⇒
+    读不到就当空日历，不许把整个阶段 1 炸掉。
+    """
+    try:
+        return _read_calendar(provider_dir)
+    except Exception:  # noqa: BLE001 - 目录还没建 ⇒ 当作空日历
+        return []
+
+
 def _provider_root_of(staging: Path) -> Path | None:
     """在解压目录里找 provider 根（含 `calendars/ features/ instruments/` 的那一层）。"""
     if all((staging / sub).is_dir() for sub in _REQUIRED_SUBDIRS):
@@ -684,12 +696,28 @@ def try_increment(
     🔴 **实时快照只能补当天**：`stock_zh_a_spot_em` 拿不到历史交易日 ⇒ 缺口 > 1 天时
     这里会**明确失败并披露**，**不写脏数据**（宁可不写）。
 
-    返回 `{"ok","needed","days","entry","notes"}`；异常被吞进 notes（**不阻断换库结论**）。
+    返回 `{"ok","needed","days","entry","notes","derived_ok","derived_covers_asof",
+    "derived_calendar_max","derived_live_dir"}`；异常被吞进 notes（**不阻断换库结论**）。
+
+    🔴 `derived_covers_asof` = **派生库自己的日历**是否覆盖 `asof`
+    （2026-11-11 假警报的根因修复：调用方必须知道「本轮到底有没有 asof 的数据」，
+    才能在校验段选对**被校验对象**）。
     """
     notes: list[str] = []
     base_path = Path(base_dir)
     live_path = Path(live_dir)
-    out: dict = {"ok": False, "needed": False, "days": [], "entry": {}, "notes": notes}
+    out: dict = {
+        "ok": False,
+        "needed": False,
+        "days": [],
+        "entry": {},
+        "notes": notes,
+        # 🔴 **派生事实**（回传给 ⑥ 校验段 ⇒ 用来选对被校验对象）
+        "derived_ok": False,  # 派生是否成功
+        "derived_covers_asof": False,  # 派生库的日历是否覆盖 asof
+        "derived_calendar_max": None,  # 派生库日历末日
+        "derived_live_dir": str(live_path),
+    }
     try:
         import stage1_rolling_increment as SRI  # noqa: PLC0415
 
@@ -726,6 +754,18 @@ def try_increment(
         )
         out["entry"] = entry
         out["ok"] = True
+        out["derived_ok"] = True
+        # 🔴 **派生库是否真的覆盖 asof** ⇒ 读**派生库自己**的日历（同一目录 ⇒ 唯一事实源）
+        live_days = _safe_calendar(live_path)
+        if live_days:
+            # 派生库已落盘 ⇒ 它的日历就是事实
+            out["derived_covers_asof"] = asof in set(live_days)
+            out["derived_calendar_max"] = live_days[-1]
+        else:
+            # dry-run：派生目录还没落盘 ⇒ 用「基座日历 + 本次补齐的交易日」模拟它
+            sim_days = sorted(set(base_days) | {d for d in days if d not in set(base_days)})
+            out["derived_covers_asof"] = asof in set(sim_days)
+            out["derived_calendar_max"] = sim_days[-1] if sim_days else None
         notes.extend(entry.get("notes") or [])
         notes.append(
             f"{'（dry-run，未落盘）' if dry_run else ''}派生数据集：{live_path}"
@@ -836,11 +876,6 @@ def run_stage1(
         swapped = bool(swap["swapped"])
         notes.append(swap["notes"])
         swap_skipped = bool(swap.get("skipped"))
-        if swap_skipped:
-            notes.append(
-                "🔴 **阶段 1 未换库**：上游快照日历未推进 ⇒ 阶段 2 的 S 层只能打到"
-                "现役数据集的覆盖末日（信号日当天的个股 Alpha 本轮拿不到）"
-            )
         if swapped:
             staging = new_dir.parent
             if staging.name.startswith("extract_") and staging != work_path:
@@ -862,11 +897,55 @@ def run_stage1(
         for note in increment_info.get("notes") or []:
             notes.append(note)
 
-    # ⑥ 校验（dry-run ⇒ 校验新快照；已换库 ⇒ 校验现役库）
-    effective = provider_path if swapped else new_dir
-    eff_days = _read_calendar(effective)
+    # ⑥ 校验对象：**下游 S 层真正会用的那一份**（🔴 2026-11-11 假警报的根因）
+    #    老口径 `provider_path if swapped else new_dir` ⇒ 换库被跳过时校验的是**上游新快照**
+    #    （末日 2026-11-09），而 S 层实际用的是**自建增量派生库** `live_path`
+    #    （`qlib_provider.select_provider` 的「谁新用谁」⇒ 派生库更新就用派生库）
+    #    ⇒ 校验对象 ≠ 实际使用对象 ⇒ 假警报（还会误触发 `--full` 的 fail-closed）。
+    live_days = _safe_calendar(live_path)
+    live_max = live_days[-1] if live_days else None
+    base_days_now = _safe_calendar(provider_path)
+    base_max_now = base_days_now[-1] if base_days_now else None
+    increment_ok = bool(increment_info.get("derived_ok"))
+    derived_covers = bool(increment_info.get("derived_covers_asof"))
+
+    if increment_ok and live_days and (base_max_now is None or live_max > base_max_now):
+        # 下游「谁新用谁」⇒ S 层会用派生库 ⇒ 就校验派生库
+        effective = live_path
+        effective_label = "自建增量派生库"
+    elif swapped:
+        effective = provider_path
+        effective_label = "现役库（本轮已换库）"
+    elif increment_ok and live_days:
+        effective = live_path
+        effective_label = "自建增量派生库"
+    else:
+        effective = new_dir
+        effective_label = "上游新快照（本轮没有换库）"
+
+    # 🔴 **覆盖判定必须用被校验目录自己的日历**（不许拿别处的日历凑）
+    eff_days = _safe_calendar(effective)
     probe = asof if asof in eff_days else (eff_days[-1] if eff_days else asof)
-    covers_asof = probe == asof
+    covers_asof = asof in set(eff_days)
+    notes.append(
+        f"ℹ️ 校验对象：{effective_label}（{effective}）⇒ 日历末日 "
+        f"{eff_days[-1] if eff_days else None}｜覆盖 asof={asof}：{'是' if covers_asof else '否'}"
+    )
+
+    # 🔴 **「未换库」的披露口径**：上游快照没推进 **≠** 本轮没有 asof 的数据
+    #    （上游没推进 + 自建增量已派生到 asof ⇒ 本轮**仍然打得到信号日**）
+    if swap_skipped:
+        if derived_covers and effective == live_path:
+            notes.append(
+                f"ℹ️ **上游快照日历未推进**（本轮没有换库）⇒ 但自建增量已派生到 asof={asof}"
+                f"（派生库 {live_path}，日历末日 {live_max}）⇒ 本轮仍可打到信号日"
+            )
+        else:
+            notes.append(
+                "🔴 **阶段 1 未换库**：上游快照日历未推进 ⇒ 阶段 2 的 S 层只能打到"
+                "现役数据集的覆盖末日（信号日当天的个股 Alpha 本轮拿不到）"
+            )
+
     if not covers_asof:
         notes.append(
             f"⚠️ asof={asof} 不在有效库日历内（末日={eff_days[-1] if eff_days else None}）"
@@ -899,6 +978,11 @@ def run_stage1(
         "swapped": swapped,
         "swap_skipped": swap_skipped,
         "increment": increment_info,
+        # 🔴 校验口径（供报告/测试一眼看出「校验的是哪一份」）
+        "validated_dir": str(effective),
+        "validated_source": effective_label,
+        "validated_calendar_max": eff_days[-1] if eff_days else None,
+        "covers_asof": bool(covers_asof),
         "verified": bool(verified.get("ok")),
         "dry_run": dry_run,
         "notes": notes,

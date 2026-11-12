@@ -114,6 +114,114 @@ def load_universe(path: str | None) -> dict[str, dict]:
     return out
 
 
+def _official_name(code: str, official: dict[str, str] | None, fallback: str = "") -> str:
+    """🔴 **官方名优先**：名称一律以 `--universe`（ETF 基础信息 CSV）的 `name` 列为准。
+
+    🔴 2026-11-11（真机缺陷 ② · 名称抽取垃圾）：
+        旧口径 `r.get("name") or universe.get(code, {}).get("name", "")`
+        ⇒ 只要 LLM / 否决原文里解析出了**非空**名字就**不回填**官方名
+        ⇒ 实测 `159547` 的 name 被抽成垃圾词「重叠」
+        （原文「…与 512890/159547 重叠 0.974/0.978…」⇒ 「重叠」不是它的名字）
+        ⇒ 交付件里出现一只**没有名字的基金**。
+    ⇒ 改成：**官方名存在 ⇒ 用官方名**（忽略来源里的名字，哪怕它非空）；
+      官方名没有 ⇒ 才保留来源里的名字；都没有 ⇒ 空串。
+    ⚠️ 官方名**只改名字**，不改任何理由 / 权重 / 动作。
+    """
+    if official:
+        nm = str(official.get(str(code)) or "").strip()
+        if nm:
+            return nm
+    return str(fallback or "").strip()
+
+
+def _pool_whitelist(report: dict, universe: dict[str, dict]) -> tuple[set[str] | None, str]:
+    """返回 **(池内代码集合 | None, 来源说明)**。
+
+    🔴 事实源优先级（2026-11-11 真机缺陷 ①）：
+      ① **`--universe` 传入的 ETF 基础信息 CSV**（`code` 列）——**这是「池子」本身的定义**
+         ⇒ 首选它。实测服务器上 `etf_universe.csv` = 1664 个代码，
+         含 516620 / 159547 / 512890 / 563020 / 159207，**不含 566620**。
+         ⚠️ 该 CSV 里另有 `in_universe` 列（实测只有 250 行为 True）⇒ **不许**按它过滤
+            （那会把 516620 等真池内标的误杀）⇒ 白名单 = **全部 code 行**。
+      ② **回退**：`--universe` 为空 / 不可读 ⇒ 用**报告侧**出现过的代码集合
+         （`plans` / `names` / `name_map` / `candidates` / `recommendation.actions` /
+         `current_holdings_diagnosis.holdings` / `filter_stats.stages[].eliminated` /
+         `filter_stats.selected` 的**并集**）⇒ 取舍理由：报告侧是「本轮**看见过**的池」，
+         可能比真池**小**（Top-N 截断）⇒ 故**只在 `--universe` 不可用时**才用它，
+         且宁可**多收**（并集）也不漏收 ⇒ 避免误杀真否决。
+      ③ 都拿不到 ⇒ 返回 **None** ⇒ **fail-closed**：**不剔除任何否决**
+         （绝不能因为白名单缺失而放过真否决），并在产物里如实披露「未能校验」。
+    """
+    if universe:
+        codes = {str(c) for c in universe if str(c).strip()}
+        if codes:
+            return codes, f"--universe（ETF 基础信息 CSV，{len(codes)} 个代码）"
+    codes: set[str] = set()
+
+    def _add(raw) -> None:
+        text = str(raw or "").strip()
+        if text:
+            codes.add(text.zfill(6))
+
+    def _walk(node) -> None:
+        if isinstance(node, dict):
+            if node.get("code"):
+                _add(node["code"])
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                _walk(value)
+        elif isinstance(node, str):
+            _add(node)
+
+    for key in ("plans", "names", "name_map"):
+        _walk(report.get(key))
+    _walk(report.get("candidates"))
+    _walk((report.get("recommendation") or {}).get("actions"))
+    _walk((report.get("current_holdings_diagnosis") or {}).get("holdings"))
+    _walk((report.get("filter_stats") or {}).get("selected"))
+    for stage in ((report.get("filter_stats") or {}).get("stages") or []):
+        _walk((stage or {}).get("eliminated"))
+    if codes:
+        return codes, f"报告侧代码集合（--universe 不可用，{len(codes)} 个代码）"
+    return None, "池内白名单不可用（--universe 缺失且报告侧取不到代码）"
+
+
+def _split_rejections_by_pool(
+    rejections: list[dict] | None,
+    pool_codes: set[str] | None,
+) -> tuple[list[dict], list[dict]]:
+    """按**池内白名单**切分 TA 否决名单 ⇒ **(池内否决, 池外披露)**。
+
+    🔴 2026-11-11（真机缺陷 ①）：LLM 把 `516620` 笔误写成 `566620`
+    （`566620` **不在** ETF 池内）⇒ 旧口径**照单全收** ⇒ 交付件的否决名单里
+    出现一只**根本不存在的标的** ⇒ 污染顺延逻辑与产物级闸门。
+    ⇒ **池外代码不得进入 `ta_screening.rejected`**（它不是候选池的标的，
+      否决它没有意义）⇒ 但**不许静默丢弃**：进 `rejected_out_of_universe` 如实披露。
+
+    🔴 **fail-closed**：`pool_codes` 为空 / 不可用 ⇒ **一个都不剔除**
+      （绝不能因为白名单缺失而放过真否决）。
+    """
+    kept: list[dict] = []
+    out_of_pool: list[dict] = []
+    for raw in (rejections or []):
+        row = dict(raw)
+        code_raw = str(row.get("code") or "").strip()
+        code = code_raw.zfill(6) if code_raw else ""
+        if pool_codes and code and code not in pool_codes:
+            out_of_pool.append({
+                "code": code,
+                "name": str(row.get("name") or ""),
+                "reason": str(row.get("reason") or ""),
+                "source_section": str(row.get("source_section") or ""),
+                "note": "池外代码，已剔除（不在 ETF 池内 ⇒ 不参与否决 / 顺延）",
+            })
+            continue
+        kept.append(row)
+    return kept, out_of_pool
+
+
 def load_account(path: str | None) -> dict[str, dict]:
     out: dict[str, dict] = {}
     if not path or not Path(path).exists():
@@ -1887,6 +1995,8 @@ def apply_ta_screening(
     asof=None,
     names: dict[str, str] | None = None,
     equity_cap: float | None = None,
+    universe_codes: set[str] | None = None,
+    official_names: dict[str, str] | None = None,
 ) -> dict:
     """🛡️ TA 合规筛选：**剔除**被 TA 点名否决的候选 + **顺延**补位。
 
@@ -1936,14 +2046,34 @@ def apply_ta_screening(
         ``min(规则层上限, TA 建议)`` 传进来 ⇒ 顺延补位也必须过这道闸
         ⇒ **不许**出现「上限被压到 36%，却顺延补位到 80%」的自相矛盾。
 
+    参数 ``universe_codes`` / ``official_names``
+        🔴 2026-11-11（真机缺陷 ①②）：
+        - ``universe_codes`` = **池内白名单**（来自 ``--universe`` 的代码集）
+          ⇒ **池外代码**（LLM 笔误 / 幻觉出来的代码）**不得**进入 ``ta_screening.rejected``
+          （它不是候选池的标的 ⇒ 否决它没有意义）⇒ 改进 ``rejected_out_of_universe`` 如实披露。
+          ⚠️ 白名单**不可用**（None / 空集）⇒ **一个都不剔除**（fail-closed ⇒ 不放过真否决）。
+        - ``official_names`` = **官方名**（``--universe`` 的 ``name`` 列）⇒ 名称**官方优先**
+          （LLM 文本里抽出来的垃圾名不许盖住官方名）。
+        ⚠️ 这两个参数**不传** ⇒ 行为与旧版**完全一致**（向后兼容）。
+
     返回 ``{"actions": [...], "ta_screening": {...}}``。
     """
     #: 本轮**生效**的权益上限（Beta 避险 ⇒ 可低于规则层硬上限；**永不低于**调用方给的硬上限口径）
     _cap = float(equity_cap) if equity_cap is not None else _EQUITY_CAP
     acts = [dict(a) for a in (actions or [])]
     cands = [dict(c) for c in (candidates or [])]
-    rejected = [dict(r) for r in (rejections or [])]
+    # 🔴 2026-11-11（真机缺陷 ①）：**池外代码剔除**（fail-closed + 如实披露）
+    #    ⇒ LLM 笔误出来的池外代码（如 566620）**不得**进入 `rejected` / `rejected_codes`
+    #      （否则污染顺延逻辑与产物级闸门）⇒ 改进 `rejected_out_of_universe` 披露。
+    rejected, rejected_out_of_universe = _split_rejections_by_pool(
+        rejections or [], universe_codes)
     rejected_codes = {str(r.get("code") or "").zfill(6) for r in rejected if r.get("code")}
+    #: 🔴 2026-11-11（真机缺陷 ②）：**官方名**（`--universe` 的 name 列）⇒ 名称官方优先。
+    #:    ⚠️ **不污染** `name_map`：它要喂 `overlap_mod.compute_overlap_pairs(names=...)`
+    #:    做**名称族**判定 ⇒ 塞官方名进去会改变 theme 判定 ⇒ 只另开一张表。
+    official: dict[str, str] = {
+        str(k): str(v) for k, v in (official_names or {}).items() if str(v or "").strip()
+    }
     held = {str(c).zfill(6) for c in (held_codes or [])}
     cw = {str(k).zfill(6): (_f(v, 0.0) or 0.0) for k, v in (current_weights or {}).items()}
     #: 规则层原始动作行（按代码索引）⇒ 用来取「被否决者的席位预算 / 原目标权重」
@@ -2046,7 +2176,8 @@ def apply_ta_screening(
         _w = _cur_weight(_code)
         orphan_rows.append({
             "code": _code,
-            "name": str(_a.get("name") or name_map.get(_code) or ""),
+            "name": _official_name(_code, official,
+                                   _a.get("name") or name_map.get(_code) or ""),
             # 维持现仓 ⇒ 目标权重 = **当前权重**（账户真值），不是 0
             "current_weight": _w,
             "target_weight": _w,
@@ -2107,7 +2238,8 @@ def apply_ta_screening(
     cap_skipped: list[dict] = []
     for a in dropped:
         code_rej = str(a.get("code") or "").zfill(6)
-        name_rej = str(a.get("name") or name_map.get(code_rej) or "")
+        name_rej = _official_name(code_rej, official,
+                                  a.get("name") or name_map.get(code_rej) or "")
         tw = _f(a.get("target_weight"), 0.0) or 0.0
         if tw <= 0:
             # 被否决的标的**原本目标权重就是 0**（规则层本就打算卖出它）
@@ -2168,7 +2300,9 @@ def apply_ta_screening(
         if _s_after > _cap + 1e-9:
             cap_skipped.append({
                 "code": str(picked.get("code") or "").zfill(6),
-                "name": str(picked.get("name") or name_map.get(str(picked.get("code") or "").zfill(6)) or ""),
+                "name": _official_name(
+                    str(picked.get("code") or "").zfill(6), official,
+                    picked.get("name") or name_map.get(str(picked.get("code") or "").zfill(6)) or ""),
                 "substituted_for": code_rej,
                 "equity_weight_after": round(_s_after, 6),
                 "equity_cap": round(_cap, 6),
@@ -2186,7 +2320,8 @@ def apply_ta_screening(
                 )
             continue
         code = str(picked.get("code") or "").zfill(6)
-        name = str(picked.get("name") or name_map.get(code) or "")
+        name = _official_name(code, official,
+                              picked.get("name") or name_map.get(code) or "")
         kept.append({
             "code": code,
             "name": name,
@@ -2234,7 +2369,8 @@ def apply_ta_screening(
         code = str(r.get("code") or "").zfill(6)
         rejected_rows.append({
             "code": code,
-            "name": str(r.get("name") or name_map.get(code) or ""),
+            "name": _official_name(code, official,
+                                   r.get("name") or name_map.get(code) or ""),
             "reason": str(r.get("reason") or ""),
             "source_section": str(r.get("source_section") or ""),
         })
@@ -2242,6 +2378,11 @@ def apply_ta_screening(
     ta_screening = {
         "enabled": True,
         "rejected": rejected_rows,
+        # 🔴 2026-11-11（真机缺陷 ①）：**池外代码如实披露**（不许静默丢弃）
+        #    ⇒ LLM 原文里出现、但**不在 ETF 池内**的代码（笔误 / 幻觉）
+        #      ⇒ 已从 `rejected` 剔除（它不是候选池的标的 ⇒ 否决它没有意义）
+        #      ⇒ 但**如实留痕**，供审计对账。
+        "rejected_out_of_universe": rejected_out_of_universe,
         "substituted": substituted,
         "no_substitute_reason": no_reason,
         "screen_pairs": screen_pairs,
@@ -2308,6 +2449,24 @@ def build_plan(args) -> dict:
 
     prices = load_prices(args.prices, asof)
     universe = load_universe(args.universe)
+    # 🔴 2026-11-11（真机缺陷 ①②）：**池内白名单** + **官方名表**。
+    #    - 白名单事实源优先级：`--universe`（ETF 基础信息 CSV）→ 报告侧代码集合 → 不可用。
+    #      取舍理由见 `_pool_whitelist` 的 docstring（**首选 `--universe`**，因为它就是
+    #      「池子」本身的定义；报告侧只是「本轮看见过的池」，可能是真池的子集）。
+    #    - 官方名 = `--universe` 的 `name` 列 ⇒ 名称**官方优先**（LLM 抽出来的垃圾名
+    #      不许盖住它；实测 159547 被抽成「重叠」）。
+    _pool_codes, _pool_source = _pool_whitelist(report, universe)
+    _official_names: dict[str, str] = {
+        str(c): str((row or {}).get("name") or "")
+        for c, row in universe.items()
+        if str((row or {}).get("name") or "").strip()
+    }
+    #: 🔴 白名单不可用 ⇒ **fail-closed**（不剔除任何否决）⇒ 必须**如实披露**。
+    _pool_whitelist_warning = (
+        "⚠️ **池内白名单不可用**（`--universe` 缺失/不可读，且报告侧取不到代码）"
+        "⇒ 本轮**未能校验** TA 否决名单里的池外代码 ⇒ 池外代码**未剔除**"
+        "（fail-closed：绝不能因为白名单缺失而放过真否决）"
+    ) if not _pool_codes else ""
     account = load_account(args.account)
     # 🔴 2026-11-11（审计缺陷 C）：**顺延池 = 报告的 `candidates`**（= analyze.py 的 Top-N）。
     #    报告 JSON **没有**「完整候选池」字段（只有 `candidates` 与
@@ -2367,7 +2526,13 @@ def build_plan(args) -> dict:
     # 🔴 一票否决**只认权威裁决段落**（观点段落没有否决权）——
     #    真实决策件里空头说「暂不买入 515450/515650」、激进派说「清仓512800，
     #    等于放弃…」⇒ 旧实现（扫全文）误伤 3 只 ⇒ 见 llm_final.AUTHORITY_SECTIONS。
-    _rejections = llm_final_mod.extract_authority_rejections(args.decision)
+    _rejections_all = llm_final_mod.extract_authority_rejections(args.decision)
+    # 🔴 2026-11-11（真机缺陷 ①）：**池外代码剔除**（fail-closed）。
+    #    LLM 笔误出来的池外代码（如 566620；池内是 516620）**不得**进入否决名单
+    #    ⇒ 剔除，但**如实披露**（`ta_screening.rejected_out_of_universe` + md 里的 ⚠️ 行）。
+    #    ⚠️ 白名单不可用 ⇒ `_split_rejections_by_pool` **一个都不剔除**（不放过真否决）。
+    _rejections, _rejections_out_of_universe = _split_rejections_by_pool(
+        _rejections_all, _pool_codes)
     # 🔴 「维持」行（被 TA 否决但**仍在持仓**）**占席位**（目标权重 = 当前权重）
     #    ⇒ 席位预算必须先扣掉它 ⇒ 否则「维持行 + 席位行」会突破本轮生效的上限。
     _orphan_weight = sum(
@@ -2390,16 +2555,35 @@ def build_plan(args) -> dict:
     _ta_screen = apply_ta_screening(
         actions=_scaled_actions,
         candidates=report.get("candidates") or [],
-        rejections=_rejections,
+        # ⚠️ 传**原始**否决名单：池外切分由 `apply_ta_screening` **自己**做
+        #    （那里才会同时产出 `ta_screening.rejected` 与 `rejected_out_of_universe`）
+        #    ⇒ 切两遍会让披露字段为空。
+        rejections=_rejections_all,
         held_codes=sorted(set(holdings_by_code) | set(account)),
         current_weights=_screen_cw,
         holdings=_ov_holdings,
         prices=_ov_prices,
         asof=asof,
         equity_cap=_effective_cap,
+        universe_codes=_pool_codes,
+        official_names=_official_names,
     )
     _screen_actions = list(_ta_screen["actions"])
     _ta_screening = _ta_screen["ta_screening"]
+
+    # 🔴 2026-11-11（真机缺陷 ①）：把「池内白名单的来源 / 规模」**写进披露**
+    #    （审计要看得见：本轮的「池」到底是哪份文件 / 多少个代码）。
+    _ta_screening["pool_whitelist"] = {
+        "source": _pool_source,
+        "available": bool(_pool_codes),
+        "n_codes": (len(_pool_codes) if _pool_codes else 0),
+        "n_rejected_out_of_universe": len(_rejections_out_of_universe),
+        "note": (
+            "池内白名单 = ETF 池的代码集合（首选 `--universe` 的 code 列；"
+            "不可用时回退报告侧代码集合）⇒ **池外代码**不得进入否决名单；"
+            "白名单不可用 ⇒ **一个都不剔除**（fail-closed ⇒ 不放过真否决）"
+        ),
+    }
 
     # 🔴 2026-11-11（Beta 避险落地）：把「TA 建议 / 生效上限 / 席位缩放」**写进披露**
     #    （用户必须看得见：TA 说压降到多少、规则层实际按多少落地、席位缩了多少）。
@@ -2449,7 +2633,9 @@ def build_plan(args) -> dict:
     plans = []
     for act in _screen_actions:
         code = str(act.get("code", "")).zfill(6)
-        name = str(act.get("name", "")) or universe.get(code, {}).get("name", "")
+        # 🔴 2026-11-11（真机缺陷 ②）：名称**官方优先**（`--universe` 的 name 列）
+        #    ⇒ 官方名存在 ⇒ 用官方名（忽略来源里的名字）；官方名没有 ⇒ 才用来源名。
+        name = _official_name(code, _official_names, act.get("name", ""))
         held = account.get(code, {})
         holdings_row = holdings_by_code.get(code, {})
         current_shares = int(held.get("shares", 0) or holdings_row.get("shares", 0) or 0)
@@ -2971,6 +3157,7 @@ def build_plan(args) -> dict:
         "risk_disclosure": report.get("risk_disclosure", []),
         "warnings": list(report.get("warnings", [])) + list(account_weight_warnings)
         + ([_pool_truncated] if _pool_truncated else [])
+        + ([_pool_whitelist_warning] if _pool_whitelist_warning else [])
         + ([(
             f"🔴 **权益超配（不可消除）**：账户在「被 TA 一票否决但仍在持仓」的标的上的"
             f"权重，合计已超出**本轮生效上限** "
@@ -3210,6 +3397,26 @@ def render_markdown(plan: dict) -> str:
             "下一个**不同主题**的资产补位；规则层的重合度判定口径**不变**。",
             "",
         ]
+        # 🔴 2026-11-11（真机缺陷 ①）：**池外代码如实披露**（不许静默丢弃）。
+        #    LLM 原文里出现、但**不在 ETF 池内**的代码（笔误 / 幻觉）
+        #    ⇒ 已从否决名单剔除（它不是候选池的标的 ⇒ 否决它没有意义）
+        #    ⇒ 但必须在这里**写一行**，让用户看得见。
+        _out_pool = _scr.get("rejected_out_of_universe") or []
+        for _o in _out_pool:
+            lines.append(
+                f"⚠️ LLM 原文出现池外代码 {_o.get('code')}"
+                "（不在 ETF 池内，已剔除、不参与否决/顺延）"
+            )
+        if _out_pool:
+            lines.append("")
+            for _o in _out_pool:
+                _why = str(_o.get("reason") or "—").replace("|", "／")[:160]
+                lines.append(
+                    f"- {_o.get('code')}{_o.get('name') or ''}：{_why}"
+                    f"（出处章节：{_o.get('source_section') or '—'}）"
+                    "⇒ **不在 ETF 池内** ⇒ 不是候选池的标的 ⇒ 否决它没有意义 ⇒ 已剔除"
+                )
+            lines.append("")
         # 🔴 2026-11-11（Beta 避险落地）：披露「TA 建议的权益上限 ⇒ 本轮生效上限」。
         #    ⚠️ 只有**读到** TA 的目标口径权益建议时才加这段 ⇒ 没有建议 ⇒ 产物逐字节不变。
         _cap_rec = _scr.get("equity_cap_ta_recommendation") or {}

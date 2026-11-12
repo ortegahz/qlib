@@ -2813,3 +2813,86 @@ cd /tmp/pycharm_project_658d3fc4
   `20261111_161126`（假 stale，链断）、`20261111_162423`（Pass11 无 LLM 意见）—— **只作事故证据**。
 - ℹ️ **残留缺口（登记，不要当已完成）**：舆情 / 宏观打桩（需**联网 + API key + 配额** ⇒ 🔴 **需用户单独授权**）；
   回测链仍 **MA20** 口径；「维持席位」> 20% 机制仍在。
+
+### ⑭ 🔴 2026-11-11 全量跑（asof=2026-11-11，含今日收盘）
+
+- **命令**：`python manu/etf_rotation/daily/main.py --asof 2026-11-11 --full --llm-timeout 5400 --wait-seconds 5400`
+  （**观察态**：无 `--live-trade` ⇒ 执行卡**挂单禁用**、**不发信**；`--full` ⇒ 取数/S层重算/qlib 换库/增量补齐/LLM **五个开关全开**）。
+- **快照**：`/mnt/data/siping/runs/etf_rotation_results/snapshots/20261111_172340/`（**未** commit / 未 push）。
+- **今日数据可得性 ✅**：17:26 取数完成，ETF 日线增量 **新增 3552 行**，其中 **2026-11-11 当日 bar 296 行**（并补齐 11-10）⇒ **「今天闭市的信息」确实进了底座**；`drop_unfinalized_bars` 规则（≥15:05 才收今天 bar）已满足。
+- **披露项**：W（成分权重）快照仍是 **2026-11-04**（滞后 7 天）⇒ **只披露不拦**。
+- ⚠️ **静默防守窗（2026-11-06 ~ 2026-11-30）今天生效**，但 🔴 **代码里该窗口只是被算出来、没有任何下游消费者**
+  （`grep is_silent_defense` 只命中 `daily/calendar_gate.py` 自身）⇒ 流水线**仍会输出买入建议**（执行卡照旧挂单禁用）
+  ⇒ 报告里必须显著标注「防守窗内 ⇒ 买入动作**仅供观察、不可执行**」。
+- ⚠️ **「今天闭市的信息」＝ 今天的行情，不是新闻/宏观**：舆情/宏观仍是 `DATA_UNAVAILABLE` 打桩（需联网+API key+配额 ⇒ **需用户单独授权**）。
+- **服务器自跑 + 自动收尾**：跑完由 `etf_autofinish.sh`（服务器侧）自动出摘要（`<RESULTS_ROOT>/reports/full_run_20261111_summary.md`）＋ `os.unlink` 清驱动脚本痕迹；host 18:00 关机**不影响**服务器。
+
+### ⑮ 🔴 待修真缺陷：阶段 1 的「未换库 / 数据滞后」是**假警报**（2026-11-11 实测）
+
+- **现象**（全量跑 asof=2026-11-11，服务器 17:34:51）：
+  `🔴 阶段 1 未换库：上游快照日历未推进 ⇒ 阶段 2 的 S 层只能打到现役数据集的覆盖末日`
+  ＋ `⚠️ asof=2026-11-11 不在有效库日历内（末日=2026-11-09）⇒ 实际校验日=2026-11-09`
+  ＋ `qlib 数据集：2026-11-09 → 2026-11-09（新增 0 个交易日）`。
+- **但事实相反**：自建增量**已经成功**（`stage1_dataset.py` ⑤之二 `try_increment`）：
+  `2026-11-10 写入 5570`、`2026-11-11 写入 5570`，派生库 `cn_data_live` 日历**末日 = 2026-11-11**；
+  **S 层真的打到了 2026-11-11**（快照 `stock_scores.csv` 打分日范围 `2024-01-09 → 2026-11-11`，
+  当日 **5570 行、score std 0.1211、100% 非零**）；ETF 行情底座**最新行情日 = 2026-11-11**（309792 行）
+  ⇒ **今日收盘信息确实进了分析**。
+- **根因**：`daily/stage1_dataset.py` ⑥ 校验段 `effective = provider_path if swapped else new_dir`
+  ⇒ **换库被跳过时校验的是新解压的上游快照 `new_dir`（末日 2026-11-09）**，
+  而不是刚派生好的 `live_path`（`cn_data_live`，末日 2026-11-11）
+  ⇒ 校验对象与 S 层实际使用的 provider **不是同一个** ⇒ 假警报
+  ⇒ 还可能让 `--full` 的「有环节没跑成 ⇒ 退出码 1」**误判**（fail-closed 被假信号触发）。
+- **修法**：校验对象改成「`swapped ? provider_path : (增量成功 ? live_path : new_dir)`」，
+  `covers_asof` 用**同一**目录的日历判定；`try_increment` 需回传「派生库是否真的覆盖 asof」。
+  🔴 修前补**钉死测试**：造「上游末日 < asof、但派生库已覆盖 asof」的夹具 ⇒ 断言
+  **不**出现「未换库 / 数据滞后」字样、且 `covers_asof=True`。
+- ⚠️ 该假警报**未进交付报告**（`etf_analysis_report.json`：「未换库」0 次、「2026-11-11」52 次）
+  ⇒ **报告口径对，日志口径错**。
+
+### ⑯ 🔴 2026-11-12 收尾：⑮ + 两个真缺陷**已修** ＋ 交付件**重生成** ＋ 验收 17/0/0
+
+- **本轮做了什么**：把 2026-11-11 全量跑（快照 `20261111_172340`）暴露的**三个真缺陷**修掉，
+  用 `manu/tools/regen_snapshot_derived.py`（**派生层就地确定性重生成**）在服务器上重生成交付件，
+  host 复跑验收 ⇒ **17 PASS / 0 FAIL / 0 SKIP**（A2 由 **SKIP**（na）→ **PASS**）。
+- **缺陷①（池外垃圾代码 / 名称垃圾）已修** —— `manu/etf_rotation/final_rebalance_plan.py`：
+  ① **池内白名单**（`_pool_whitelist` + `_split_rejections_by_pool`）：
+     LLM 把 `516620` 笔误写成 **`566620`**（**不在** ETF 池内）⇒ 旧口径照单全收 ⇒
+     交付件凭空多出一条「被否决」的假事实 ⇒ **剔除**（`ta_screening.rejected_out_of_universe` 如实披露 ＋
+     计划 md 一行 ⚠️ ＋ 交付面报告新增「⚠️ 池外代码」小节）⇒
+     `rejected` 由 6 只变 **5 只**（`516620/159207/563020/512890/159547`）；
+     ⚠️ **fail-closed**：白名单不可用 ⇒ **一个都不剔除**（不许因白名单缺失而放过真否决）。
+  ② **官方名优先**（`_official_name`）：`159547` 的 name 曾被抽成垃圾词「重叠」
+     （原文「…与 512890/159547 重叠 0.974/0.978…」）⇒ 改成**官方名盖住来源名** ⇒ 现为 **红利低波ETF华夏**。
+  ③ 白名单事实源优先级：**`--universe`（1664 个 code）** → 报告侧代码集合 → **不可用（fail-closed）**；
+     ⚠️ 该 CSV 另有 `in_universe` 列（仅 250 行为 True）⇒ **不许**按它过滤（会误杀 516620 等真池内标的）。
+  ④ 钉死测试：`manu/etf_rotation/tests/test_pool_whitelist.py`（12 例）＋ 变异反证（去掉池外剔除 / 退回回退口径 ⇒ 各 2 例转红）。
+- **缺陷②（阶段 1「未换库 / 数据滞后」假警报）已修** —— `manu/etf_rotation/daily/stage1_dataset.py`：
+  根因是 ⑥ 校验段校验的是**上游新解压快照**（末日 2026-11-09），而 S 层实际用的是**自建增量派生库**
+  `live_path`（`cn_data_live`，末日 2026-11-11）⇒ **校验对象 ≠ 实际使用对象**。
+  ⇒ 校验对象改为「**下游真正会用的那一份**」（增量成功且派生库更新 ⇒ `live_path`；换库 ⇒ `provider_path`；
+  都没换且增量失败 ⇒ `new_dir`）；`try_increment` 回传 `derived_ok / derived_covers_asof / derived_calendar_max`；
+  `covers_asof` 改用**被校验目录自己的日历**判定；**真降级告警原样保留**（不许为消假警报把真告警也删）；
+  返回值新增 `validated_dir / validated_source / validated_calendar_max / covers_asof`。
+  钉死测试：`manu/etf_rotation/daily/tests/test_stage1_dataset_validation.py`（7 例，含 4 个场景 ＋ 变异反证）。
+- **交付面报告新增披露**（`manu/etf_rotation/daily/report.py`）：「⚠️ 池外代码（**已剔除，不计入否决名单**）」小节 ＋ 2 个离线单测。
+- 🟢 **「CLI 重建 3 动作 vs 交付件 4 动作」之谜已解开（**不是**代码 bug，是**环境差异**）：
+  顺延补位要核验「规则层冲突对」⇒ 需要 **W 成分权重表** `etf_holdings.csv`
+  （`C.ETF_HOLDINGS_CSV` = `<OUTPUT_ROOT>/datasets/etf/etf_holdings.csv`）⇒ host 上**没有**这个路径
+  ⇒ `overlap_ready=False` ⇒ `_SKIP_CONFLICT_ON_SUBSTITUTE` 生效 ⇒ **宁缺毋滥、不补位**（正确 fail-safe）
+  ⇒ 重建只有 3 个动作。补上成分权重后（host 用 `ETF_ROTATION_OUTPUT_ROOT` 指向含 `datasets/etf/etf_holdings.csv` 的目录；
+  该文件与服务器 **md5 一致** `0eea3c12d25f9d9971371726455a36a7`）⇒ 重建与交付件**逐字段一致**（仅绝对路径不同）。
+  🔴 **教训**：任何「重建少/多一个动作」的差异，先查**输入件是否齐**（`overlap_ready`），再查代码。
+- **回归**：host 全量 `pytest manu/etf_rotation -q` ⇒ **568 passed / 0 failed**（基线 547 ＋ 本轮新增 21）。
+- **服务器收尾**：`_work/_etf_daily_20261109` 与 `_work/_etf_daily_20261111` 两个跑批 scratch
+  已用 `shutil.rmtree` 删除（**不碰 `rm -rf`**）；`/tmp` 下清理脚本也已 `os.unlink`。
+  🔴 `data/` 目录下**没有**任何 `_etf_daily_*`（只剩 `datasets/etf` ＋ `datasets/qlib` ＋ `_work/`）。
+- ℹ️ **残留缺口（登记，勿当已完成）**：
+  ① ⚠️ **静默防守窗 2026-11-06 ~ 2026-11-30 今天生效**，但该窗口在代码里**只被 `daily/calendar_gate.py` 算出来、
+     **无下游消费者**（`grep is_silent_defense` 只命中该文件）⇒ 流水线**仍会输出买入建议**
+     ⇒ 本轮 3 笔买入**仅供观察、不可执行**（执行卡本身也是挂单禁用）；
+  ② ⚠️ **舆情/宏观仍 `DATA_UNAVAILABLE`**（`offline_tools=true`，未接外部数据源）⇒ 报告里的「今天」= **11-11 收盘行情**，不是新闻；
+  ③ ⚠️ **W 成分权重快照仍是 2026-11-04**（滞后 7 天）⇒ 只披露不拦；
+  ④ 「维持席位」> 20% 机制仍在；回测链仍 **MA20** 口径。
+- 🔴 **不 commit / 不 push**（HEAD 仍 `a727de53`；工作区 M：`final_rebalance_plan.py` / `daily/stage1_dataset.py` /
+  `daily/report.py` / `daily/tests/test_report.py` ＋ 新增 `tests/test_pool_whitelist.py` / `daily/tests/test_stage1_dataset_validation.py`）。

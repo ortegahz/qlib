@@ -429,6 +429,35 @@ def _render_pipeline(result: Mapping, account: object,
         else:
             lines.append("**本轮无 TA 否决**（候选池全部通过合规审查）。")
             lines.append("")
+        # ---- ⚠️ 池外代码（LLM 笔误 / 幻觉代码）**剔除但如实披露** ----
+        # 🔴 2026-11-12：TA 的权威节里可能出现**候选池外**的代码
+        #    （实测 2026-11-11：LLM 把 516620 笔误写成 566620）。
+        #    规则层只认「池内白名单」⇒ 池外代码**不进否决名单**（否则会伪造一条
+        #    「被否决」的假事实）⇒ 但**必须披露**（不许悄悄吞掉）。
+        _out_of_universe = ta_screen.get("rejected_out_of_universe") or []
+        if _out_of_universe:
+            lines.append("### ⚠️ 池外代码（**已剔除，不计入否决名单**）")
+            lines.append("")
+            lines.extend(_table(
+                ["代码", "名称", "LLM 给出的理由", "原文出处", "处置"],
+                [
+                    [
+                        _text(_get(r, "code")),
+                        _text(_get(r, "name")),
+                        _text(_get(r, "reason")),
+                        _text(_get(r, "source_section")),
+                        _text(_get(r, "note")) or "池外代码 ⇒ 已剔除",
+                    ]
+                    for r in _out_of_universe
+                ],
+            ))
+            lines.append("")
+            lines.append(
+                "ℹ️ **池外代码不进否决名单**：上述代码不在本次 ETF 候选池"
+                "（`--universe` 白名单）内 ⇒ 规则层**不认**这条否决"
+                "（多半是 LLM 笔误/幻觉）⇒ 已剔除；**池内真否决行为不受影响**。"
+            )
+            lines.append("")
         if substituted:
             lines.append("### 顺延补位记录")
             lines.append("")

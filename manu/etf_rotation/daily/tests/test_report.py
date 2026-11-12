@@ -415,3 +415,45 @@ def test_report_beta_avoidance_section_is_optional():
     """没有 TA 建议 ⇒ **不许**凭空渲染这一段（不许编数据）。"""
     text = report.render_report(_pipeline_result(live_trade=True), live_trade=True)
     assert "Beta 避险" not in text, text[:4000]
+
+
+# =============================================================================
+# 池外代码（LLM 笔误 / 幻觉代码）：**剔除 + 如实披露**
+# =============================================================================
+def test_report_discloses_pool_outside_codes():
+    """池外代码不进否决名单，但**必须披露**（2026-11-12）。
+
+    真实事故：2026-11-11 的 TA 权威节把 `516620` 笔误写成 `566620`（池外），
+    规则层照单全收 ⇒ 交付件里凭空多出一条「被否决」的假事实。
+    """
+    ta = {
+        "rejected": [
+            {"code": "516620", "name": "影视ETF国泰", "reason": "E 为负",
+             "source_section": "六、最终交易决定（原始输出）"},
+        ],
+        "rejected_out_of_universe": [
+            {"code": "566620", "name": "重叠", "reason": "LLM 笔误",
+             "source_section": "六、最终交易决定（原始输出）",
+             "note": "池外代码 ⇒ 已剔除"},
+        ],
+        "substituted": [],
+    }
+    text = report.render_report(
+        _pipeline_result(live_trade=True, ta_screening=ta), live_trade=True)
+    assert "566620" in text, "池外代码必须如实披露"
+    assert "池外" in text, "必须写明「池外」处置口径"
+    assert "516620" in text, "池内真否决必须照旧披露"
+
+
+def test_report_has_no_pool_outside_section_when_none():
+    """没有池外代码时**不许**渲染空的「池外」小节。"""
+    ta = {
+        "rejected": [
+            {"code": "516620", "name": "影视ETF国泰", "reason": "E 为负",
+             "source_section": "六、最终交易决定（原始输出）"},
+        ],
+        "substituted": [],
+    }
+    text = report.render_report(
+        _pipeline_result(live_trade=True, ta_screening=ta), live_trade=True)
+    assert "池外代码" not in text
