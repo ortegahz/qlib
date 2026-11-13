@@ -3612,13 +3612,28 @@ def render_markdown(plan: dict) -> str:
         lines += [""]
 
     conflicts = plan.get("llm_conflicts") or []
-    if conflicts:
-        _stale = bool((plan.get("meta", {}).get("llm_stale") or {}).get("stale"))
-        _ttl = "## 二之三、⚠️ LLM 第二意见 vs 规则层的冲突（**默认以规则层为准**，但用户应知情）"
-        if _stale:
-            _ttl = ("## 二之三、🔴 LLM 第二意见**已过期**（基于旧版分析报告）⇒ 下表**不可作数**，"
-                    "以规则层为准")
-        lines += [_ttl, ""]
+    # 🔴 2026-11-13（真缺陷 · 交付件 `snapshots/20261113_092926` 实证）：
+    #    原实现 `if conflicts:` ⇒ **冲突表为空时整个「二之三」节不渲染**
+    #    ⇒ 但正文里「二之二」节与「二之四」节仍在**引用**「二之三 冲突表」
+    #      （"「二之三 冲突表」里的对应条目已随之移除"）⇒ **悬空交叉引用**；
+    #    ⇒ 且章节编号变成 二 / 二之二 / 二之四（**二之三缺号**）⇒ 用户对不上号。
+    #    ⇒ 现在**始终渲染**本节：空表时如实写「本轮无冲突」，编号与引用**自洽**。
+    _stale = bool((plan.get("meta", {}).get("llm_stale") or {}).get("stale"))
+    _ttl = "## 二之三、⚠️ LLM 第二意见 vs 规则层的冲突（**默认以规则层为准**，但用户应知情）"
+    if _stale:
+        _ttl = ("## 二之三、🔴 LLM 第二意见**已过期**（基于旧版分析报告）⇒ 下表**不可作数**，"
+                "以规则层为准")
+    lines += [_ttl, ""]
+    if not conflicts:
+        lines += [
+            "**本轮无冲突条目**：规则层目标与 LLM 第二意见的偏离**均在 ±2pp 以内**"
+            "（口径：`|规则% − LLM%| > 2`）⇒ 没有需要用户拍板的分歧。",
+            "",
+            "> ℹ️ 「空冲突表」是**合法结果**（不是解析器坏了）："
+            "只有当原文重放能找出 >2pp 分歧、却没进本表时，才判解析器失效。",
+            "",
+        ]
+    else:
         lines += ["| 代码 | 名称 | 规则层目标 | LLM 目标 | LLM 方向 | 谁说的 | LLM 理由 |", "|:--|:--|--:|--:|:--|:--|:--|"]
         for c in conflicts:
             rule_txt = "—" if c.get("rule_target_pct") is None else f"{c['rule_target_pct']:.0f}%"

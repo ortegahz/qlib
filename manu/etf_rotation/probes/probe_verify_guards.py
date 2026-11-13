@@ -651,8 +651,249 @@ def _inject_buy_side_target(plan: dict, code: str) -> dict:
     return out
 
 
+#: 🔴 2026-11-13（探针真空假红 · 负例**自建夹具**）：N1/N2/N4/N5 这四条负例原本
+#:   「往**本轮真实**冲突表里注入一条人造行」⇒ 本轮规则层与 LLM 在 ±2pp 内一致
+#:   ⇒ 真实冲突表**合法为空（0 行）** ⇒ 人造行**根本注入不进去**
+#:   ⇒ 期望的 FAIL **没发生** ⇒ 负例自己先红了（假红）。
+#: ⇒ 修法：负例**自建夹具**（自己的非空冲突表 + 计划件 + LLM 原文）
+#:   ⇒ **不依赖本轮真实产物** ⇒ 任何一轮都能真的转红（守卫一直有牙）。
+#:   ⚠️ 期望**不许**从「期望 FAIL」改成「期望 PASS」（那是把断言改弱）。
+#:
+#: 夹具用的**合成 LLM 原文**（探针自造 ⇒ 不依赖任何真实决策件）。
+#:    两行分别覆盖两个语义档：① ZERO（卖出 ⇒ 目标必须 0%）；② REDUCE（减仓 ⇒ 目标 < 当前）。
+_FIXTURE_DECISION_MD = """# 合成决策（守卫自检夹具 · **非真实产物**）
+
+## 研究经理
+
+| 标的 | 当前权重 | 方向 | 目标权重 | 理由 |
+|:--|--:|:--|--:|:--|
+| 512800 | 20.00% | **卖出** | 0% | 夹具行：规则层 20%，LLM 清仓 |
+| 515650 | 20.00% | **减仓** | 10% | 夹具行：规则层 20%，LLM 减到 10% |
+"""
+
+#: 夹具里的两个代码：ZERO 档（卖出）/ REDUCE 档（减仓）
+_FIXTURE_ZERO_CODE = "512800"
+_FIXTURE_REDUCE_CODE = "515650"
+#: 夹具的规则层权重（%）与 LLM 目标（%）：两者都 >2pp ⇒ 冲突表**非空**
+_FIXTURE_RULE_PCT = 20.0
+_FIXTURE_ZERO_TARGET_PCT = 0.0
+_FIXTURE_REDUCE_TARGET_PCT = 10.0
+
+
+def _fixture_plan(decision_md: Path) -> dict:
+    """自建夹具：一份**非空**冲突表 + 计划件（**不依赖本轮真实产物**）。
+
+    口径（与生产守卫同源 ⇒ 未变异的夹具两条守卫都必须 PASS）：
+      · 规则层：两个代码各 20%（`actions[].target_weight = 0.2`）；
+      · LLM：512800 卖出 0%（ZERO 档）、515650 减仓 10%（REDUCE 档）
+        ⇒ 两行都 >2pp 分歧 ⇒ 冲突表**非空**；
+      · 冲突行的每个字段都与**原文重放**逐位一致（llm_target_pct / llm_direction /
+        llm_who / rule_target_pct）⇒ 可追溯守卫 PASS ⇒ 负例只可能因**变异**而转红。
+    """
+    return {
+        "meta": {
+            "total_assets": 100000.0,
+            "source_decision": str(decision_md),
+            "account_current_weights_pct": {
+                _FIXTURE_ZERO_CODE: _FIXTURE_RULE_PCT,
+                _FIXTURE_REDUCE_CODE: _FIXTURE_RULE_PCT,
+            },
+        },
+        "actions": [
+            {"code": _FIXTURE_ZERO_CODE, "name": "夹具ETF-ZERO", "target_weight": 0.2},
+            {"code": _FIXTURE_REDUCE_CODE, "name": "夹具ETF-REDUCE", "target_weight": 0.2},
+        ],
+        "llm_targets": {
+            _FIXTURE_ZERO_CODE: {
+                "direction": "卖出", "current_pct": _FIXTURE_RULE_PCT,
+                "target_pct": _FIXTURE_ZERO_TARGET_PCT, "who": "research",
+                "reason": "夹具：规则层 20%，LLM 清仓",
+            },
+            _FIXTURE_REDUCE_CODE: {
+                "direction": "减仓", "current_pct": _FIXTURE_RULE_PCT,
+                "target_pct": _FIXTURE_REDUCE_TARGET_PCT, "who": "research",
+                "reason": "夹具：规则层 20%，LLM 减到 10%",
+            },
+        },
+        "llm_conflicts": [
+            {
+                "code": _FIXTURE_ZERO_CODE, "name": "夹具ETF-ZERO",
+                "rule_target_pct": _FIXTURE_RULE_PCT,
+                "llm_target_pct": _FIXTURE_ZERO_TARGET_PCT,
+                "llm_direction": "卖出", "llm_who": "research",
+                "llm_current_pct": _FIXTURE_RULE_PCT, "llm_reason": "夹具",
+                "all_divergent_views": [{
+                    "who": "research", "direction": "卖出",
+                    "target_pct": _FIXTURE_ZERO_TARGET_PCT,
+                    "current_pct": _FIXTURE_RULE_PCT,
+                }],
+            },
+            {
+                "code": _FIXTURE_REDUCE_CODE, "name": "夹具ETF-REDUCE",
+                "rule_target_pct": _FIXTURE_RULE_PCT,
+                "llm_target_pct": _FIXTURE_REDUCE_TARGET_PCT,
+                "llm_direction": "减仓", "llm_who": "research",
+                "llm_current_pct": _FIXTURE_RULE_PCT, "llm_reason": "夹具",
+                "all_divergent_views": [{
+                    "who": "research", "direction": "减仓",
+                    "target_pct": _FIXTURE_REDUCE_TARGET_PCT,
+                    "current_pct": _FIXTURE_RULE_PCT,
+                }],
+            },
+        ],
+        "tradingagents_view": "合成夹具（守卫自检用 · 非真实产物）",
+    }
+
+
+def _fixture_variants(plan: dict) -> list[tuple[str, dict]]:
+    """夹具上的四条负例变异（N1 / N2 / N4 / N5）⇒ `[(标签, 变异后的计划件)]`。
+
+    🔴 期望**不许**改成「期望 PASS」（那是把断言改弱）：
+       每条变异都必须让对应的守卫**真的转红**。
+    """
+    variants: list[tuple[str, dict]] = []
+
+    # N1：ZERO 方向那一行配 9.11% 目标权重（= 理由栏里的浮盈被当成权重 ⇒ 假冲突）
+    bad = json.loads(json.dumps(plan))
+    for conflict in bad.get("llm_conflicts") or []:
+        if str(conflict.get("llm_direction") or "") not in _ZERO_DIRECTIONS:
+            continue
+        conflict["llm_target_pct"] = 9.11
+        for view in conflict.get("all_divergent_views") or []:
+            if str(view.get("direction") or "") in _ZERO_DIRECTIONS:
+                view["target_pct"] = 9.11
+    variants.append(("N1 「不买」配 9.11% 目标权重（假冲突）", bad))
+
+    # N2：REDUCE 方向那一行的目标改成 **≥ 当前权重**（说减却不减 ⇒ 自相矛盾）
+    bad = json.loads(json.dumps(plan))
+    for conflict in bad.get("llm_conflicts") or []:
+        if str(conflict.get("llm_direction") or "") not in _REDUCE_DIRECTIONS:
+            continue
+        _cur = float(conflict.get("llm_current_pct") or 0.0)
+        conflict["llm_target_pct"] = _cur
+        for view in conflict.get("all_divergent_views") or []:
+            if str(view.get("direction") or "") in _REDUCE_DIRECTIONS:
+                view["target_pct"] = _cur
+    variants.append(("N2 REDUCE 方向 ⇒ 目标 ≥ 当前权重（说减却不减）", bad))
+
+    # N4：方向被改写（「卖出」→「买」，但目标权重还是 0% ⇒ 语义矛盾）
+    bad = json.loads(json.dumps(plan))
+    for conflict in bad.get("llm_conflicts") or []:
+        if str(conflict.get("llm_direction") or "") not in _ZERO_DIRECTIONS:
+            continue
+        conflict["llm_direction"] = "买"
+        conflict["llm_target_pct"] = 0.0
+    variants.append(("N4 方向「不买」→「买」（目标 0%）", bad))
+
+    # N5：规则层权重被改（与 actions 不自洽）
+    bad = json.loads(json.dumps(plan))
+    for conflict in bad.get("llm_conflicts") or []:
+        try:
+            _cur = float(conflict.get("rule_target_pct"))
+        except (TypeError, ValueError):
+            _cur = 0.0
+        conflict["rule_target_pct"] = _cur + 5.0
+    variants.append(("N5 规则层权重 +5pp（与 actions 不一致）", bad))
+    return variants
+
+
+#: 夹具负例的**期望**：`(语义守卫要 FAIL?, 可追溯守卫要 FAIL?)`
+#: 🔴 铁律：期望**不许**改成「期望 PASS」（那是把断言改弱）⇒ 四条里
+#:    「可追溯守卫要 FAIL」**恒为真**，N1/N2/N4 的「语义守卫要 FAIL」也恒为真。
+_FIXTURE_EXPECT: dict[str, tuple[bool, bool]] = {
+    "N1": (True, True),
+    "N2": (True, True),
+    "N4": (True, True),
+    "N5": (False, True),
+}
+
+
+def _fixture_negative_cases(plan: dict) -> list[tuple[str, bool, str]]:
+    """夹具负例的自检结果 ⇒ `[(标签, 是否符合期望, 细节)]`。
+
+    口径（与 `main()` 里跑的**同一份逻辑** ⇒ 单测能直接盖住探针本体）：
+      · 变异必须**真的改动了计划件**（改了等于没改 ⇒ 负例无牙 ⇒ 判否）；
+      · 变异后对应守卫必须**真的转红**（期望来自 `_FIXTURE_EXPECT`）。
+    """
+    out: list[tuple[str, bool, str]] = []
+    base_json = json.dumps(plan, ensure_ascii=False, sort_keys=True)
+    for tag, variant in _fixture_variants(plan):
+        key = tag.split(" ", 1)[0]
+        want = _FIXTURE_EXPECT.get(key)
+        if want is None:
+            out.append((f"{tag} ⇒ 期望未登记", False, "期望表缺项 ⇒ 负例无牙"))
+            continue
+        want_semantic, want_traceable = want
+        mutated = json.dumps(variant, ensure_ascii=False, sort_keys=True) != base_json
+        got_semantic, got_traceable = _guard_verdicts(variant)
+        ok = (
+            mutated
+            and got_semantic is (not want_semantic)
+            and got_traceable is (not want_traceable)
+        )
+        label = (f"{tag} ⇒ 期望 语义守卫{'FAIL' if want_semantic else 'PASS'}"
+                 f" / 可追溯守卫{'FAIL' if want_traceable else 'PASS'}"
+                 "（**自建夹具** · 不依赖本轮真实产物）")
+        detail = (f"语义守卫={got_semantic}｜可追溯守卫={got_traceable}"
+                  f"｜变异{'已生效' if mutated else '**未生效（负例无牙）**'}")
+        out.append((label, ok, detail))
+    return out
+
+
+def _guard_verdicts(plan: dict) -> tuple[bool, bool]:
+    """生产两条守卫对这份计划件的判定 ⇒ `(语义守卫 PASS?, 可追溯守卫 PASS?)`。
+
+    🔴 **单一事实源**：`verify_artifacts.py` 的自检里调用的**就是**这两个函数
+       （「LLM 方向-权重语义自洽」/「冲突表数字可追溯（回放 LLM 原文）」）
+       ⇒ 探针与生产**不可能**各自漂一套口径。
+    """
+    semantic_ok, _ = VA._check_llm_direction_semantics(plan)
+    traceable_ok, _ = VA._check_conflict_traceability(plan)
+    return bool(semantic_ok), bool(traceable_ok)
+
+
+def _exit_code(failures: int, stage_na: bool) -> int:
+    """探针退出码：0=通过 / 1=失败 / **2=不适用**（不适用 ≠ 通过）。
+
+    🔴 2026-11-13：`stage_na` 只由**阶段级**的 na 触发（如 G-TA1 闸门判不了）。
+       **断言级**的 na（如 P0b「本轮无冲突行 ⇒ 本前置不适用」）**不许**把整个阶段
+       变成「不适用」⇒ 否则 run_gates.sh 会把这一阶段整段跳过（闸门覆盖面就没了）。
+    """
+    if failures:
+        return 1
+    return 2 if stage_na else 0
+
+
+def _p0b_verdict(conflicts: list) -> dict:
+    """P0b 的**三值**判定 ⇒ `{status: pass|fail|na, detail: str}`。
+
+    🔴 2026-11-13（探针真空假红）：旧口径 `bool(conflicts) and ...`
+       ⇒ **冲突表为空**时判 FAIL ⇒ 但「规则层与 LLM 在 ±2pp 内一致」时
+       **冲突表合法为空（0 行）** ⇒ 旧口径 = **真空假红**。
+    ⇒ 正确口径：**冲突表为空 ⇒ 本前置不适用**（N/A，**不适用 ≠ 通过**）；
+       非空 ⇒ 每行都必须带 llm_current_pct，否则 FAIL（这条**必须**有牙）。
+    """
+    rows = list(conflicts or [])
+    if not rows:
+        return {
+            "status": "na",
+            "detail": "本轮基线**无冲突行**（规则层与 LLM 在 ±2pp 内一致 ⇒ 冲突表合法为空）"
+                      "⇒ **本前置不适用**（不适用 ≠ 通过）",
+        }
+    n_with = sum(
+        1 for c in rows
+        if isinstance(c, dict) and c.get("llm_current_pct") is not None
+    )
+    ok = n_with == len(rows)
+    return {
+        "status": "pass" if ok else "fail",
+        "detail": f"冲突 {len(rows)} 条｜带 llm_current_pct 的 {n_with} 条"
+                  + ("" if ok else "｜**有冲突行缺 llm_current_pct** ⇒ N2 的语义断言无从生效"),
+    }
+
+
 def _mutate_baseline(plan: dict) -> list[tuple[str, dict]]:
-    """构造若干「故意做坏」的交付件变体。
+    """构造「**依赖本轮真实交付件**」的故意做坏的变体（N3 / N6）。
 
     🔴（2026-11-09 独立审计实证）修：**负例不许硬编码生产数据的偶然形态**。
        旧实现把变异目标**写死**：N1/N4 改代码 `563020`、N5 改数值 `25.0`
@@ -662,93 +903,24 @@ def _mutate_baseline(plan: dict) -> list[tuple[str, dict]]:
        ⇒ 三条负例全部「守卫生效」地 PASS（实测 N1/N4/N5 三红）。
        ⇒ 修法：**动态挑行**（挑「ZERO 方向 + 目标 0%」的行）+ **自带兜底夹具**，
          且外层会**断言变异确实改动了交付件**（改了等于没改 ⇒ 负例无牙 ⇒ 判 FAIL）。
+
+    🔴 2026-11-13（探针真空假红）：N1 / N2 / N4 / N5 **整体迁到自建夹具**
+       （`_fixture_variants`）—— 它们要「往**非空**冲突表里注入人造行」，
+       而本轮真实冲突表**合法为空（0 行）** ⇒ 人造行注入不进去 ⇒ 期望的 FAIL
+       **没发生** ⇒ 负例自己先红了（假红）。
+       ⇒ 夹具自带非空冲突表 + 计划件 + 原文 ⇒ **不依赖本轮真实产物**。
+       这里只保留**本来就得看真实交付件**的两条：N3（凭空造冲突）与 N6（--skip-ta 形态）。
     """
     variants: list[tuple[str, dict]] = []
 
-    # N1：BLOCKING 类假冲突 —— 「不买/卖」却配 9.11% 目标权重（= 理由栏的浮盈被当成权重）
-    bad = json.loads(json.dumps(plan))
-    _hit = 0
-    for conflict in bad.get("llm_conflicts") or []:
-        if str(conflict.get("llm_direction") or "") not in _ZERO_DIRECTIONS:
-            continue
-        conflict["llm_target_pct"] = 9.11
-        for view in conflict.get("all_divergent_views") or []:
-            if str(view.get("direction") or "") in _ZERO_DIRECTIONS:
-                view["target_pct"] = 9.11
-        _hit += 1
-    if not _hit and bad.get("llm_conflicts"):
-        # 兜底夹具：自造一条「不买 + 9.11%」（**不依赖生产数据恰好有某个代码**）
-        bad["llm_conflicts"][0]["llm_direction"] = "不买"
-        bad["llm_conflicts"][0]["llm_target_pct"] = 9.11
-        _hit = 1
-    variants.append(("N1 「不买」配 9.11% 目标权重（假冲突）", bad))
-
-    # N2：REDUCE 方向那一行的目标改成 **≥ 当前权重**（说减却不减 ⇒ 自相矛盾）。
-    # 🔴 2026-11-05 01:3x（M-K 收尾）：旧注释写「「减」方向不受语义守卫约束」——
-    #    那**不是设计，是 bug**：旧实现把「当前权重」伪造成**目标值**
-    #    ⇒ 「减 ⇒ 目标 < 当前」这一档**恒不成立** ⇒ 语义守卫对「减」方向完全失效。
-    # 🔴 2026-11-10（闸门假红修复）：旧实现把变异目标**写死** `512800` + `25.0`
-    #    ⇒ 本轮 512800 的冲突方向是「持有」（NEUTRAL ⇒ **不设约束**）
-    #    ⇒ 变异落在**无约束维度** ⇒ 语义守卫仍 PASS ⇒ 负例**空转**
-    #    ⇒ 期望「语义守卫 FAIL」落空 ⇒ 闸门假红（实测 N2 红）。
-    #    ⇒ 修法：**动态挑 REDUCE 方向的行**（挑不到就用**兜底夹具**自造一条）
-    #      ⇒ REDUCE 这一档**永远有人看守**，不再依赖生产数据碰巧有某个代码/方向。
-    bad = json.loads(json.dumps(plan))
-    _hit = 0
-    for conflict in bad.get("llm_conflicts") or []:
-        if str(conflict.get("llm_direction") or "") not in _REDUCE_DIRECTIONS:
-            continue
-        _cur = float(conflict.get("llm_current_pct") or 0.0)
-        conflict["llm_target_pct"] = _cur  # 「减」却不减到当前以下 ⇒ 自相矛盾
-        for view in conflict.get("all_divergent_views") or []:
-            if str(view.get("direction") or "") in _REDUCE_DIRECTIONS:
-                view["target_pct"] = _cur
-        _hit += 1
-    if not _hit and bad.get("llm_conflicts"):
-        # 兜底夹具：自造一条「减仓 + 目标 = 当前」⇒ 必被 REDUCE 档拦下
-        # （**不依赖生产数据恰好有 REDUCE 行**，否则该档会悄悄失去看守）。
-        bad["llm_conflicts"][0].update({
-            "llm_direction": "减仓", "llm_current_pct": 20.0, "llm_target_pct": 20.0,
-        })
-        _hit = 1
-    variants.append(("N2 REDUCE 方向 ⇒ 目标 ≥ 当前权重（说减却不减）", bad))
-
     # N3：凭空插入一条 LLM 原文里根本没有的冲突
     bad = json.loads(json.dumps(plan))
-    bad["llm_conflicts"].append({
+    bad.setdefault("llm_conflicts", []).append({
         "code": "510300", "name": "沪深300ETF", "rule_target_pct": 20.0,
         "llm_target_pct": 5.0, "llm_direction": "减", "llm_who": "bear",
         "llm_reason": "凭空捏造", "all_divergent_views": [],
     })
     variants.append(("N3 凭空插入原文里不存在的冲突", bad))
-
-    # N4：方向被改写（「不买」→「买」，但目标权重还是 0% ⇒ 语义矛盾）
-    bad = json.loads(json.dumps(plan))
-    _hit = 0
-    for conflict in bad.get("llm_conflicts") or []:
-        if str(conflict.get("llm_direction") or "") not in _ZERO_DIRECTIONS:
-            continue
-        conflict["llm_direction"] = "买"
-        conflict["llm_target_pct"] = 0.0
-        _hit += 1
-    if not _hit and bad.get("llm_conflicts"):
-        bad["llm_conflicts"][0]["llm_direction"] = "买"
-        bad["llm_conflicts"][0]["llm_target_pct"] = 0.0
-        _hit = 1
-    variants.append(("N4 方向「不买」→「买」（目标 0%）", bad))
-
-    # N5：规则层权重被改（与 actions 不自洽）
-    #    🔴 2026-11-09 修：旧实现**写死 25.0** ⇒ 本轮 512800 的规则层权重**本来就是 25.0**
-    #    ⇒ 变异空转 ⇒ 可追溯守卫看不到任何改动 ⇒ 负例无牙。
-    #    ⇒ 修法：**在现值上加 5pp**（保证与 actions 重建值**必然不同**）。
-    bad = json.loads(json.dumps(plan))
-    for conflict in bad.get("llm_conflicts") or []:
-        try:
-            _cur = float(conflict.get("rule_target_pct"))
-        except (TypeError, ValueError):
-            _cur = 0.0
-        conflict["rule_target_pct"] = _cur + 5.0
-    variants.append(("N5 规则层权重 +5pp（与 actions 不一致）", bad))
 
     # N6：无 LLM 意见（--skip-ta 形态）⇒ 两条新断言**按设计**跳过
     bad = json.loads(json.dumps(plan))
@@ -848,6 +1020,8 @@ def main() -> int:
     failures = 0
     passes = 0
     not_applicable = 0
+    #: 阶段级「无法判定」⇒ 退出码 2（断言级 N/A **不**触发，见 `_record_na`）
+    stage_na = False
 
     def _record(ok: bool, tag: str, detail: str) -> None:
         nonlocal failures, passes
@@ -859,23 +1033,42 @@ def main() -> int:
         lines.append(f"        {detail}")
 
     def _record_gate(verdict: dict, tag: str) -> None:
-        """三值判定（pass / fail / na）的记录器。
+        """三值判定（pass / fail / na）的记录器（**阶段级**闸门用）。
 
         🔴 「不适用」**既不是通过也不是失败** ⇒ 单列一行 `[N/A]`，
            **不进 PASS 计数**（否则 run_gates.sh 的断言 PASS 计数会被灌水）。
+        🔴 阶段级「无法判定」（na）⇒ 退出码 **2**（沿用本探针既有契约：
+           0=通过 / 1=失败 / 2=不适用 ⇒ run_gates.sh 据此显式标注「不适用，不是通过」）。
         """
-        nonlocal failures, passes, not_applicable
+        nonlocal failures, passes, not_applicable, stage_na
         status = verdict.get("status")
         if status == "fail":
             failures += 1
             lines.append(f"[FAIL] {tag}")
         elif status == "na":
             not_applicable += 1
+            stage_na = True
             lines.append(f"[N/A] {tag}")
         else:
             passes += 1
             lines.append(f"[PASS] {tag}")
         lines.append(f"        {verdict.get('detail', '')}")
+
+    def _record_na(tag: str, detail: str) -> None:
+        """**断言级**「不适用」的记录器（前置条件在本轮不成立）。
+
+        🔴 与 `_record_gate` 的 na 的区别（**必须分清**，否则闸门会误判）：
+           · `_record_gate` 的 na = **阶段级无法判定** ⇒ 整个探针自判「不适用」
+             ⇒ 退出码 **2**（run_gates.sh 显式标注「不适用，不是通过」）；
+           · `_record_na` = **单条断言的前置在本轮不适用**（如「本轮无冲突行 ⇒
+             这条前置无从校验」）⇒ 本探针**其余断言照常判定**
+             ⇒ 退出码**不受影响**（否则一条前置不适用会把整个阶段的判定抹掉）。
+        ⚠️ 「不适用」**不进 PASS 计数**（不适用 ≠ 通过）。
+        """
+        nonlocal not_applicable
+        not_applicable += 1
+        lines.append(f"[N/A] {tag}")
+        lines.append(f"        {detail}")
 
     # ---- P0 阳性对照：原样交付件 ⇒ 两条新断言都必须 PASS，且整体退出码 0 ----
     exit_code, verdicts = _run_verify(scratch, project_dir)
@@ -891,14 +1084,18 @@ def main() -> int:
     # 🔴 2026-11-05 01:4x（reviewer 指出）：N2 的语义断言依赖「当前权重」；
     #    若基线是**旧产物**（没有 llm_current_pct）⇒ 变异后语义守卫仍 PASS
     #    ⇒ 探针会误报「守卫已失效」⇒ 先把这条误诊挡在前面。
+    # 🔴 2026-11-13（探针真空假红）：旧口径 `bool(conflicts) and ...`
+    #    ⇒ **冲突表为空**时判 FAIL ⇒ 但「规则层与 LLM 在 ±2pp 内一致」时
+    #    **冲突表合法为空（0 行）** ⇒ 旧口径 = **真空假红**。
+    #    ⇒ 正确口径：**冲突表为空 ⇒ 本前置不适用**（N/A，**不适用 ≠ 通过**），
+    #      非空 ⇒ 每行都必须带 llm_current_pct，否则 FAIL（这条**必须**有牙）。
     _base_conflicts = baseline_plan.get("llm_conflicts") or []
-    _n_with_cur = sum(
-        1 for c in _base_conflicts
-        if isinstance(c, dict) and c.get("llm_current_pct") is not None
-    )
-    _record(bool(_base_conflicts) and _n_with_cur == len(_base_conflicts),
-            "P0b 基线前置：每条冲突行都必须带 llm_current_pct（否则 N2 的语义断言无从生效）",
-            f"冲突 {len(_base_conflicts)} 条｜带 llm_current_pct 的 {_n_with_cur} 条")
+    _p0b = _p0b_verdict(_base_conflicts)
+    _p0b_tag = "P0b 基线前置：每条冲突行都必须带 llm_current_pct（否则 N2 的语义断言无从生效）"
+    if _p0b["status"] == "na":
+        _record_na(_p0b_tag, _p0b["detail"])
+    else:
+        _record(_p0b["status"] == "pass", _p0b_tag, _p0b["detail"])
 
     # =============================================================================
     # 🔴 2026-11-11：**产物级**闸门「TA 否决名单零误伤」（断言对象 = 交付件本身）
@@ -954,7 +1151,34 @@ def main() -> int:
     # 还原计划件（后面的 N1~N6 会各自写自己的变异体）
     plan_path.write_text(json.dumps(baseline_plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ---- N1~N6：故意做坏 ⇒ 对应断言必须 FAIL ----
+    # =============================================================================
+    # 🔴 2026-11-13（探针真空假红）：N1 / N2 / N4 / N5 —— **自建夹具**上的负例
+    # =============================================================================
+    # 【为什么必须自建夹具】这四条负例要「往**非空**冲突表里注入一条人造行」，
+    #   而本轮规则层与 LLM 在 **±2pp 内一致** ⇒ 真实冲突表**合法为空（0 行）**
+    #   ⇒ 人造行**根本注入不进去** ⇒ 期望的 FAIL **没发生** ⇒ 负例自己先红了（假红）。
+    #   ⇒ 修法：**自己造**一份非空冲突表 + 计划件 + LLM 原文（`_fixture_plan`）
+    #     ⇒ **不依赖本轮真实产物** ⇒ 任何一轮都能真的转红（守卫一直有牙）。
+    #   ⚠️ 期望**不许**从「期望 FAIL」改成「期望 PASS」（那是把断言改弱）。
+    #
+    # 【口径】判定用的就是**生产那两条守卫**（`verify_artifacts._check_llm_direction_semantics`
+    #   / `_check_conflict_traceability` —— 自检里调用的**同两个函数**）⇒ 探针与生产不会漂。
+    #   ⚠️ 这里**不校验全局退出码**：夹具目录里缺真实产物 ⇒ 与本用例无关的断言必红
+    #     ⇒ 全局退出码没有判别力（只认两条守卫的判定）。
+    _fixture_md = scratch / "_probe_fixture_decision.md"
+    _fixture_md.write_text(_FIXTURE_DECISION_MD, encoding="utf-8")
+    _fixture = _fixture_plan(_fixture_md)
+    _fx_sem, _fx_trace = _guard_verdicts(_fixture)
+    _record(_fx_sem and _fx_trace,
+            "N0 夹具自检：自建的非空冲突表 + 计划件 + LLM 原文 ⇒ 两条守卫都 PASS"
+            "（夹具本身坏了 ⇒ 下面的负例就是空转）",
+            f"语义守卫={_fx_sem}｜可追溯守卫={_fx_trace}"
+            f"｜冲突 {len(_fixture.get('llm_conflicts') or [])} 条"
+            f"｜原文 {_fixture_md.name}")
+    for _label, _ok, _detail in _fixture_negative_cases(_fixture):
+        _record(_ok, _label, _detail)
+
+    # ---- N3 / N6：故意做坏**真实交付件** ⇒ 对应断言必须 FAIL ----
     # 期望**哪些断言要报 FAIL**（语义守卫, 可追溯守卫, 是否校验全局退出码）
     # 🔴 2026-11-10：加第三维「是否校验 exit」——
     #    `:305`（旧行号）把两条守卫与**全局**退出码耦合 ⇒ **N6 永远不可能 PASS**：
@@ -964,11 +1188,7 @@ def main() -> int:
     #    ⇒ 只对 N6 关掉 exit 校验；**期望某条守卫 FAIL 时仍必须 exit ≠ 0**
     #      （那半边保留牙 ⇒ 负例不许空转）。
     expectations = {
-        "N1": (True, True, True),
-        "N2": (True, True, True),
         "N3": (False, True, True),
-        "N4": (True, True, True),
-        "N5": (False, True, True),
         # --skip-ta 形态 ⇒ 两条断言按设计都 PASS ⇒ **不校验全局退出码**
         "N6": (False, False, False),
     }
@@ -1156,9 +1376,9 @@ def main() -> int:
           + (f" / 不适用 {not_applicable}" if not_applicable else ""))
     print("=" * 78)
     # 🔴 退出码契约：0=通过 / 1=失败 / **2=不适用**（不适用 ≠ 通过）
-    if failures:
-        return 1
-    return 2 if not_applicable else 0
+    #    ⇒ 只由**阶段级**的 na（`_record_gate`）触发；断言级 na（`_record_na`）
+    #      不改变退出码（否则「本轮无冲突行」会把整个阶段的判定抹成「不适用」）。
+    return _exit_code(failures, stage_na)
 
 
 if __name__ == "__main__":

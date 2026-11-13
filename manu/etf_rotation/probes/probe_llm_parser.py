@@ -99,7 +99,10 @@ SCRATCH = C.WORK_ROOT / "_probe_llm_parser"
 #:           ① 每条冲突**方向-权重自洽**（零方向 ⇒ 目标 0%；减 ⇒ 目标 < 规则%；买 ⇒ 目标 ≥ 规则%）；
 #:           ② 冲突集合 == 「|规则% − LLM%| > 2」的代码集（**不多不少**）；
 #:           ③ 说话人必须 ∈ 已知集合；
-#:           ④ 冲突表**不得为空**（LLM 有意见却解析不出 ⇒ 解析器坏了）。
+#:           ④ 冲突表**为空时必须合法**（🔴 2026-11-13 修：旧口径「不得为空」是**假红**——
+#:              规则层与 LLM 在 ±2pp 内一致时冲突表**本来就该是空**；
+#:              改成与「冲突表数字可追溯」**同一条判定**：**重放原文**有 >2pp 分歧却没进表
+#:              ⇒ FAIL（解析器坏了）；无分歧 ⇒ 空表合法；本轮没有 LLM 意见 ⇒ N/A）。
 #:         · 不变量**带真负例**（注入自相矛盾的一行 ⇒ I1 必须 FAIL）。
 #:    ③ 改完后的 official 冲突集合**逐条对着新决策原文核过**（研究经理表 82~92 行）：
 #:       512800 减 | 10%左右；159929/513330/513770/512690 卖 | 0%；
@@ -282,6 +285,51 @@ def _invariant_failures(plan: dict, views: dict | None = None) -> list[str]:
     return [] if ok else [detail]
 
 
+def _conflict_table_emptiness(plan: dict, decision_md: Path) -> tuple[str, str]:
+    """冲突表**为空**时到底合不合法 ⇒ `(状态, 细节)`；状态 ∈ {"pass", "fail", "na"}。
+
+    🔴 2026-11-13（探针真空假红 · 本轮 8 项闸门红里的 6 项）：旧口径**无条件**要求
+       「冲突表**不得为空**」（理由写的是「LLM 有意见却解析不出 ⇒ 解析器坏了」）
+       ⇒ 但本轮 LLM 决策与规则层**在 ±2pp 内一致** ⇒ 冲突表**合法为空（0 行）**
+       ⇒ 旧口径 = **假红**（把「本来就该是空」的表判成解析器坏了）。
+
+    ⇒ 正确口径（**复用生产同一条判定**，不另造第三套）：
+       `verify_artifacts._check_conflict_traceability` —— 自检里的
+       「冲突表数字可追溯（**回放 LLM 原文**）」那条：
+         · **重放** LLM 原文得出 **>2pp** 分歧、却没进冲突表 ⇒ **FAIL**（解析器漏读，真缺陷）；
+         · **重放**无 >2pp 分歧 ⇒ 冲突表为空**合法**（规则层与 LLM 一致）⇒ PASS；
+         · 本轮**没有 LLM 意见**（--skip-ta / LLM 未完成）⇒ **N/A**
+           （**不适用 ≠ 通过**，沿用本文件与 `probe_verify_guards.py` 的既有惯例）。
+    """
+    conflicts = plan.get("llm_conflicts") or []
+    if conflicts:
+        return "pass", f"冲突表 {len(conflicts)} 条（非空 ⇒ 无需重放判定）"
+    meta = plan.get("meta") or {}
+    has_view = bool(str(plan.get("tradingagents_view") or "").strip())
+    src_decision = str(meta.get("source_decision") or "")
+    # 🔴 2026-11-13（reviewer 发现 1 · IMPORTANT）：「本轮**没有** LLM 意见」的判据
+    #    **必须用权威信号**（`meta.llm_decision_status`），**不能**只看 `tradingagents_view`
+    #    —— 生产里 **LLM 失败占位**也会渲染出一段非空的 `tradingagents_view`
+    #       （`final_rebalance_plan._decision_view` 的「未完成」渲染），
+    #       而失败占位的 `meta.source_decision` 被置 None ⇒ 旧判据会把它当成
+    #       「有 LLM 意见」⇒ 走重放分支 ⇒ 空转 **PASS**（不适用被记成通过）。
+    status = str(meta.get("llm_decision_status") or "").strip().lower()
+    final_available = (plan.get("llm_final_decision") or {}).get("available")
+    if status in ("absent", "failed") or final_available is False:
+        _why = str(meta.get("llm_decision_error") or "").strip()
+        return "na", (f"本轮**未嵌入 LLM 意见**（llm_decision_status={status or '（未记录）'}"
+                      + (f"，原因：{_why}" if _why else "")
+                      + "）⇒ 冲突表为空是**正常的** ⇒ 本判定**不适用**（不适用 ≠ 通过）")
+    if not has_view and not src_decision:
+        return "na", ("本轮**未嵌入 LLM 意见**（--skip-ta 模式 / LLM 未完成）"
+                      "⇒ 冲突表为空是**正常的** ⇒ 本判定**不适用**（不适用 ≠ 通过）")
+    # 重放必须打**探针自己读过的那份原文**（产物里的 source_decision 可能是别的机器上的路径）
+    _replay = json.loads(json.dumps(plan, ensure_ascii=False))
+    _replay.setdefault("meta", {})["source_decision"] = str(decision_md)
+    ok, detail = VA._check_conflict_traceability(_replay)
+    return ("pass" if ok else "fail"), f"冲突表 0 条 ⇒ 重放原文判定：{detail}"
+
+
 # ---------------------------------------------------------------------------
 # 🔴 2026-11-05 09:5x（M-R 修）：**内容无关**的断言工具（把「抄金标」换成「可回放不变量」）
 #
@@ -306,10 +354,6 @@ _ZERO_WORDS = ("不建仓", "不买", "卖出", "清仓")
 
 #: 计划里允许的**零方向**取值
 _ZERO_DIRS = ("不买", "不建仓", "卖", "清仓")
-
-#: 手数的中文写法（与 `llm_final._CN_NUM` 对齐）
-_CN_LOTS: dict[int, str] = {1: "一", 2: "两", 3: "三", 4: "四", 5: "五",
-                             6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 
 #: 6 位代码正则（**照抄解析器口径** `llm_final._CODE_RE`：首位不能是 0，
 #:    否则「最终分差仅 0.006126」里的 "006126" 会被当成一个代码）
@@ -721,28 +765,6 @@ def _md_number_hit(md_text: str, value: float) -> str | None:
     return None
 
 
-def _md_lots_hit(md_text: str, lots: int) -> str | None:
-    """手数能否在**决策 md 原文**里回放（命中则返回命中的写法）。
-
-    🔴 口径**照抄解析器自己的取数语法**（`llm_final._BUY_LOTS_RE` / `_MAX_LOTS_RE`）：
-       手数只可能来自「买 N 手」/「最多 N 手」这类**买 / 上限**表述
-       ⇒ ① 用同样的语法回放 ⇒ 解析器抽出来的值必然命中（不会误杀）；
-         ② 「三手货币 ETF」「买不齐三手」这种**不是手数**的写法不会被误命中
-            （突变测试实测：裸数字匹配会把这两句误当成「3 手」）。
-    """
-    nums = [str(int(lots))]
-    cn = _CN_LOTS.get(int(lots))
-    if cn:
-        nums.append(cn)
-    if int(lots) == 2:
-        nums.append("二")
-    alt = "|".join(re.escape(n) for n in nums)
-    pat = (r"(?:买\s*(?:入)?\s*|最多\s*|至多\s*|不超过\s*|不超\s*)"
-           + rf"(?:{alt})\s*\**\s*手")
-    m = re.search(pat, md_text or "")
-    return m.group(0) if m else None
-
-
 def _md_zero_dir_word(cell: str) -> str | None:
     """判断一个**方向格**是不是零方向（不买 / 不建仓 / 卖出 / 清仓）。
 
@@ -865,6 +887,74 @@ def _md_clause_codes(clause: str) -> list[str]:
     return group
 
 
+#: 「降至 / 减至 / 调到…」这类**降目标**动作（= **减仓**，不是清仓）。
+#:    🔴 2026-11-13 实测事故（A20⑥ 假红 · 真机交付件 `20261113_092926`）：
+#:       「…在**卖出四只持仓**并**将 512800 降至 12–16%** 后静态约 76–84%…」
+#:       ⇒ 「卖出」的**对象是「四只持仓」**（泛指），512800 被「降至 12–16%」**点名**
+#:       ⇒ 512800 是**减仓**（计划里目标 16%）⇒ 子句级零方向词把它**连坐**
+#:       ⇒ 闸门报「原文写明零方向，但计划目标=16.0」⇒ **假红**。
+#:    ⚠️ 这些词**只用于「代码级归属」**（`_md_clause_reduced_codes`）：
+#:       **绝对不许**加进 `_PARTIAL_WORDS`（那是**整子句**豁免 ⇒ 会把同子句里
+#:       真·清仓的代码一起放过 ⇒ 真缺陷被放过）。
+_MD_REDUCE_TARGET_WORDS: tuple[str, ...] = (
+    "降至", "减至", "降到", "调至", "下调至", "下调到",
+    "压缩至", "压缩到", "调整至", "调整到",
+)
+
+#: 「降目标」动作词允许出现在**代码之后**的最大字数（**就近绑定** ⇒ 不跨代码）
+_MD_REDUCE_TARGET_TAIL = 12
+
+
+def _md_clause_reduced_codes(clause: str) -> set[str]:
+    """子句里被「降至 / 减至 / 调到…」**直接绑定**的代码（= 减仓，**不是**零方向）。
+
+    🔴 事故来源（2026-11-13 服务器实跑，A20⑥ 假红）：真机交付件的最终裁决里写
+       「现金 15,518.87 元（51.98%）在**卖出四只持仓**并**将 512800 降至 12–16%**
+         后静态约 76–84%」
+       ⇒ 「卖出」的对象是「四只持仓」（泛指），512800 是被「降至 12–16%」**点名**的
+       ⇒ 512800 是**减仓**（计划里目标 16%）⇒ 子句级零方向词把它连坐 ⇒ **假红**。
+
+    🔴 口径（**代码级**归属，不是整句/整子句豁免）：
+       · 逐个代码看它**后面**那一段文字里有没有「降至/减至/降到/调至/下调至/
+         下调到/压缩至/压缩到/调整至/调整到」；
+       · 这一段**遇到下一个代码就截断**（且 ≤ `_MD_REDUCE_TARGET_TAIL` 字）
+         ⇒ 不许**跨代码**绑定：「卖出 512800 并将 515450 降至 10%」里
+           **512800 仍判零方向**，只有 515450 是减仓；
+       · 只剔除**被直接绑定的那只** ⇒ 同子句其它代码**不受影响**。
+    """
+    text = clause or ""
+    hits = list(_CODE_RE.finditer(text))
+    out: set[str] = set()
+    for idx, m in enumerate(hits):
+        nxt = hits[idx + 1].start() if idx + 1 < len(hits) else len(text)
+        tail = text[m.end():min(nxt, m.end() + _MD_REDUCE_TARGET_TAIL)]
+        if any(w in tail for w in _MD_REDUCE_TARGET_WORDS):
+            out.add(m.group(1))
+    return out
+
+
+def _md_clause_zero_direct_code(clause: str, zero_word: str) -> str | None:
+    """零方向词**紧跟其后**的那个代码（= 该动作词的**直接对象**）；没有则 None。
+
+    🔴 为什么要这条护栏：「清仓 900001 并将组合权益降至 10%」里，
+       「降至」就落在 900001 后面 ⇒ 只看「代码级减仓绑定」会把 900001 一起豁免
+       ⇒ **真清仓被放过**（假绿）⇒ 所以：**紧跟在动作词后面**的代码是它的对象
+       ⇒ 该代码的零方向判定**不受**减仓绑定影响。
+    🔴 动作词与代码之间允许夹**空白 / markdown 强调 / 冒号 / 顿号**
+       （「清仓：512800」「卖出、513330」也是**直接对象**）。
+    """
+    text = clause or ""
+    if not zero_word:
+        return None
+    for m in re.finditer(re.escape(zero_word), text):
+        if _md_negated(text, m.start(), m.group(0)):
+            continue
+        tail = re.sub(r"^[\s*`_~：:、]+", "", text[m.end():])
+        cm = _CODE_RE.match(tail)
+        return cm.group(1) if cm else None
+    return None
+
+
 #: 「卖出超配部分」「卖出部分」等**部分卖出**写法（2026-11-11 日常链真件）。
 _MD_SELL_PARTIAL_RE = re.compile(r"(?:卖出|卖掉)　?[^\uff0c\uff1b。|]{0,6}?部分")
 
@@ -963,6 +1053,117 @@ def _md_has_buy_action(clause: str) -> bool:
     return False
 
 
+#: 「买 N 手」—— **照抄解析器** `llm_final._BUY_LOTS_RE`（探针与被测物必须同口径）
+_MD_BUY_LOTS_RE = re.compile(r"买\s*(?:入)?\s*(\d+|[一二两三四五六七八九十])\s*手")
+
+#: 「最多 N 手」/「至多 N 手」/「不超过 N 手」—— **照抄解析器** `llm_final._MAX_LOTS_RE`
+_MD_MAX_LOTS_RE = re.compile(r"(?:最多|至多|不超过|不超)\s*(\d+|[一二两三四五六七八九十])\s*手")
+
+#: 中文数字 → 手数（**照抄解析器** `llm_final._CN_NUM`）
+_MD_CN_NUM: dict[str, int] = {
+    "一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _md_lots_value(token: str) -> int:
+    """「1」/「一」/「两」⇒ 手数（**照抄解析器** `llm_final._to_lots`）。"""
+    raw = str(token).strip().replace(",", "")
+    if raw.isdigit():
+        return int(raw)
+    return _MD_CN_NUM.get(raw, 1)
+
+
+def _md_final_text(text: str) -> str:
+    """取「最终交易决定」章节正文（**解析器** `llm_final.extract_section` 的同一份口径）。
+
+    🔴 为什么要按**章节**取：计划里的 `targets` 就是解析器**只看这一章**抽出来的
+       ⇒ 手数也必须**只在这一章**里找 ⇒ 否则分析师章节里的一句「买 1 手」会被
+       算到最终裁决的标的头上 ⇒ **假红**。
+    """
+    try:
+        section = LF.extract_section(text or "")
+    except Exception:  # noqa: BLE001 —— 探针自身出错 ⇒ 如实退化为「全文」
+        section = None
+    return section or (text or "")
+
+
+def _md_nearest_code(clause: str, start: int, end: int) -> str | None:
+    """离「手数表达式」**最近**的那个代码（同距时取**在前面**的那个）；没有则 None。"""
+    best: str | None = None
+    best_dist: int | None = None
+    for m in _CODE_RE.finditer(clause or ""):
+        if m.end() <= start:
+            dist = start - m.end()
+        elif m.start() >= end:
+            dist = m.start() - end
+        else:
+            dist = 0
+        if best_dist is None or dist < best_dist:
+            best, best_dist = m.group(1), dist
+    return best
+
+
+def _md_code_lots(md_text: str) -> dict[str, int]:
+    """决策原文里**逐代码**写明的**手数**（code → 手数）。
+
+    🔴 口径（**照抄解析器** `llm_final._BUY_LOTS_RE` / `_MAX_LOTS_RE`）：
+       · 手数只可能来自「买 N 手」/「最多 N 手」（**以「手」为单位**）；
+         「N 股 / N 份」走的是**股数**通道（`_KEEP_SHARES_RE` / `_SELL_SHARES_RE`）
+         ⇒ **不是手数** ⇒ 不认（否则会要求一个解析器根本抽不出来的值 ⇒ **永久假红**）；
+       · 「三手货币 ETF」「买不齐三手」这种**不是手数**的写法**不许命中**
+         （裸数字匹配会误命中 ⇒ 必须照抄解析器的语法）；
+       · 只在**买入类子句**里找（`_md_has_buy_action`）
+         ⇒ 与解析器的绑定口径一致（解析器也只在「买/条件买入」的子句里取手数）；
+       · 绑定：**同一子句**内离手数**最近**的代码 ⇒ 归它；
+         子句里没有代码 ⇒ 泛指 ⇒ **不归给任何代码**（探针只报「矛盾」，
+         不替解析器补语义 ⇒ 宁可漏判、不可误杀）。
+    """
+    out: dict[str, int] = {}
+    for sentence in _md_sentences(_md_final_text(md_text)):
+        for clause in _md_clauses(sentence):
+            if not _md_has_buy_action(clause):
+                continue
+            m = _MD_BUY_LOTS_RE.search(clause)
+            if m is None:
+                m = _MD_MAX_LOTS_RE.search(clause)
+            if m is None:
+                continue
+            code = _md_nearest_code(clause, m.start(), m.end())
+            if code:
+                out.setdefault(code, _md_lots_value(m.group(1)))
+    return out
+
+
+def _md_lots_violations(md_text: str, targets: dict) -> list[str]:
+    """「原文写了手数 ⇒ 计划必须回放同样的手数」的违例列表。
+
+    🔴 2026-11-13 实测事故（A20⑤ 假红 · 真机交付件 `20261113_092926`）：
+       最终裁决写「515450 仅作条件性卫星仓，最高 8%」⇒ 用**权重**表达、**没有手数**
+       ⇒ 计划里 `lots=None` 是**正确**的（计划按 权重×价格÷手数 自己算）
+       ⇒ 旧口径「每个买类都必须有手数」把它判红 ⇒ **假红**。
+    ⇒ 口径：**只有当原文真的给这只标的写了手数时**，才要求计划能回放同样的手数；
+      原文没写 ⇒ `lots=None` 合法。
+    ⇒ 能抓住：手数**抽错**（原文写 1 手、计划写 2 手）/ 手数**漏抽**（原文写了、计划 None）。
+    """
+    want = _md_code_lots(md_text)
+    bad: list[str] = []
+    for code, tgt in sorted(targets.items()):
+        if str(tgt.get("direction") or "") not in ("买", "条件买入"):
+            continue
+        expect = want.get(code)
+        if expect is None:
+            continue  # 原文没写手数 ⇒ 计划 lots=None 合法
+        lots = tgt.get("lots")
+        if isinstance(lots, bool) or not isinstance(lots, int) or lots < 1:
+            bad.append(f"{code}: 原文写明「{expect} 手」，但计划手数={lots!r}"
+                       f"（必须是 {expect} 的整数）")
+        elif lots != expect:
+            bad.append(f"{code}: 原文写明「{expect} 手」，但计划手数={lots!r}"
+                       f"（必须 == {expect}）")
+    return bad
+
+
 def _legacy_char_crop(text: str, limit: int) -> str:
     """**旧裁剪口径**的等价实现：按字符裁「头 1/3 + 省略标记 + 尾 2/3」。
 
@@ -1031,6 +1232,15 @@ def _md_zero_direction_codes(md_text: str) -> tuple[set[str], str]:
                     and all(c in _partial for c in _codes)):
                 # 句级护栏：这是「减仓」不是「清仓」⇒ 不进零方向集合
                 continue
+            # 🔴 2026-11-13 实测事故（A20⑥ 假红）：子句里的零方向词**对象可能不是**
+            #    那只代码（「卖出**四只持仓**」+「将 512800 **降至** 12–16%」）
+            #    ⇒ 被「降至/减至」**直接绑定**的代码是**减仓**（目标权重另给）
+            #    ⇒ 不进零方向集合（**代码级**归属，不是整子句豁免）。
+            #    ⚠️ 「紧跟在动作词后面」的代码是**直接对象** ⇒ 它的零方向判定**不受**
+            #       豁免影响（否则「清仓 900001 并将组合权益降至 10%」会放过真清仓）。
+            _direct = _md_clause_zero_direct_code(clause, _zw)
+            _reduced = _md_clause_reduced_codes(clause)
+            _codes = [c for c in _codes if c == _direct or c not in _reduced]
             from_prose.update(_codes)
     codes = from_table | from_prose
     return codes, (f"最终裁决章节：表格方向列 {len(from_table)} 个代码"
@@ -1159,8 +1369,18 @@ def main() -> int:
             _legal = {"research", "bull", "bear", "final", "trader", "unknown"}
             check("I3 冲突表的说话人必须 ∈ 已知集合",
                   _whos <= _legal, f"出现的说话人={sorted(_whos)}｜未知={sorted(_whos - _legal)}")
-            check("I4 冲突表**不得为空**（LLM 有意见却解析不出 ⇒ 解析器坏了）",
-                  bool(_rows), f"冲突 {len(_rows)} 条")
+            # 🔴 2026-11-13（探针真空假红）：旧口径**无条件**要求冲突表非空
+            #   ⇒ 规则层与 LLM 在 ±2pp 内一致时（冲突表**合法为空**）⇒ **假红**。
+            #   ⇒ 改用**生产同一条判定**（重放 LLM 原文）：有 >2pp 分歧却没进表 ⇒ FAIL；
+            #   无分歧 ⇒ 空表合法；本轮没有 LLM 意见 ⇒ N/A（不适用 ≠ 通过）。
+            _i4_status, _i4_detail = _conflict_table_emptiness(plan, dec_path)
+            if _i4_status == "na":
+                print(f"[N/A] I4 冲突表为空时的合法性判定：{_i4_detail}")
+            else:
+                check("I4 冲突表为空时**必须合法**"
+                      "（重放 LLM 原文有 >2pp 分歧却没进表 ⇒ 解析器坏了；"
+                      "无分歧 ⇒ 空表合法）",
+                      _i4_status == "pass", _i4_detail)
         else:
             check(f"A1 {tag} 冲突集合 == 金标", got == want,
                   f"一致 {len(got)}/{len(want)} 条｜差异 "
@@ -1821,9 +2041,12 @@ def main() -> int:
                   bool(_ev) and _ev[:60] in _md_all,
                   f"证据前 60 字命中={bool(_ev) and _ev[:60] in _md_all}｜{_ev[:80]!r}")
             # ⑤ **可回放**（不写死代码/手数）：
-            #    数据侧：每个「买 / 条件买入」的最终裁决 ⇒ 手数必须是 ≥1 的整数，
-            #      且**决策 md 原文**里能找到对应的手数写法（**照抄解析器的语法**：
-            #      `买 N 手` / `最多 N 手`，中间允许空格或 `**`）。
+            #    数据侧：**原文真的写了手数的那只标的** ⇒ 计划必须能回放**同样的手数**
+            #      （`买 N 手` / `最多 N 手`，**照抄解析器的语法** ⇒ 解析器抽出来的值
+            #      必然一致 ⇒ 不会误杀）。
+            #      🔴 2026-11-13 实测假红：最终裁决写「515450 仅作条件性卫星仓，最高 8%」
+            #         ⇒ 用**权重**表达、**没有手数** ⇒ 计划 `lots=None` 是**正确**的
+            #         ⇒ 旧口径「每个买类都必须有手数」把它判红 ⇒ **假红**。
             #      🔴 **不再要求「至少有一个买入类」**：新一轮合法裁决可以一个买单都没有
             #         （把「必须 ≥1」当金标 = 把**上一份决策的形状**抄成标准 ⇒ 换一轮就误红）。
             #    能力侧（保证**不 vacuous**）：合成一段最终裁决正文（**自造代码**），
@@ -1832,23 +2055,17 @@ def main() -> int:
             #    ⇒ 能抓住：手数抽错（原文写一手、计划写两手）/ 手数漏抽 / 解析器读不出手数。
             _buy_codes = [(c, t) for c, t in sorted(_tgt_map.items())
                           if str(t.get("direction") or "") in ("买", "条件买入")]
-            _lots_bad: list[str] = []
-            for _c, _t in _buy_codes:
-                _lots = _t.get("lots")
-                if isinstance(_lots, bool) or not isinstance(_lots, int) or _lots < 1:
-                    _lots_bad.append(f"{_c}: 手数={_lots!r}（必须是 ≥1 的整数）")
-                    continue
-                if not _md_lots_hit(_md_all, _lots):
-                    _lots_bad.append(f"{_c}: 原文里找不到「{_lots} 手」的写法")
+            _lots_bad = _md_lots_violations(_md_all, _tgt_map)
             _syn5 = ("## 六、最终交易决定\n\n**Executive Summary**: "
                      "对 900001 买 1 手；对 900002 条件买入最多一手。\n")
             _r5 = LF.extract_final_decision(_syn5)
             _l5a = ((_r5.get("targets") or {}).get("900001") or {}).get("lots")
             _l5b = ((_r5.get("targets") or {}).get("900002") or {}).get("lots")
             _syn5_ok = (_l5a == 1 and _l5b == 1)
-            check("A20⑤ 每个**买入类**最终裁决都必须能回放手数（数据侧）+ 解析器必须读得出手数（能力侧）",
+            check("A20⑤ 原文写了手数的**买入类**最终裁决必须能回放手数（数据侧）+ 解析器必须读得出手数（能力侧）",
                   not _lots_bad and _syn5_ok,
                   f"买入类目标 {len(_buy_codes)} 个（本轮可以**一个都没有** ⇒ 不判失败）"
+                  f"｜原文写了手数的标的 {len(_md_code_lots(_md_all))} 个"
                   f"｜回放问题 {_lots_bad[:3]}"
                   f"｜能力侧合成夹具（**自造代码**）：「买 1 手」⇒ lots={_l5a!r}、"
                   f"「最多一手」⇒ lots={_l5b!r}（都必须是 1）")
@@ -1857,6 +2074,10 @@ def main() -> int:
             #    （**表格方向列** + **逐句散文**两个来源；散文按**子句**归属 ⇒
             #     「清仓 A、B、C」这种**列表**写法要全算上；理由格 / 理由句里的代码不算）。
             #    🔴 **部分卖出不算零方向**：「卖出约 2,600 份」是**减仓**，不是清仓。
+            #    🔴 2026-11-13 实测假红：子句里零方向词的**对象可能不是**那只代码
+            #       （「卖出**四只持仓**」+「将 512800 **降至 12–16%**」同子句）
+            #       ⇒ 被「降至/减至」**直接绑定**的代码是**减仓** ⇒ **代码级**豁免
+            #       （`_md_clause_reduced_codes`）⇒ 不许整子句连坐。
             #    ⇒ S 里每个代码：计划里 target_pct == 0.0 + direction ∈ 零方向；
             #      且**不得**掉进 `unparsed_codes`（= 整条漏抽）。
             #    ⇒ 另外：**部分卖出**子句里的代码 ⇒ 计划方向必须是「减」（**不是**卖 / 清仓）。

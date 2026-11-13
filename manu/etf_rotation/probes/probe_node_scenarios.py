@@ -26,7 +26,9 @@ M-S7 之前，`reprice_node_day.py` 只会重算**纯规则层**清单 ⇒ 用�
 【断言清单】
 P1  两个脚本在仓库里常驻（存在 / 非空）
 P2  默认路径零回归：默认产物**无** `meta.scenario`、动作行**无** `scenario_override`
-P3  情景 A/A/A 与默认运行**逐条一致**（股数 / 权重 / 动作）
+P3  情景 A/A/A 与默认运行**逐条一致**（股数 / 目标金额 / 动作；🔴 2026-11-13 起
+    **按原始浮点值比较**，容差只放浮点表示误差 —— 旧口径拿「默认的原始权重」比
+    「聚合件的 4 位小数百分数（展示值）」⇒ 同一笔权重也因打印精度不同被判红）
 P4  聚合件结构完整（情景数 = 2^N / notes 非空 / 3 条断言全 PASS / disclaimer 非空）
 P5  全部情景期末现金**均不为负**且 `feasible`
 P6  所有落地股数都是**整手**（100 股）
@@ -249,6 +251,82 @@ def all_a_scenario(scenarios: list[dict], expect_label: str = "") -> dict | None
     return None
 
 
+#: 🔴 2026-11-13（探针真空假红 · P3）：金额比较容差（元）。
+#:    **只**放**浮点表示误差**（1e-9 量级）⇒ 真实差异照样被拦下：
+#:    权重差 0.001（≈ 30 元）≫ 1e-9 ⇒ 必被报出来。
+#:    🔴 **不许**把它放大到能掩盖真实差异（也不许拿「展示用舍入值」当判据）。
+P3_AMOUNT_TOL = 1e-9
+
+
+def _p3_default_signature(payload: dict) -> dict[str, dict]:
+    """默认（规则层）产物的每条动作 ⇒ `{代码: {股数, 变动, 动作, 目标金额}}`。"""
+    out: dict[str, dict] = {}
+    for row in payload.get("actions") or []:
+        out[str(row.get("code"))] = {
+            "target_shares": row.get("target_shares"),
+            "delta_shares": row.get("delta_shares"),
+            "action": row.get("action"),
+            "target_amount": row.get("target_amount"),
+        }
+    return out
+
+
+def _p3_aaa_signature(scenario: dict) -> dict[str, dict]:
+    """「全 A」情景的每笔交易 ⇒ `{代码: {股数, 变动, 动作, 目标金额}}`（字段与默认侧同构）。"""
+    out: dict[str, dict] = {}
+    for row in scenario.get("trades") or []:
+        out[str(row.get("code"))] = {
+            "target_shares": row.get("target_shares"),
+            "delta_shares": row.get("delta_shares"),
+            "action": row.get("action"),
+            "target_amount": row.get("target_amount"),
+        }
+    return out
+
+
+def _p3_compare(default_sig: dict[str, dict], aaa_sig: dict[str, dict],
+                total_assets: float) -> tuple[list[str], set[str]]:
+    """默认（规则层） vs 「全 A」情景逐条比对 ⇒ `(差异描述, 共同代码集)`。
+
+    🔴 2026-11-13（探针真空假红）**口径换版**：旧口径把
+       「默认产物的**原始权重** `target_weight`」与「聚合件的 **4 位小数百分数**
+       `target_weight_pct`（= `make_node_scenarios.py` 的 `round(w*100, 4)`，
+       **展示用**的舍入值）」放在一起比（还各自 `round(..., 10)`）
+       ⇒ 同一笔权重也会因**打印精度**不同而被判红
+       （实测 512800：默认 0.0533333333 vs A/A/A 0.053333 ⇒ 假红）。
+    ⇒ 正确口径：**按原始浮点值比较**，容差只放**浮点表示误差**（`P3_AMOUNT_TOL`）：
+       · 股数 / 变动股数 / 动作 ⇒ **逐位相等**；
+       · 目标**金额**（两边都存 `round(target_amount, 6)` ⇒ **逐位相同**的原始浮点值）
+         ⇒ 差 > `P3_AMOUNT_TOL` 才算不一致（0.001 权重 ≈ 30 元 ⇒ 必被拦下）。
+       ⇒ **不许**把「展示用舍入值」当判据（那会把真实差异一起放过）。
+    """
+    problems: list[str] = []
+    common = set(default_sig) & set(aaa_sig)
+    for code in sorted(common):
+        left = default_sig[code]
+        right = aaa_sig[code]
+        for field in ("target_shares", "delta_shares", "action"):
+            if left.get(field) != right.get(field):
+                problems.append(
+                    f"{code}: {field} 默认 {left.get(field)!r} vs A/A/A {right.get(field)!r}")
+        left_amount = left.get("target_amount")
+        right_amount = right.get("target_amount")
+        if left_amount is None or right_amount is None:
+            if left_amount != right_amount:
+                problems.append(
+                    f"{code}: 目标金额缺失 默认 {left_amount!r} vs A/A/A {right_amount!r}")
+            continue
+        diff = abs(float(left_amount) - float(right_amount))
+        if diff > P3_AMOUNT_TOL:
+            weight_pp = (diff / total_assets * 100.0) if total_assets else float("nan")
+            problems.append(
+                f"{code}: 目标金额 默认 {float(left_amount):.6f} 元 vs "
+                f"A/A/A {float(right_amount):.6f} 元（差 {diff:.6f} 元 ≈ {weight_pp:.6f}pp 权重）")
+    for code in sorted(set(aaa_sig) - set(default_sig)):
+        problems.append(f"{code}: A/A/A 多出交易项")
+    return problems, common
+
+
 def main() -> int:
     """命令行入口。"""
     ap = argparse.ArgumentParser(description="节点日分歧情景重算闸门")
@@ -328,25 +406,18 @@ def main() -> int:
         if aaa is None:
             p3_problems.append(f"聚合件里找不到「全 A」情景（期望标签 {aaa_label}）")
         else:
-            def sig(d: dict) -> dict:
-                return {x["code"]: (x.get("target_shares"), x.get("delta_shares"),
-                                    round(float(x.get("target_weight") or 0.0), 10),
-                                    x.get("action")) for x in d.get("actions", [])}
-            default_sig = sig(default_payload)
-            aaa_sig = {t["code"]: (t.get("target_shares"), t.get("delta_shares"),
-                                   round(float(t.get("target_weight_pct") or 0.0) / 100.0, 10),
-                                   t.get("action")) for t in aaa.get("trades", [])}
+            # 🔴 2026-11-13（探针真空假红）：**按原始浮点值比较**（见 `_p3_compare` 的口径）
+            #   —— 旧口径拿「默认的原始权重」比「聚合件的 4 位小数百分数（展示值）」
+            #   ⇒ 同一笔权重也因打印精度不同被判红（0.0533333333 vs 0.053333）。
+            default_sig = _p3_default_signature(default_payload)
+            aaa_sig = _p3_aaa_signature(aaa)
             # 默认产物里的「零变动」条目在聚合件里被剔除了 ⇒ 只比共同的（有变动的）条目
-            common = set(default_sig) & set(aaa_sig)
-            for code in sorted(common):
-                if default_sig[code] != aaa_sig[code]:
-                    p3_problems.append(f"{code}: 默认 {default_sig[code]} vs A/A/A {aaa_sig[code]}")
-            for code in sorted(set(aaa_sig) - set(default_sig)):
-                p3_problems.append(f"{code}: A/A/A 多出交易项")
+            p3_problems, common = _p3_compare(default_sig, aaa_sig, _total_assets)
         p3_ok = not p3_problems
-        checker.add("P3", "情景 A/A/A 与默认（规则层）逐条一致", p3_ok,
+        checker.add("P3", "情景 A/A/A 与默认（规则层）逐条一致（股数 / 目标金额 / 动作）", p3_ok,
                     "；".join(p3_problems) if p3_problems
-                    else f"共同 {len(common)} 条交易项的股数/权重/动作全一致")
+                    else f"共同 {len(common)} 条交易项的股数/目标金额/动作全一致"
+                         f"（目标金额 = 权重 × 总资产，容差 {P3_AMOUNT_TOL} 元）")
 
         # --- P4 聚合件结构完整 ---
         p4_problems = []

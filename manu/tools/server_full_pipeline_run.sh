@@ -80,7 +80,30 @@ write_summary(){
     echo
     echo "- 本轮是**观察态**（未开 \`--live-trade\`）：执行卡**结构性挂单禁用**、**不发信**、**不下单**。"
     echo "- 全程未 commit / 未 push；服务器代码由本地 \`sync_to_server.sh\` rsync 同步。"
+    echo
+    echo "## 快照速览（自动追加）"
+    echo
+    local latest f
+    latest="$(ls -1dt "$RUN"/snapshots/*/ 2>/dev/null | head -1)"
+    if [ -z "$latest" ]; then
+      echo "- （本轮**没有**快照目录）"
+    else
+      echo "- 快照目录：\`$latest\`"
+      echo "- 产物清单："
+      for f in "$latest"*; do
+        [ -e "$f" ] || continue
+        echo "  - \`$(basename "$f")\`"
+      done
+    fi
   } > "$SUMMARY"
+
+  # 🔴 2026-11-13：把汇总**同时**落到 `reports/` ⇒ 明早**一条命令**就能取到
+  #    （以前只在编排日志目录里，明早要自己翻文件）。
+  mkdir -p "$RESULTS_ROOT/reports" 2>/dev/null || true
+  # 🔴 2026-11-13（独立审查 D-1）：文件名必须带**信号日**（`reports/` 目录既有口径 =
+  #    `report_<YYYYMMDD>.md` 里的日期是 **asof**）⇒ 夜跑「运行日 ≠ 信号日」时，
+  #    只看文件名**分不清**这份汇总对应哪个信号日。
+  cp -f "$SUMMARY" "$RESULTS_ROOT/reports/full_run_${RUN_TAG}_asof${ASOF_PIPE}_summary.md" 2>/dev/null || true
 }
 
 trap 'write_summary' EXIT
@@ -110,9 +133,25 @@ run_full(){
 run_full "第 1 尝试：--full"
 RC=$?
 if [ "$RC" -ne 0 ]; then
-  say "   ⚠️ 第 1 次 --full 未过 ⇒ 重试一次（**仍用 --full**：行情缺口是根因，不能降级）"
-  run_full "第 2 尝试：--full（重试）"
-  RC=$?
+  # 🔴 2026-11-13（2026-11-12 夜跑实测）：第 1 次失败的**主因是东方财富按 IP 限流**
+  #    （`Push2RateLimitError`）⇒ 原文明确写着「等待期间不要重复调用行情接口，
+  #    否则会延长限流」⇒ **立刻重试 = 再撞一次限流**（2026-11-12 第 2 次尝试
+  #    296 只 ETF 全挂 ⇒ 整轮从「降级成功」变成「全链路失败」）。
+  #    ⇒ 重试前**真的等**（默认 600s，可用 RETRY_BACKOFF_SECONDS 覆盖）。
+  RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-600}"
+  # 🔴 2026-11-13（独立审查 D-2）：**退避只对限流生效**。
+  #    理由：限流的恢复要时间（等待期重复调用只会延长限流）⇒ 该等；
+  #    但若是 LLM/解析侧的真错 ⇒ 等 10 分钟再整轮重跑**纯属浪费**
+  #    （而且会**再调一次 LLM**、再产一份快照）⇒ 直接判失败。
+  if grep -q "Push2RateLimitError" "$LOG_DIR/step2_pipeline/pipeline.log" 2>/dev/null; then
+    say "   ⚠️ 第 1 次 --full 未过（**限流**）⇒ 等 ${RETRY_BACKOFF_SECONDS}s 再重试一次（**仍用 --full**：行情缺口是根因，不能降级；等待期不碰行情接口）"
+    sleep "$RETRY_BACKOFF_SECONDS"
+    run_full "第 2 尝试：--full（重试）"
+    RC=$?
+  else
+    say "   ⚠️ 第 1 次 --full 未过（**非限流**）⇒ **不退避、不重跑**（真错重跑只会再调一次 LLM）；详见 step2_pipeline/pipeline.log"
+    RC=$?
+  fi
 fi
 record "统一流水线真实跑（--full，含 LLM）" "$RC" "step2_pipeline/pipeline.log"
 

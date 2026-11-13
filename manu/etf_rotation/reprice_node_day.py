@@ -890,6 +890,55 @@ def _render_md(payload: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _effective_provider() -> tuple[str | None, str]:
+    """本轮**实际生效**的 qlib 数据源（谁新用谁）⇒ `(数据集覆盖末日, 目录名)`。
+
+    🔴 **2026-11-13 修复（实测：2026-11-13 全量跑批出「假红灯」）**
+    ------------------------------------------------------------------
+    原实现只读 `C.PROVIDER_URI`（= **上游基座** `cn_data`，末日 2026-11-09）⇒
+    阶段 1「自建增量日」派生出的 `cn_data_live`（末日 2026-11-12）对它**完全不可见**
+    ⇒ 明明 S 层**已覆盖**到信号日/节点日（实测 `stock_scores.csv` 最大日期 = 2026-11-12），
+    披露却写成「节点日 2026-11-12 的 S 层**不存在**」⇒ **交付件里一条假红灯**。
+
+    ⇒ 改用**单一事实源** `manu/etf_rotation/qlib_provider.py::select_provider()`
+    （规则：派生目录末日 > 基座 ⇒ 用派生目录），与每日链
+    `daily/run_qlib_score.select_provider`、`daily/agents_rebalance` **同源**
+    ⇒ 研究链与每日链不再各写各的 provider 口径。
+
+    读不到 ⇒ `(None, "")`（**不猜**末日）。
+    """
+    try:
+        import qlib_provider as QP
+
+        provider, _reason = QP.select_provider()
+        return QP.calendar_max_date(provider), Path(provider).name
+    except Exception:  # noqa: BLE001 - 退回基座口径（老行为，不比基座更差）
+        pass
+    try:
+        sys.path.insert(0, str(ROOT / "data"))
+        import signal_policy as SP
+
+        _uri = str(getattr(C, "PROVIDER_URI", "") or "")
+        return SP.calendar_max_date(Path(_uri) / "calendars" / "day.txt"), Path(_uri).name
+    except Exception:  # noqa: BLE001
+        return None, ""
+
+
+def _dataset_coverage_note(node_date: str, max_date: str | None, source: str) -> str:
+    """「节点日有没有 S 层」的如实披露（**只陈述事实，不夸大**）。"""
+    if not max_date:
+        return "（qlib 数据集覆盖末日读不到）"
+    if max_date < node_date:
+        return (
+            f"qlib 数据集只到 **{max_date}** ⇒ 节点日 {node_date} 的 S 层**不存在**"
+            "（专题档 §45）"
+        )
+    return (
+        f"qlib 数据集末日 **{max_date}**（≥ 节点日 {node_date}，数据源 {source}）"
+        "⇒ 节点日 S 层**存在**"
+    )
+
+
 def main() -> int:
     """跑重算；退出码 0 = 产物已写出，1 = 失败（中文错误）。"""
     ap = argparse.ArgumentParser(description="节点日股数/金额重算（只重算价格口径）")
@@ -1087,20 +1136,8 @@ def main() -> int:
 
     stale_notes = [a["price_note"] for a in result["actions"] if a["price_note"]]
     # qlib 数据集覆盖末日（用于「节点日有没有 S 层」的如实披露；读不到就不提）
-    try:
-        sys.path.insert(0, str(ROOT / "data"))
-        import signal_policy as SP
-
-        _cal = Path(str(getattr(C, "PROVIDER_URI", ""))) / "calendars" / "day.txt"
-        _qlib_max = SP.calendar_max_date(_cal)
-    except Exception:  # noqa: BLE001
-        _qlib_max = None
-    _s_note = (
-        f"qlib 数据集只到 **{_qlib_max}** ⇒ 节点日 {node_date} 的 S 层"
-        + ("**不存在**" if _qlib_max and _qlib_max < node_date else "是否可用取决于打分栅格")
-        + "（专题档 §45）"
-        if _qlib_max else "（qlib 数据集覆盖末日读不到）"
-    )
+    _qlib_max, _qlib_src = _effective_provider()
+    _s_note = _dataset_coverage_note(node_date, _qlib_max, _qlib_src)
     # ---- 双口径差异的成文披露（先拼好，避免在 f-string 里嵌表达式）----
     n_differ = int(basis["n_shares_differ_plan_vs_node"])
     if n_differ:
@@ -1125,7 +1162,8 @@ def main() -> int:
         f"🔴 **节点日收盘价 ≠ 执行日成交价**：本清单的股数按 **{node_date} 收盘价**折算，"
         f"实际在执行日 **{execution_date or '（未算出）'} 收盘**成交 ⇒ 成交股数/金额与本表可能不同。",
         f"🔴 **信号未刷新**：本次**只重算股数与金额**，信号（名单 + 目标权重）仍来自计划件"
-        f"（信号日 {plan_asof}）⇒ {_s_note} ⇒ 本表**不是**「按新信号」的清单。",
+        f"（信号日 {plan_asof}）⇒ 本表**不是**「按新信号」的清单。"
+        f"ℹ️ 数据面：{_s_note}。",
         f"🔴 **账户口径可能已过期**：{account_note}。",
         _basis_risk,
         f"🔴 **整手与费用口径**：整手 {LOT} 份、佣金 {commission_bp:.1f} bp + 滑点 "

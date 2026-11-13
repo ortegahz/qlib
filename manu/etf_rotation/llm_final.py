@@ -24,7 +24,9 @@
 ------------------------------------------------------------------
 1. **只抽原文明确写出的数字**；抽不出 ⇒ `target_pct=None` + 说明，**绝不编造**；
 2. 每条抽取都带**原文证据句**（`evidence`）⇒ 可逐条回放校验；
-3. 只认「**最终交易决定**」章节 ⇒ 不把多头/空头/研究经理的正文混进来；
+3. **散文**只认「**最终交易决定**」章节 ⇒ 不把多头/空头/研究经理的正文混进来；
+   （**结构化决策表**是例外：裁决区＝研究经理结论 / Trader 交易计划 / 最终交易决定，
+   只认**目标列**、**只补空** ⇒ 观点表**没有裁决权**）
 4. **动作类词**（卖出/不建仓/不买/买 N 手）按**子句**判定 ⇒ 一个子句里多个代码一起成立
    （如「其余持仓 159929、513330、513770、512690 全部卖出」）；
 5. **权重类数字**（目标权重降至 X% / 保留 N 股 / 硬上限 / 下限 / 止损）按**句**判定，
@@ -166,6 +168,84 @@ _TARGET_PCT_LOOSE_RE = re.compile(
 _PORTFOLIO_PCT_LOOSE_RE = re.compile(
     r"(?:" + _PORTFOLIO_PCT_NOUNS + r")"
     r"\s*(?:约|大约|约等于|≈)\s*[\*（(]{0,3}\s*(\d+(?:\.\d+)?)\s*%")
+
+#: 🔴 2026-11-13（真实交付件 `snapshots/20261112_181544` 实证）：**代码锚定**的紧致写法。
+#:
+#: Trader 的最终裁决常把整套方案压成**一句**「代码 + 目标设定词/档位 + 数字%」：
+#:     「本轮最终采用**"`512800`减至20%、`515450`标准档20%、否决`515650`、
+#:       其余弱仓退出、权益上限40%、约60%现金"**的方案」
+#: ⇒ 旧口径**只认「权重名词（目标权重/权重/仓位/目标/风险预算）+ 动词 + 数字%」**
+#:    ⇒ 这两只都**抽不出** ⇒ `target_pct=None` ⇒ `unparsed_codes` 里挂 `512800`/`515450`
+#:    ⇒ `make_decision_scenarios` 硬失败（「不许用默认值蒙混」）⇒ 重建链转红
+#:    （2026-11-12 夜跑实测：`llm_final_decision.targets[515450]缺少必需字段 target_pct`）。
+#:
+#: 🔴 **口径纪律**（**不许**放宽成模糊窗口）：
+#:    ① **代码必须紧邻**（中间只允许 markdown 记号与空白）⇒ 数字不会安到别的标的头上；
+#:    ② 中间的词**只认闭集**（目标设定动词 / 档位词）且**至少要有一个**
+#:       ⇒ 「512800当前权重7.90%」这类**当前状态**数字**抽不出**
+#:       （宁可抽不出，也**不许**把现值当目标权重）；
+#:    ③ **裸「到/至」不收** ⇒ 「512800涨到20%」不会被当成目标；
+#:    ④ **只补空**：`_set` 先到先得 ⇒ 严格规则已抽到的值**不被本规则覆盖**。
+_TERSE_TARGET_VERBS = (
+    r"减至|减到|降至|降到|下调至|下调到|调至|调到|调整至|调整到|"
+    r"压缩至|压缩到|压至|压到|定为|设为|定在|定到|控制在|限定在|"
+    r"只给|仅给|配置|给"
+)
+#: 档位词（LLM 自创的仓位档说法：**不是**权重名词，但后面跟的数字就是目标权重）
+_TERSE_TARGET_BANDS = r"标准档位|标准档|标准槽位|标准仓位|档位|档|槽位"
+#: 🔴 2026-11-13（独立审查 A-1）：**否决/备选语境**词表。
+#:    实测：「`515650`调至20%的备选方案被否决。」⇒ 若不设防 ⇒ 会被发一个**目标 20%**
+#:    ⇒ 交付件里「LLM 最终裁决目标权重 20%」对一只**被一票否决**的标的是**错的**。
+_TERSE_REJECT_MARKERS: tuple[str, ...] = (
+    "否决", "放弃", "不采用", "未采纳", "不考虑", "剔除", "排除", "移除",
+    "备选", "原方案", "不作为", "不予", "搁置",
+)
+
+
+def _has_reject_marker(text: str) -> bool:
+    """这段文字里有没有**否决/备选**语境（粗判，仅作辅助）。"""
+    return any(marker in (text or "") for marker in _TERSE_REJECT_MARKERS)
+
+
+def _reject_bound_codes(sentence: str) -> set[str]:
+    """句子里**被否决/备选语境管到**的代码集合。
+
+    🔴 2026-11-13（独立审查 A-1 + 实测修）：**同一个否决词可能管的是别的标的**。
+       实测真实原文：「`512800`减至20%、`515450`标准档20%、**否决**`515650`、…」
+       ⇒ 「否决」紧跟在 515450 后面，但它**管的是下一只 515650**
+       ⇒ 若按「邻近即命中」判 ⇒ **515450 被误伤**（target_pct 抽不出 ⇒ 又回到硬失败）。
+       ⇒ 口径：**逐个否决词判定它绑定的是哪只**——
+          ① 后面紧跟代码（「否决`515650`」）⇒ **绑后面那只**；
+          ② 后面没有代码 ⇒ **绑前面最近那只**（「`515650`调至20%的备选方案被否决」）。
+    """
+    bound: set[str] = set()
+    for marker in _TERSE_REJECT_MARKERS:
+        start = 0
+        while True:
+            pos = sentence.find(marker, start)
+            if pos < 0:
+                break
+            start = pos + len(marker)
+            tail = sentence[pos + len(marker): pos + len(marker) + 8]
+            m = _CODE_RE.search(tail)
+            if m is not None:
+                bound.add(m.group(1))
+                continue
+            head_codes = [mm.group(1) for mm in _CODE_RE.finditer(sentence[:pos])]
+            if head_codes:
+                bound.add(head_codes[-1])
+    return bound
+
+
+_TERSE_TARGET_RE = re.compile(
+    r"(?P<code>(?<![\d.])[1-9]\d{5}(?!\d))"
+    r"[\*`）)）:：|\s]{0,4}"
+    r"(?:" + _TERSE_TARGET_VERBS + r"|" + _TERSE_TARGET_BANDS + r")"
+    r"[\*`）)）:：|\s]{0,4}"
+    r"(?:" + _TERSE_TARGET_VERBS + r"|" + _TERSE_TARGET_BANDS + r")?"
+    r"[\*`）)）:：|\s]{0,4}"
+    r"(?:约|大约|约等于|≈)?\s*"
+    r"[\*（(]{0,3}\s*(?P<pct>\d+(?:\.\d+)?)\s*%")
 
 #: 🔴 2026-11-05 09:3x（M-Q 修）：**条件句**里的数字**不是**最终裁决。
 #:    实测：「若512800的E转负但mom120仍为正且未有效跌破MA60，将仓位进一步降至约10%」
@@ -412,6 +492,61 @@ def _to_lots(text: str) -> int:
     return _CN_NUM.get(raw, 1)
 
 
+#: 🔴 2026-11-13（真缺陷 · **真否决被放过**）：「**不满足**持有**条件**即剔除512800」
+#:    ⇒ 那句里的「条件」是「不满足」的**宾语**（条件**没达标**＝既成事实），
+#:    **不是**条件句的**触发器** ⇒ 旧口径把整句当条件句 ⇒ **豁免否决判定**
+#:    ⇒ **真否决**（剔除）被放过 ⇒ 交付层让本该出局的标的继续留在组合里。
+#:    ⚠️ 词表口径：只认「**不满足/未满足/未达到/不符合/达不到/不达标/不成立** …」
+#:       这类**明确的「未达标」**表述；「不满足…的**必要性**」**不在**此列
+#:       （那是**否定剔除本身**，由 `_REJECT_NEG_NECESSITY_RE` 单独处理）。
+_COND_FAIL_RE = re.compile(
+    r"(?:不满足|未满足|未达到|不符合|达不到|不达标|不成立)"
+    r"[^，,；;：:\n]{0,12}?"
+    r"(?:条件|标准|门槛|要求|阈值)"
+)
+
+#: 「**不满足/未达到/…**」**之前**出现这些词 ⇒ 这是**前瞻条件**（不是既成事实）
+#:    ⇒ 「512800**若**不满足持有条件，则剔除512800。」**不许**判成否决。
+_COND_FAIL_HYPOTHETICAL_WORDS: tuple[str, ...] = (
+    "若", "如果", "假如", "倘若", "一旦", "除非", "只有当", "只有在",
+)
+
+#: 「**条件没达标 ⇒ 直接出局**」的**剔除类**动词（**只有**这些才允许改判）。
+_REJECT_DEF_VERBS: tuple[str, ...] = (
+    "剔除", "排除", "否决", "移除", "回避", "踢出", "去掉",
+)
+
+
+def _is_definitive_rejection(sentence: str) -> bool:
+    """这句是不是「**条件没达标 ⇒ 直接剔除**」的**既成否决**（⇒ 不按条件句豁免）。
+
+    🔴 2026-11-13：`_is_conditional` 见到首子句里的「条件」就判条件句
+       ⇒ 「512800不满足持有条件即剔除512800。」被**整句豁免** ⇒ 真否决被放过。
+
+    ⚠️ 三重护栏（避免把**真条件句**误改判）：
+       ① 必须真的出现「**未达标**」的表述（`_COND_FAIL_RE`）；
+       ② 「条件」后面若跟「**时/则/便/将**」⇒ 那是**时间条件**
+          （「不满足条件**时**目标权重降至10%」）⇒ 仍按条件句处理；
+       ③ 必须带**剔除类**动词（否则只是「条件没达标」，不是否决）。
+    """
+    text = sentence or ""
+    m = _COND_FAIL_RE.search(text)
+    if not m:
+        return False
+    # ② 失败短语**之前**有假设连词 ⇒ 这是**前瞻条件**，不是既成事实
+    #    （「512800**若**不满足持有条件，则剔除512800。」⇒ 不许判成否决）
+    if any(w in text[:m.start()] for w in _COND_FAIL_HYPOTHETICAL_WORDS):
+        return False
+    # ③ 失败短语**之后**（跳过分隔符）的第一个词是「时/则/便/将/就」
+    #    ⇒ **时间/结果条件** ⇒ 仍按条件句处理
+    _tail = re.sub(r"^[，,、；;。\s]+", "", text[m.end():])
+    if re.match(r"(?:则|便|将|就|时)", _tail):
+        return False
+    # ④ 剔除动词必须与失败短语**同一子句**（否则主语可能串味）
+    _clause = re.split(r"[，,；;。\n]", text)[0]
+    return any(v in _clause for v in _REJECT_DEF_VERBS)
+
+
 def _is_conditional(sentence: str) -> bool:
     """判断一个句子是不是**条件句**（条件句里的数字**不是**最终裁决）。
 
@@ -430,6 +565,10 @@ def _is_conditional(sentence: str) -> bool:
     for word in _CONDITIONAL_WORDS:
         if head.startswith(word):
             return True
+    # 🔴 2026-11-13：句首是「**若/如果/…**」的**假设**已在上面返回（优先级最高）。
+    #    下面只处理「**既成事实**」的否决（见 `_is_definitive_rejection`）。
+    if _is_definitive_rejection(head):
+        return False
     # 🔴 2026-11-05 10:3x（M-Q 修）：「降级条件：…⇒ 残仓一次性清零」是**触发器**，
     #    不是本轮裁决 ⇒ 但「条件买入/条件建仓」是**动作** ⇒ 判条件前先抹掉它。
     probe = _COND_BUY_SPAN.sub("", head)
@@ -530,6 +669,284 @@ def _clause_spans(sentence: str, base: int) -> list[tuple[int, int, str]]:
             start = idx + 1
     out.append((base + start, base + len(sentence), sentence[start:]))
     return [sp for sp in out if sp[2].strip()]
+
+
+#: ── 结构化决策表（Trader 把整套方案写成 markdown 表）────────────────────────
+#:
+#: 🔴 2026-11-13（真实交付件 `snapshots/20261113_092926` 实证）：Trader 会把最终方案
+#:    写成**表**「标的 | 方向 | 目标 | 执行理由」：
+#:
+#:        | **512800** | **减** | **16%目标，20%不再是执行目标** | 保留相对最强仓… |
+#:        | **515450** | **买（条件性）** | **最高16%** | 仅在复核后仍入选… |
+#:        | **515650** | **不买，正式一票否决** | **0%** | E=-0.8598… |
+#:
+#:    而「最终交易决定」章节是**散文**（数字写在不带代码的句子里：「减至 12% 基础目标」
+#:    「最高 8%」）⇒ 旧口径（散文 + 权重名词 + 动词）**一个字都抽不出**
+#:    ⇒ `target_pct=None` ⇒ `make_decision_scenarios` 硬失败（「不许用默认值蒙混」）
+#:    ⇒ 重建链转红（2026-11-13 09:29 实测：`targets[512800]缺少必需字段 target_pct`）。
+#:
+#: 🔴 **口径纪律**：
+#:    ① **只认权威区**（「最终交易决定」章节 ＋「Trader 交易计划」章节）⇒ 多头/空头的
+#:       观点表**没有**裁决权（与既有 `AUTHORITY_SECTIONS` 同源）；
+#:    ② **只认目标列**（表头含「目标/权重/仓位/敞口」的那一列）⇒ **理由列里的数字一律不看**
+#:       （理由列写着「将 22.54% 的当前超配降回标准槽位」⇒ 那是**现值**，不是目标）；
+#:    ③ **只认该列的第一个有效数字%**，并剔除被「不再是/硬上限/至少…」修饰的数
+#:       （「16%目标，20%不再是执行目标」⇒ 16%，不是 20%）；
+#:    ④ **只补空**（`_set` 先到先得）⇒ 散文抽得到的**一律以散文为准**（口径不被污染）。
+_TABLE_TARGET_HEADER_WORDS: tuple[str, ...] = (
+    "目标", "权重", "仓位", "敞口", "风险目标",
+)
+#: 🔴 2026-11-13（独立审查 + 变异探针实证）：**现值列**不许被当成目标列。
+#:    旧口径是「表头含『目标/权重/仓位/敞口』就算目标列」⇒「**当前权重**」含「权重」
+#:    ⇒ 取到**现值** 22.54% 当目标权重（静默产出错误数字，且来源标签写着「目标列」
+#:    ⇒ 回放时完全看不出错）。
+_TABLE_CURRENT_HEADER_WORDS: tuple[str, ...] = (
+    "当前", "现有", "原始", "原持仓", "原仓位", "现值", "调整前", "原值",
+)
+#: 🔴 2026-11-13（独立审查 + 变异探针实证）：「**从 20% 降至 10%**」/「**由 22.54% 降至 10%**」
+#:    ⇒ 目标是**转变之后**那个数（10%）；前面的 20%/22.54% 是**现值**。
+#:    ⚠️ 旧口径把「由/从」放进 `SKIP_BEFORE` ⇒ 两个数**都被**跳过 ⇒ 整格 `None`
+#:    ⇒ `target_pct` 缺失 ⇒ `make_decision_scenarios` 硬失败（与本次要修的缺陷同类）。
+_TABLE_TRANSITION_RE = re.compile(
+    r"(?:降至|减至|降到|调至|下调至|下调到|压缩至|压缩到|调整至|调整到)"
+)
+#: 目标格里「数字**前面/后面**」只看**紧邻**的那一段（到最近的标点/括号为止）
+#:    ⇒ 修旧「8 字滑窗」把**别的分句**的排除词也算了进来（假绿：抽不出就静默 None）。
+_TABLE_DELIM_RE = re.compile(r"[，,；;：:、（）()【】\[\]「」『』|｜]")
+_TABLE_SEP_CELL_RE = re.compile(r"^:?-{2,}:?$")
+_TABLE_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+#: 目标格里**不是目标**的数字（出现在数字**前面** ⇒ 跳过）
+_TABLE_PCT_SKIP_BEFORE: tuple[str, ...] = (
+    "不再是", "不是", "并非", "硬上限", "上限", "至少", "不超过", "不低于",
+    "高于", "低于", "现值", "当前",
+)
+#: 目标格里**不是目标**的数字（出现在数字**后面** ⇒ 跳过）
+_TABLE_PCT_SKIP_AFTER: tuple[str, ...] = (
+    "不再是", "不是", "并非", "已失效", "作废", "不再执行", "硬上限",
+)
+
+
+def _table_target_pct(cell: str) -> float | None:
+    """目标列 ⇒ 目标权重（**抽不出就返回 None**，绝不编造）。
+
+    🔴 2026-11-13（三处口径修正，均由独立审查 + 变异探针实证）：
+       ① **转变标记优先**：「从 20% 降至 10%」⇒ **10%**（转变之后那个数）。
+       ② **排除词只看紧邻段**（旧口径用 8 字滑窗 ⇒「现值 22.54% ⇒ 目标 16%」里
+          16% 的窗口也含「现值」⇒ 整格 `None` ⇒ **静默抽不出**）。
+       ③ **前/后排除词都成对**：「硬上限12%，执行目标16%」⇒ 16%（12 被「硬上限」否掉）。
+    """
+    text = re.sub(r"[*`\s]", "", cell or "")
+    if not text:
+        return None
+    tm = _TABLE_TRANSITION_RE.search(text)
+    if tm:
+        nxt = _TABLE_PCT_RE.search(text[tm.end():])
+        if nxt:
+            return _norm_pct(float(nxt.group(1)))
+    for m in _TABLE_PCT_RE.finditer(text):
+        before = text[max(0, m.start() - 10):m.start()]
+        after = text[m.end():m.end() + 10]
+        if _table_skip_before(before) or _table_skip_after(after):
+            continue
+        return _norm_pct(float(m.group(1)))
+    return None
+
+
+def _table_skip_before(before: str) -> bool:
+    """目标格里这个数**前面紧邻**的那段是不是「不是目标的数」（⇒ 跳过这个数）。"""
+    seg = _TABLE_DELIM_RE.split(before)[-1]
+    return any(w in seg for w in _TABLE_PCT_SKIP_BEFORE)
+
+
+def _table_skip_after(after: str) -> bool:
+    """目标格里这个数**后面紧邻**的那段是不是「不是目标的数」（⇒ 跳过这个数）。"""
+    seg = _TABLE_DELIM_RE.split(after)[0]
+    return any(w in seg for w in _TABLE_PCT_SKIP_AFTER)
+
+
+def _table_direction(cell: str) -> str | None:
+    """方向列 ⇒ 方向（口径与既有 `_ACTION_RULES` 的方向词同源）。
+
+    🔴 2026-11-13（独立审查 + 变异探针实证）：**否定护栏缺失** ⇒
+       「不清仓 / 不卖出 / 不减」被当成「卖 / 减」⇒ 方向落进 `direction_vocab.ZERO`
+       而目标权重 > 0 ⇒ **违反 ZERO 不变量**（守卫 `LLM_DIRECTION_ZERO` 会拦）。
+       ⇒ 现在：**每个动作词都过 `_negated`**；全被否掉 ⇒ 抽不出方向（返回 None，**不编造**）。
+    """
+    text = re.sub(r"[*`\s]", "", cell or "")
+    if not text:
+        return None
+
+    def _hit(words: tuple[str, ...]) -> str | None:
+        """这些词里第一个**未被否定**的（⇒ 动作成立）。"""
+        for word in words:
+            for m in re.finditer(re.escape(word), text):
+                if not _negated(text, m.start(), m.group(0)):
+                    return word
+        return None
+
+    if _hit(("否决", "不买", "不建仓", "不配置", "不参与", "不纳入")):
+        return "不买"
+    if _hit(("减",)):
+        return "减"
+    if _hit(("清仓", "清掉", "卖出", "卖掉", "退出", "卖")):
+        return "卖"
+    if _hit(("买入", "买", "建仓", "配置")):
+        return "条件买入" if "条件" in text else "买"
+    if _hit(("持有", "维持", "观察", "持")):
+        return "持"
+    return None
+
+
+#: 🔴 2026-11-13（真实交付件 `snapshots/20261113_092926` 实证）：**裁决区**的章节。
+#:    Trader 把**结构化决策表**（「标的 | 方向 | 目标 | 理由」）写在
+#:    「研究经理结论」/「Trader 交易计划」章里，而「最终交易决定」章是**散文**
+#:    ⇒ 只读散文 ⇒ 表里的目标权重**抽不出来**（`target_pct=None`）
+#:    ⇒ `make_decision_scenarios` 硬失败 ⇒ 重建链转红。
+#:    ⚠️ **只认这三个章** ⇒ 多头/空头/风险三方的**观点表**没有裁决权
+#:       （与既有 `AUTHORITY_SECTIONS` 同源）；「辩论裁决 / 风险裁决」里的表**不采信**
+#:       （那是陪审团意见，不是 Trader 的执行目标）。
+_DECISION_REGION_KEYWORDS: tuple[str, ...] = (
+    "研究经理结论", "研究经理", "Trader 交易计划", "Trader交易计划",
+    "交易计划", "最终交易决定", "最终交易决策",
+)
+
+
+def _heading_has_keyword(line: str, keywords: tuple[str, ...]) -> bool:
+    """标题行里是否**命中**裁决区关键词（🔴 必须「**词边界**」命中）。
+
+    🔴 2026-11-13（独立审查 NIT）：旧口径是裸 `k in line` ⇒「## 四、风险官意见与**交易计划**调整」
+    「## 五、**交易计划**（初稿）」这类**非裁决章**也被扫进裁决区 ⇒ 观点表可能被当成裁决表。
+    ⇒ 现在：关键词后面必须**到标题末尾**或紧跟**非文字**字符（括号/书名号/空格…）
+    ⇒「研究经理结论（Research Manager）」「Trader 交易计划」「最终交易决定（原始输出）」都命中；
+      而「交易计划调整」（关键词后紧跟汉字）**不**命中。
+    """
+    title = line.lstrip("#").strip()
+    for k in keywords:
+        pos = title.find(k)
+        while pos >= 0:
+            nxt = title[pos + len(k):pos + len(k) + 1]
+            if not nxt or not re.match(r"[一-鿿A-Za-z0-9]", nxt):
+                return True
+            pos = title.find(k, pos + 1)
+    return False
+
+
+def _chapters_by_keyword(text: str, keywords: tuple[str, ...]) -> list[str]:
+    """按标题关键词取**所有**匹配章节（含子章节）⇒ 返回章节列表。"""
+    lines = (text or "").splitlines()
+    heads: list[tuple[int, int]] = []   # (行号, 井号层级)
+    for idx, line in enumerate(lines):
+        if line.startswith("#") and _heading_has_keyword(line, keywords):
+            heads.append((idx, len(line) - len(line.lstrip("#"))))
+    out: list[str] = []
+    for start, level in heads:
+        chunk = [lines[start]]
+        for line in lines[start + 1:]:
+            if line.startswith("#"):
+                lv = len(line) - len(line.lstrip("#"))
+                if lv <= level:
+                    break
+            chunk.append(line)
+        out.append("\n".join(chunk))
+    return out
+
+
+def _decision_region(text: str) -> str:
+    """**最终裁决区** = 研究经理结论 / Trader 交易计划 / 最终交易决定 三章（若有）。
+
+    🔴 为什么要在这些章里找**结构化决策表**：
+       Trader 常把最终方案写成表，而「最终交易决定」章是散文
+       ⇒ 只读散文 ⇒ 表里的目标权重**抽不出来**（2026-11-13 实测：`targets[512800]`
+       缺少 `target_pct` ⇒ `make_decision_scenarios` 硬失败 ⇒ 重建链转红）。
+    ⇒ 三章都是**权威裁决**（与 `AUTHORITY_SECTIONS` 同源）⇒ 合起来才是裁决区。
+    """
+    parts: list[str] = []
+    sec = extract_section(text)
+    if sec:
+        parts.append(sec)
+    for chapter in _chapters_by_keyword(text, _DECISION_REGION_KEYWORDS):
+        parts.append(chapter)
+    return "\n\n".join(parts)
+
+
+def _authority_target_rows(region: str) -> list[dict]:
+    """裁决区里的「标的 | 方向 | 目标 | 理由」表 ⇒ 逐行 [{cells, target_idx, line}]。"""
+    rows: list[dict] = []
+    seen_lines: set[str] = set()
+    lines = (region or "").splitlines()
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip().startswith("|"):
+            idx += 1
+            continue
+        header = _table_cells(line)
+        sep_line = lines[idx + 1] if idx + 1 < len(lines) else ""
+        sep_cells = _table_cells(sep_line) if sep_line.strip().startswith("|") else []
+        is_sep = bool(sep_cells) and all(_TABLE_SEP_CELL_RE.match(c) for c in sep_cells)
+        if not (is_sep and len(header) >= 3):
+            idx += 1
+            continue
+        target_idx = _table_target_col(header)
+        if target_idx is None:
+            idx += 1
+            continue
+        dir_idx = _table_direction_col(header)
+        j = idx + 2
+        while j < len(lines) and lines[j].strip().startswith("|"):
+            cells = _table_cells(lines[j])
+            if cells:
+                _line = " ".join(lines[j].split())
+                # 🔴 2026-11-13（独立审查 NIT）：裁决区里最终章被扫了**两遍**
+                #    （`extract_section` + `_chapters_by_keyword`）⇒ 同一行会重复出现
+                #    ⇒ 按**行文本**去重（结果不变，但不白跑一趟）。
+                if _line not in seen_lines:
+                    seen_lines.add(_line)
+                    rows.append({
+                        "cells": cells,
+                        "target_idx": target_idx,
+                        "dir_idx": dir_idx,
+                        "line": _line,
+                    })
+            j += 1
+        idx = j
+    return rows
+
+
+def _table_target_col(header: list[str]) -> int | None:
+    """表头 ⇒ **目标列**的列号（抽不出返回 None ⇒ 整张表不采信）。
+
+    🔴 2026-11-13（独立审查 + 变异探针实证）：旧口径是「`range(2, len)` 里取**第一个**含
+       「目标/权重/仓位/敞口」的列」⇒ 两个坑：
+       ① **现值列被当成目标列**：「当前权重」含「权重」⇒ 取到**现值** 22.54%
+          （静默产出错误目标权重，且来源标签写着「目标列」⇒ 回放时看不出错）；
+       ② **目标列在 index1** 的常见版式「标的 | 目标权重 | 方向 | 理由」被**整张丢弃**
+          ⇒ 又回到 `target_pct=None` 的硬失败。
+    ⇒ 现在：① 先**排除现值列**（当前/现有/原始/调整前/现值…）；
+       ② **全列**找候选（不再跳过 index1）；
+       ③ 多个候选时按「目标/风险目标 > 权重/仓位/敞口」取**最具体**的那个。
+    """
+    cands: list[int] = []
+    for i, h in enumerate(header):
+        if any(w in h for w in _TABLE_CURRENT_HEADER_WORDS):
+            continue
+        if any(w in h for w in _TABLE_TARGET_HEADER_WORDS):
+            cands.append(i)
+    if not cands:
+        return None
+    for i in cands:
+        if "目标" in header[i]:
+            return i
+    return cands[0]
+
+
+def _table_direction_col(header: list[str]) -> int | None:
+    """表头 ⇒ **方向列**的列号（没有就 None ⇒ **不猜**）。"""
+    for i, h in enumerate(header):
+        low = h.lower()
+        if any(w in low for w in ("方向", "动作", "action")):
+            return i
+    return None
 
 
 def extract_final_decision(text: str) -> dict:
@@ -783,6 +1200,78 @@ def extract_final_decision(text: str) -> dict:
             _set(owner, "post_trade_pct", _norm_pct(float(mm.group(2))),
                  sentence.strip(), "原文「调仓后权重」")
 
+    # ---- 第 1.5 遍：**结构化决策表**（Trader 的「标的 | 方向 | 目标 | 理由」表）----
+    #    🔴 2026-11-13（真实交付件 `snapshots/20261113_092926` 实证）：
+    #       「最终交易决定」章是**散文**（「减至 12% 基础目标」「最高 8%」…）
+    #       ⇒ 散文遍抽不出 `target_pct` ⇒ `make_decision_scenarios` 硬失败 ⇒ 重建链转红。
+    #    ⇒ 现在额外读**裁决区**里的结构化表：**只认目标列**、**只认第一个有效数字%**、
+    #       **只补空** ⇒ 散文抽得到的一律以散文为准（口径不被污染）。
+    for _row in _authority_target_rows(_decision_region(text)):
+        _cells = _row["cells"]
+        # 🔴 2026-11-13（独立审查 + 变异探针实证）：**代码只认「标的列」**。
+        #    旧口径在标的列没有代码时**扫全部格** ⇒ 「组合整体 | 减仓 | 10% | 主要是512800…」
+        #    ⇒ 512800 拿到**组合级** 10%，且来源标签谎称来自「标的列」。
+        #    ⇒ 标的列没有代码 ⇒ 整行跳过（**不回落**到理由列）。
+        _codes = [m.group(1) for m in _CODE_RE.finditer(_cells[0])] if _cells else []
+        if not _codes:
+            continue
+        _ti = int(_row["target_idx"])
+        if _ti >= len(_cells):
+            continue
+        _pct = _table_target_pct(_cells[_ti])
+        _di = _row.get("dir_idx")
+        if _di is None:
+            # 无「方向」表头 ⇒ 兼容旧版式「标的 | 方向 | 目标 | 理由」，
+            # 但**不得**把**目标列**当成方向列。
+            _di = 1 if (1 != _ti and len(_cells) > 1) else None
+        _dir = (_table_direction(_cells[int(_di)])
+                if _di is not None and int(_di) < len(_cells) else None)
+        for _code in _codes:
+            if _pct is not None:
+                _set(_code, "target_pct", _pct, _row["line"],
+                     "最终裁决表（标的/方向/目标列）")
+            if _dir:
+                _sl = _slot(_code)
+                if _sl["direction"] is None:
+                    _sl["direction"] = _dir
+                    if not _sl.get("evidence"):
+                        _sl["evidence"] = _row["line"][:_EVIDENCE_MAX]
+
+    # ---- 第 2 遍之补（**独立一遍**）：**代码锚定**的紧致写法（2026-11-13 实证）----
+    #    「`512800`减至20%、`515450`标准档20%」⇒ 旧口径（权重名词 + 动词）抽不出
+    #    ⇒ 这两只 `target_pct=None` ⇒ `make_decision_scenarios` 硬失败 ⇒ 重建链转红。
+    #
+    #    🔴 **必须独立成一遍**（2026-11-13 独立审查实证）：若与严格规则**逐句交错**，
+    #    则「先出现的紧致句」会赢过「后出现的严格句」（`_set` 先到先得）
+    #    ⇒ 「`512800`减至20%。512800目标权重降至12%。」会取到 **20.0**（宽松口径压过
+    #    严格口径）⇒ 与「严格规则优先」的口径**不一致**。
+    #    ⇒ 现在：**先把整节严格规则跑完**，再跑这一遍 ⇒ 严格规则**全局**优先。
+    for s_start, s_end, sentence in _sentence_offsets(section):
+        if _is_conditional(sentence):
+            continue
+        # 🔴 **坐标口径**：`mm.start()` 是**句内相对偏移**；`_clause_spans` 返回的是
+        #    **绝对偏移**（base=s_start）⇒ 二者**必须**先统一到句内相对口径再比较
+        #    （2026-11-13 首版混用 ⇒ 否决语境守卫**没生效**，实测「备选方案被否决」
+        #    仍被抽成 20.0 ⇒ 独立审查 A-1 差点漏修）。
+        rejected_codes = _reject_bound_codes(sentence)
+        clause_spans = [(cs - s_start, ce - s_start)
+                        for cs, ce, _clause in _clause_spans(sentence, s_start)]
+        code_spans = [(mm.start(), mm.end()) for mm in _CODE_RE.finditer(sentence)]
+        for mm in _TERSE_TARGET_RE.finditer(sentence):
+            c_start, c_end = 0, len(sentence)
+            for cs, ce in clause_spans:
+                if cs <= mm.start() < ce:
+                    c_start, c_end = cs, ce
+                    break
+            # 🔴 **否决/备选语境守卫**（独立审查 A-1）：被否决/备选/未采纳的标的
+            #    **不许**拿到目标权重（否则交付件会给一只被一票否决的标的编出「目标 20%」）。
+            #    🔴 判定口径 = **这个否决词绑的是哪只**（`_reject_bound_codes`）
+            #    ⇒ 同一个句子里「否决`515650`」**不会**误伤前面的 515450。
+            if mm.group("code") in rejected_codes:
+                continue
+            _set(mm.group("code"), "target_pct", _norm_pct(float(mm.group("pct"))),
+                 sentence.strip(), "原文「代码 + 目标设定词/档位 + 数字%」（紧致写法）")
+
     # ---- 第 3 遍：补齐「买 N 手 ⇒ 目标权重取调仓后权重」 ----
     for code, slot in targets.items():
         if slot["target_pct"] is None and slot["post_trade_pct"] is not None \
@@ -934,6 +1423,28 @@ _REJECT_REASON_MAX = 200
 #: 百分比（权重）——「目标权重 > 0%」⇒ 该表格行不是否决。
 _PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
+#: 🔴 2026-11-13（真实交付件 `snapshots/20261113_092926` 实证）：**范围级**宾语。
+#:    「放弃**整个银行主题**偏于反应过度」= 放弃**主题** ⇒ 不是否决某一只代码。
+#: 🔴 2026-11-13：被「不选」的**方案名**（动作/立场词）⇒ 「不选 <方案名>」= 不采用那个方案
+#:    ⇒ **不是**否决某一只代码（实测：「不选Sell：512800仍具有…」）。
+#:    ⚠️ 必须**非空**且**后面不是代码** ⇒ 表格动作格里光秃秃的「不选」**仍判否决**
+#:    （`tests/test_llm_rejections.py::test_表格行剔除命中且名称取下一格` 钉死这条）。
+#: 🔴 2026-11-13（独立审查 + 变异探针实证）：「不选 <方案名>」里**只有「处置既有仓位」类**
+#:    方案名才**豁免**（Sell / Reduce / Trim / Exit / 清仓 / 卖出 / 减仓 / 减持）
+#:    ——「不选Sell：512800仍具有…」= 研究经理在解释「**为什么不选**那个方案」⇒ 不是否决 512800。
+#:    ⚠️ 「**建仓/持有**类」方案名（Buy / Add / Hold / 买入 / 加仓 / 持有 / 维持）
+#:    ⇒「不选买入512800」= **真否决** ⇒ **不许**豁免
+#:    （旧口径把两类混在一个闭集 ⇒ 真否决被放过）。
+_REJECT_EXIT_PLAN_RE = re.compile(
+    r"(?:sell|reduce|trim|exit|清仓|卖出|减仓|减持|清掉)",
+    re.IGNORECASE,
+)
+
+_REJECT_SCOPE_AFTER: tuple[str, ...] = (
+    "整个", "全部", "整体", "全仓", "全组合", "该主题", "这个主题", "主题",
+    "组合", "该板块", "这个板块", "板块", "全市场",
+)
+
 _REJECT_VERB_RES: tuple[tuple[str, re.Pattern], ...] = tuple(
     (v, re.compile(re.escape(v), re.IGNORECASE)) for v in _REJECT_VERBS
 )
@@ -1017,9 +1528,57 @@ def _reject_verb_hits(text: str) -> list[tuple[int, str]]:
             #    （`不买也不卖 512800` = 维持 ⇒ 不是否决；旧口径只认紧邻的「卖」）。
             if re.match(r"[\s*`_~]*(?:也|则|并|且)?不?(" + keep_alt + ")", text[m.end():]):
                 continue
+            _tail = text[m.end():].lstrip("`*（( ")
+            # 🔴 2026-11-13（真实交付件 `snapshots/20261113_092926` 实证）：
+            #    「**不选 <方案名>**」= 研究经理在解释「**为什么不选**空头的 Sell 方案」
+            #    ⇒ 「不选」后面跟的是**方案名**（Sell / 清仓 / 减持…）而不是**代码**
+            #    ⇒ **不是**否决那只代码。
+            #    实测误伤：「- 不选Sell：512800仍具有入选组合中最完整的相对趋势证据…」
+            #    ⇒ 512800 被误判成一票否决 ⇒ 交付层把它变成「维持席位」、
+            #       真正该顺延补位的 515450 消失 ⇒ 入选名单整体错。
+            if m.group(0) in ("不选", "不选择"):
+                _t14 = _tail[:14]
+                _opt = _REJECT_EXIT_PLAN_RE.match(_t14) if _t14 else None
+                if _opt and not _CODE_RE.match(_t14):
+                    # 🔴 2026-11-13（独立审查）：方案名后面**紧跟代码**
+                    #    ⇒ 那不是方案名，是「不选<动作>某只标的」⇒ **真否决** ⇒ 不许豁免。
+                    if not _CODE_RE.match(_t14[_opt.end():]):
+                        continue
+            # 🔴 2026-11-13（同源第二处）：「**放弃整个银行主题**」= 放弃**主题**
+            #    （范围级）⇒ 不是否决某一只代码。
+            if m.group(0) == "放弃" and any(
+                _tail.startswith(w) for w in _REJECT_SCOPE_AFTER
+            ):
+                # 🔴 2026-11-13（独立审查 + 变异探针实证）：「放弃**组合内的**512800」
+                #    = **点名**否决 512800 ⇒ 范围词后面若跟了**具体代码**，就不许豁免。
+                _after = _tail
+                for _w in _REJECT_SCOPE_AFTER:
+                    if _after.startswith(_w):
+                        _after = _after[len(_w):]
+                        break
+                _seg = re.split(r"[，,。；;\n]", _after)[0]
+                if not _CODE_RE.search(_seg):
+                    continue
             out.append((m.start(), m.group(0)))
     out.sort()
     return out
+
+
+#: 🔴 2026-11-13（真实交付件 `snapshots/20261113_092926` 实证）：「**否定式剔除**」
+#:    ——「**不满足**从候选池彻底剔除的必要性」= **明确否掉剔除** ⇒ 不是一票否决。
+#:    实测事故：该句在研究经理段 ⇒ 512800 被误判成**否决** ⇒ 交付层把 512800 变成
+#:    「维持席位」、把真正该顺延的 515450 挤掉 ⇒ 入选名单整体错。
+#:    ⇒ 口径：**否定词 + ≤16 字 + 剔除类动词 + 「的必要性/的条件/…」** ⇒ 豁免。
+#:    ⚠️ 与 `_REJECT_NEGATION_RE` 的差别：后者只看「否定词 + 动词」（会漏掉
+#:       「不满足…剔除的**必要性**」这种带**尾巴**的写法）；本条**必须**带尾巴
+#:       ⇒ 「不满足条件即剔除 512800」（真否决）**不会被**误豁免。
+_REJECT_NEG_NECESSITY_RE = re.compile(
+    r"(?:不满足|不支持|不具备|不足以|无需|无须|不需要|没有|并非|不构成|不再)"
+    r"[^，；。｜|\n]{0,16}?"
+    r"(?:否决|剔除|排除|移除|放弃|回避)"
+    r"[^，；。｜|\n]{0,6}?"
+    r"(?:的)?(?:必要性|的条件|的理由|的依据|的门槛|的前提|标准|空间|需要)"
+)
 
 
 def _guarded(clause: str) -> bool:
@@ -1027,6 +1586,8 @@ def _guarded(clause: str) -> bool:
     if any(neg in clause for neg in _REJECT_NEGATIONS):
         return True
     if _REJECT_NEGATION_RE.search(clause):
+        return True
+    if _REJECT_NEG_NECESSITY_RE.search(clause):
         return True
     return any(mark in clause for mark in _REJECT_CAPABILITY)
 
@@ -1161,10 +1722,34 @@ def _keep_meaning(clause: str) -> bool:
 #:    ⇒ 现在：命中下列**闭集**模式的代码标为「引用」⇒ **不作为否决主体**。
 _MD_REF_COMPARE_RE = re.compile(
     r"(?:与|和|跟|相比|对比|较之|之于)\s*(?P<code>[1-9]\d{5})"
-    r"\s*(?:的)?\s*(?:相关性|相关度|相关系数|重叠度|重合度|重叠|重合|相似度|重复度|替代性)")
+    r"\s*(?:的)?\s*(?:相关性|相关度|相关系数|重叠度|重合度|重叠|重合|相似度|重复度|替代性"
+    r"|同族|同质|同类|同源|同族类)")
 _MD_REF_TOOL_RE = re.compile(
     r"(?:只|仅|来)?\s*(?:用|由|以)\s*(?P<code>[1-9]\d{5})"
     r"\s*(?:来)?\s*(?:表达|代表|覆盖|代替|承接)")
+
+#: 🔴 2026-11-13（真误伤 · 真实交付件 `20261113_092926` · 研究经理结论段）：
+#:    「**弱于 / 优于 … CODE**」里的 `CODE` 是**比较对象**，不是本句的**裁决对象**。
+#:    实测原句：
+#:      「- 563020（红利低波ETF易方达）：若出现在顺延池即否决
+#:        （与 515450 同族、相关性 0.919、分位 86% 拥挤、最终分 +0.0370 **弱于 515450**）」
+#:    ⇒ 真机同时写明「**515450 仅条件性买入**」「| 515450 | **买** |」
+#:    ⇒ 旧口径把 515450 当成**否决主体**（`_REJECT_WINDOW=40` 把它拉进动词作用域）
+#:       ⇒ TA 要买的那只被剔出候选 ⇒ 席位被顺延给别的标的（本轮实际顺延给了 512890）。
+#:    ⇒ 本条把「比较词 + CODE」标成**引用** ⇒ 不作否决主体（与 `_MD_REF_COMPARE_RE` 同族）。
+_MD_REF_SUPERIOR_RE = re.compile(
+    r"(?:弱于|强于|优于|逊于|不如|好于|差于|劣于|胜过|低于|高于)\s*"
+    r"[\*`\s]*(?P<code>[1-9]\d{5})"
+)
+
+#: 🔴 2026-11-13（真误伤 · 同一交付件）：「**代码 + 带符号的小数**」= **比分引述**
+#:    （「医药类 512170 -1.3950、512010 -1.4778」）⇒ 不是**裁决主体**。
+#:    ⇒ 旧口径把它塞进 `prev_codes` ⇒ **跨子句继承** ⇒ 下一子句的「否决它等于…」
+#:       落到 512010 头上 ⇒ 一只**没被点名否决**的标的被写进「TA 一票否决」名单。
+#:    ⇒ 只在**跨子句继承**通道生效（子句内 R1/R2/R3 仍按原语义判）⇒ 口径收紧、影响面最小。
+_MD_DATA_CITATION_RE = re.compile(
+    r"(?<![0-9])(?P<code>[1-9]\d{5})[ \t]*[-+]\d+\.\d+"
+)
 
 #: 🔴 2026-11-11（真误伤 · 每日链快照 `20261111_142244`）：「避免与 `X` 重复/重叠」里的 `X` 是**被保留的那只**，不是被否决的那只。
 #:    实测：「`515020`、`516310`、`512820` 不买，**避免与 `512800` 重复银行暴露**；
@@ -1198,7 +1783,8 @@ def _reference_codes(clause: str) -> set[str]:
        ⇒ 「剔除 512170 与 512690」这种**并列主体**不会被误伤（后面没有比较名词）。
     """
     out: set[str] = set()
-    for rx in (_MD_REF_COMPARE_RE, _MD_REF_TOOL_RE, _MD_REF_AVOID_RE):
+    for rx in (_MD_REF_COMPARE_RE, _MD_REF_TOOL_RE, _MD_REF_AVOID_RE,
+               _MD_REF_SUPERIOR_RE):
         for m in rx.finditer(clause):
             out.add(m.group("code"))
     return out
@@ -1381,10 +1967,90 @@ def _codes_with_own_action(
 #:       却被旧口径当成「被否决」⇒ 计划把 512800 变成「维持」席位、515450 整个消失。
 #:   * 「不下调到 0（**否决熊方**）」⇒ 同一句话的动词后置写法。
 #: ⇒ 命中这些写法的否决动词**不否决**子句里的任何代码。
+#: 🔴 2026-11-13（真 bug · G-TA1 产物级闸门实证）：「第三方立场 + **对某只标的**的否决」
+#:   —— 真机原文：`正因如此我拒绝熊方对 515650 的否决：…`
+#:   ⇒ 旧正则只认「熊方的否决」⇒ 夹在中间的「对 515650」让它**匹配不上**
+#:   ⇒ 「否决」动词被当成本轮的裁决 ⇒ 515650 被写进「TA 一票否决」名单。
 _META_VETO_RE = re.compile(
-    r"(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方)\s*的?\s*(?:一票\s*)?否决"
+    r"(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方)"
+    r"\s*(?:对|针对|给)?\s*(?:\d{6}\s*)?的?\s*(?:一票\s*)?否决"
     r"|否决\s*(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方)"
 )
+
+#: 🔴 2026-11-13（真 bug · 交付件 `20261113_092926`）**「驳回否决」的元结构**
+#: ------------------------------------------------------------------
+#: 否决动词的**宾语是「某方的否决」而不是「某只标的」**：
+#:   「正因如此我**拒绝熊方对 515650 的否决**：515650 的 E=+0.3401 是全部非银行候选里最高的」
+#:   ⇒ 说话人（研究经理）**驳回**了「否决 515650」这件事，并**买入** 515650。
+#:   ⇒ 旧口径：`否决` 与 `515650` 落在**同一子句** ⇒ 命中 ⇒ 515650 进「TA 一票否决」名单
+#:      ⇒ 否决出处还落在**研究经理**（层级 10）⇒ 与研究经理自己的买侧指令（层级 10）撞车
+#:      ⇒ G-TA1「否决名单里不许有买侧标的」红灯。
+#:   ⇒ 修法：`(拒绝|不接受|不同意|反对|不采纳)` + (第三方立场/介词) + CODE + 的 + (一票)?否决
+#:      ⇒ 命中 ⇒ 这段里的**否决动词与「拒绝」本身一并作废**（它驳回的是「否决这件事」）。
+#:   ⚠️ 口径**只认「CODE + 的 + 否决」**这一种宾语结构（`拒绝 512800 并否决 515450`
+#:      这种真否决不受影响；「拒绝」后面**不跟**「的+否决」时**不触发**）。
+_REFUSED_VETO_RE = re.compile(
+    r"(?:拒绝|不接受|不同意|反对|不采纳|不予接受)"
+    r"[^，；。｜|\n]{0,16}?"
+    r"(?P<code>[1-9]\d{5})\s*的?\s*(?:一票\s*)?否决"
+)
+
+
+#: 🔴 2026-11-13（真 bug · 交付件 `20261113_092926`）**否决动词的「名词用法」**
+#: ------------------------------------------------------------------
+#: 「只可**作否决的补充理由**——正因如此我拒绝熊方对 515650 的否决：…」
+#:   ⇒ 第一个「否决」是**名词**（"作……的理由"里的宾语），不是「否决某只标的」的动词
+#:   ⇒ 旧口径把它当成裁决动词 ⇒ 同子句里的 515650 被判成被否决。
+#:   ⇒ 修法：`作 / 作为 / 当成 / 当作` + (可选「一票」) + `否决` ⇒ 该「否决」是名词
+#:      ⇒ 动词位置作废（**不影响**「正式否决 515450」这类真裁决）。
+_REJECT_NOUN_RE = re.compile(r"(?:作|作为|当成|当作)\s*(?:一票\s*)?否决")
+
+
+def _noun_veto_positions(clause: str, verbs: list[tuple[int, str]]) -> set[int]:
+    """「作/作为 + 否决」这类**名词用法**里的否决动词位置 ⇒ 不作裁决。"""
+    out: set[int] = set()
+    for match in _REJECT_NOUN_RE.finditer(clause):
+        for pos, _word in verbs:
+            if match.start() <= pos < match.end():
+                out.add(pos)
+    return out
+
+
+def _strip_noun_veto(text: str) -> str:
+    """抹掉「作/作为 + 否决」的名词用法。"""
+    return _REJECT_NOUN_RE.sub(" ", text or "")
+
+
+def _refused_veto_positions(clause: str, verbs: list[tuple[int, str]]) -> set[int]:
+    """「驳回否决」元结构里（`我拒绝熊方对 515650 的否决`）的否决动词位置。
+
+    ⇒ 这些动词**不否决**该代码（说话人驳回的是「否决这件事」，不是「否决这只标的」）。
+    """
+    out: set[int] = set()
+    for match in _REFUSED_VETO_RE.finditer(clause):
+        for pos, _word in verbs:
+            if match.start() <= pos < match.end():
+                out.add(pos)
+    return out
+
+
+def _strip_refused_veto(text: str) -> str:
+    """抹掉「驳回否决」的元结构（`我拒绝熊方对 515650 的否决`）。"""
+    return _REFUSED_VETO_RE.sub(" ", text or "")
+
+
+def _span_code_positions(clause: str, pattern: re.Pattern) -> set[int]:
+    """落在 pattern 命中区间内的 6 位代码**位置**（子句内相对下标）。
+
+    🔴 **按位置**剔除（不是按代码）：同一子句里同一个代码可能既出现在元结构里
+       （`我拒绝熊方对 515650 的否决`）、又出现在**真正的裁决**里
+       （`…的否决不成立，正式否决 515650`）⇒ 按代码剔除会把真否决一起丢掉。
+    """
+    out: set[int] = set()
+    for match in pattern.finditer(clause):
+        for code_match in _CODE_RE.finditer(match.group(0)):
+            out.add(match.start() + code_match.start())
+    return out
 
 #: 🔴 2026-11-11（真缺陷 · 第 5 处根因）**点名裁决条目**
 #: ------------------------------------------------------------------
@@ -1473,7 +2139,13 @@ def _explicit_verdict_rejects(verdict: str) -> bool:
     🔴 动词表**刻意不含**「清仓 / 卖出 / 退出」—— 那是「非目标持仓清仓」的正常动作，
        不是**一票否决**（进了否决名单就会变成「维持」席位 ⇒ 卖不掉）。
     """
-    cleaned = _strip_meta_veto(verdict)
+    # 🔴 2026-11-13（真 bug · G-TA1）：**先**抹「驳回否决」元结构
+    #    （`我拒绝熊方对 515650 的否决`）⇒ 否则它剩下的「拒绝」仍会被当成否决动词
+    #    ⇒ 而「拒绝」的宾语是「否决这件事」，不是「这只标的」。
+    cleaned = _strip_refused_veto(verdict)
+    cleaned = _strip_meta_veto(cleaned)
+    # 🔴 2026-11-13（真 bug · G-TA1）：「作/作为 + 否决」是**名词用法** ⇒ 一并抹掉。
+    cleaned = _strip_noun_veto(cleaned)
     for neg in _REJECT_NEGATIONS:
         cleaned = cleaned.replace(neg, " ")
     cleaned = _REJECT_NEGATION_RE.sub(" ", cleaned)
@@ -1535,16 +2207,31 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
         # 🔴 2026-11-11（真误伤 · 第 5 处根因续）：「一票否决**理由不足**」
         #    ⇒ 这条**否决不成立**（权威段明确否掉了对方的否决）⇒ 否决动词作废。
         weak_local = _weakened_veto_positions(clause, clause_verbs)
+        # 🔴 2026-11-13（真 bug · G-TA1）：**「驳回否决」**元结构
+        #    （`我拒绝熊方对 515650 的否决`）里的否决动词**不否决**该代码
+        #    ⇒ 说话人驳回的是「否决这件事」，并且往往**买入**这只标的。
+        refused_local = _refused_veto_positions(clause, clause_verbs)
+        # 🔴 2026-11-13（真 bug · G-TA1）：「只可**作否决的补充理由**」里的「否决」
+        #    是**名词**（宾语），不是裁决动词 ⇒ 位置作废。
+        noun_local = _noun_veto_positions(clause, clause_verbs)
         verbs = [
             (cstart + pos, word)
             for pos, word in clause_verbs
-            if pos not in hypo_local and pos not in meta_local and pos not in weak_local
+            if pos not in hypo_local and pos not in meta_local
+            and pos not in weak_local and pos not in refused_local
+            and pos not in noun_local
         ]
         # 🔴 2026-11-11 修（真误伤）：**比较引用 / 工具引用**里的代码
         #    （「与 515450 相关性 0.917」「只用 515450 表达足够」）
         #    **不是本句的裁决对象** ⇒ 不得当成否决主体，也不得被下一子句继承。
         _refs = _reference_codes(clause)
-        subjects = [(cpos, code) for cpos, code in own_codes if code not in _refs]
+        # 🔴 2026-11-13（真 bug · G-TA1）：**元结构里的代码不是裁决对象**
+        #    （`我拒绝熊方对 515650 的否决` 里的 515650 是「被驳回的否决」的宾语）
+        #    ⇒ 按**位置**剔除（同一子句里别处的同代码裁决不受影响）。
+        _meta_positions = (_span_code_positions(clause, _REFUSED_VETO_RE)
+                           | _span_code_positions(clause, _META_VETO_RE))
+        subjects = [(cpos, code) for cpos, code in own_codes
+                    if code not in _refs and (cpos - cstart) not in _meta_positions]
         if verbs:
             if subjects:
                 # 🔴 2026-11-11 修（真误伤）：子句内按顿号切成**并列项** ⇒
@@ -1584,8 +2271,15 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
             #    ⇒ 规则：代码在本子句里**自带动作**（买/卖/减/保留/持有…）
             #      ⇒ 它**已有裁决** ⇒ 不许被下一子句继承成否决主体。
             spoken = _codes_with_own_action(clause, cstart, subjects)
+            # 🔴 2026-11-13（真误伤 · 交付件 `20261113_092926`）：**比分引述**
+            #    （「医药类 512170 -1.3950、512010 -1.4778」）里的代码**不是裁决主体**
+            #    ⇒ 不许**跨子句继承**成下一子句「否决它等于…」的主体
+            #    ⇒ 否则一只没被点名否决的标的会被写进「TA 一票否决」名单。
+            #    ⇒ 只收窄**继承**通道；子句内 R1/R2/R3 的判定口径一字未动。
+            _cited = {m.group("code") for m in _MD_DATA_CITATION_RE.finditer(clause)}
             prev_codes = ([] if (_keep_meaning(clause) or hypo_local) else
-                         [(cpos, code) for cpos, code in subjects if code not in spoken])
+                         [(cpos, code) for cpos, code in subjects
+                          if code not in spoken and code not in _cited])
     return out
 
 
@@ -1660,6 +2354,36 @@ def _iter_units(text: str):
         pos += len(line)
 
 
+#: 🔴 2026-11-13（真 bug · G-TA1 产物级闸门实证）**权威段落的层级**
+#: ------------------------------------------------------------------
+#: 决策 md 里同一个人/同一层可能**先后**改口：
+#:   研究经理（10）买 515650 → 辩论裁决（20）驳回熊方的否决 → 风险裁决（20）改为否决
+#:   → 最终交易决定（40）确认否决。
+#: ⇒ 「**约束力最强**的那一处」才是生效的裁决 ⇒ 否决的**出处章节**必须记**最高层级**
+#:   （否则交付件记成「研究经理」，与研究经理自己的买侧指令撞车 ⇒ G-TA1 误判红灯）。
+#: ⚠️ 本表与 `probes/probe_verify_guards.py::_AUTHORITY_RANKS` **必须逐字一致**
+#:    （`tests/test_llm_final_veto_authority_attribution.py` 有漂移守卫）。
+_AUTHORITY_RANK_MARKERS: tuple[tuple[str, int], ...] = (
+    ("最终交易决定", 40),
+    ("Trader", 30),
+    ("辩论裁决", 20),
+    ("风险裁决", 20),
+    ("研究经理", 10),
+    ("Research Manager", 10),
+)
+
+
+def _authority_rank(section: object) -> int:
+    """章节标题 ⇒ 权威层级（认不出来 ⇒ 0 = 观点层/未知）。"""
+    text = str(section or "").strip()
+    if not text:
+        return 0
+    for marker, rank in _AUTHORITY_RANK_MARKERS:
+        if marker in text:
+            return rank
+    return 0
+
+
 def extract_rejections(text: str) -> list[dict]:
     """抽出「TA 点名否决 / 剔除某只标的」的条目（合规筛选：否决 + 顺延）。
 
@@ -1692,23 +2416,40 @@ def extract_rejections(text: str) -> list[dict]:
     #      · 条目说买/减/持 ⇒ 这只**不是**被一票否决的（⇒ 不得进否决名单）
     #      · 条目说否决/不买/不建仓 ⇒ 这只**必须**进否决名单（⇒ 不许漏放）
     explicit = _explicit_item_verdicts(text)
+    # 🔴 2026-11-13（真 bug · G-TA1）：否决**出处章节**取**权威层级最高**的那一处
+    #    （同层级保留先出现的那条 ⇒ 与既有语义一致）。
+    #    ⇒ 一只标的在「研究经理（10）→ 辩论裁决（20）→ 风险裁决（20）→ 最终交易决定（40）」
+    #      多段都被否决时，交付件记的是**约束力最强**的那一段
+    #      ⇒ 闸门才能拿「否决层级 vs 买侧层级」判出真矛盾。
+    by_code: dict[str, dict] = {}
     for kind, start, unit in _iter_units(text):
         hits = _row_hits(unit) if kind == "row" else _prose_hits(unit)
         reason = " ".join(unit.split())[:_REJECT_REASON_MAX]
+        section = _section_at(headings, start)
+        rank = _authority_rank(section)
         for code, name in hits:
-            if code in seen or code in rescued:
+            if code in seen:
+                prev = by_code[code]
+                if rank > _authority_rank(prev.get("source_section")):
+                    by_code[code] = {
+                        "code": code, "name": name, "reason": reason,
+                        "source_section": section,
+                    }
+                continue
+            if code in rescued:
                 continue
             verdict = explicit.get(code)
             if verdict is not None and not _explicit_verdict_rejects(verdict[0]):
                 rescued.add(code)          # 有点名裁决且不是否决 ⇒ 永久豁免
                 continue
             seen.add(code)
-            out.append({
+            by_code[code] = {
                 "code": code,
                 "name": name,
                 "reason": reason,
-                "source_section": _section_at(headings, start),
-            })
+                "source_section": section,
+            }
+    out.extend(by_code.values())
     # 🔴 点名条目里明确写了「否决 / 不买 / 不建仓」⇒ 补抓（散文漏放时兜底）
     for code, (verdict, offset) in explicit.items():
         if code in seen or code in rescued:

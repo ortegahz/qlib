@@ -737,30 +737,74 @@ def fetch_market_snapshot(
     ak_python: str | None = None,
     prev_day: str | None = None,
     timeout: int = 900,
+    retry_times: int = 3,
+    backoff_seconds: tuple[int, ...] = (300, 600),
 ) -> dict:
     """抓「全市场 A 股 `day` 当日快照」⇒ 规范化 CSV（**在 ak env 子进程里跑**）。
 
     ⚠️ `stock_zh_a_spot_em` 是**实时快照** ⇒ 只能拿到**当天**（收盘后 = 当日收盘价）。
     🔴 **硬闸门**：`day` 不是「ak env 所在时区的今天」且本地档案里也没有 ⇒ **直接抛错**。
        否则会把**今天的行情写进历史日**（静默错位 ⇒ Alpha158 全体失真）。
+
+    🔴 2026-11-13（2026-11-12 夜跑实测）：东方财富 push2 会**按 IP 限流**
+       （`Push2RateLimitError`：首次约 5 分钟恢复，反复触发要 40 分钟以上，
+       且**等待期间重复调用只会延长限流**）⇒ 本函数**必须**带退避重试：
+       ① 只对**限流**退避重试（其它失败照旧立刻抛，不许掩盖真错）；
+       ② 重试前**真的等**（指数退避）⇒ 不再拿同一份被限流的 IP 硬撞。
     """
     ak_python = ak_python or DC.AK_PY
     out_csv = Path(out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     worker = Path(out_csv).with_suffix(".worker.py")
-    worker.write_text(_AK_WORKER, encoding="utf-8")
+    proc = None
+    last_err = ""
+    last_rc: object = None
     try:
-        proc = subprocess.run(
-            [ak_python, str(worker), day, str(out_csv), str(prev_day or "")],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        for attempt in range(max(1, int(retry_times))):
+            # 🔴 2026-11-13（独立审查实证 · 阻塞）：worker 必须**每次尝试都重写**。
+            #    旧写法把 `write_text` 放在循环**外**、`unlink` 放在循环**内**的 finally
+            #    ⇒ 第 1 次失败后 worker 已被删 ⇒ 第 2 次子进程去打开**不存在的脚本**
+            #    ⇒ rc=2「can't open file」⇒ **退避重试成了死路**，而且
+            #    `Push2RateLimitError` 被这条假报错**掩盖** ⇒ 明早会去追错方向。
+            worker.write_text(_AK_WORKER, encoding="utf-8")
+            try:
+                proc = subprocess.run(
+                    [ak_python, str(worker), day, str(out_csv), str(prev_day or "")],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                # 🔴 限流下的典型表现就是**请求挂死到超时** ⇒ 归入「疑似限流」退避重试
+                err = exc.stderr
+                err = err.decode("utf-8", "replace") if isinstance(err, bytes) else (err or "")
+                last_err = f"TimeoutExpired(after {timeout}s): {err[-400:]}"
+                last_rc = "timeout"
+                proc = None
+            if proc is not None and proc.returncode == 0:
+                break
+            if proc is not None:
+                last_err = (proc.stderr or "")[-600:]
+                last_rc = proc.returncode
+            is_rate_limited = ("Push2RateLimitError" in (last_err or "")
+                                or last_rc == "timeout")
+            if not is_rate_limited or attempt >= max(1, int(retry_times)) - 1:
+                raise RuntimeError(
+                    f"akshare 快照抓取失败 rc={last_rc}: {last_err}"
+                )
+            wait = int(backoff_seconds[min(attempt, len(backoff_seconds) - 1)])
+            print(
+                f"[increment] ⚠️ 东方财富限流 ⇒ 等 {wait}s 再重试"
+                f"（第 {attempt + 1}/{max(1, int(retry_times))} 次，"
+                "**等待期间不再调用行情接口**）",
+                flush=True,
+            )
+            time.sleep(wait)
     finally:
         worker.unlink(missing_ok=True)
-    if proc.returncode != 0:
+    if proc is None or proc.returncode != 0:
         raise RuntimeError(
-            f"akshare 快照抓取失败 rc={proc.returncode}: {(proc.stderr or '')[-600:]}"
+            f"akshare 快照抓取失败 rc={last_rc}: {last_err}"
         )
     meta: dict = {}
     for line in (proc.stdout or "").splitlines():
