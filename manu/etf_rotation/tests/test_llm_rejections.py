@@ -388,13 +388,20 @@ def test_真实夹具_命中项必须带证据句与章节():
 # ---------------------------------------------------------------- ⑫ 变异负例
 
 def test_变异负例_清空反向语义护栏后否定式必须转红():
-    """把护栏清空 ⇒ 「不否决 512800」变红 ⇒ 证明这条断言**有牙**。"""
+    """把**两道**否定护栏都清空 ⇒ 「不否决 512800」变红 ⇒ 证明这条断言**有牙**。
+
+    🔴 2026-11-16：新增第二道护栏 `_REJECT_NEG_PREFIX_RE`（否定前缀**贴脸**过滤）
+    ⇒ 只清空旧的 `_REJECT_NEGATIONS` 不再逼得红 ⇒ **两道一起**清空才有效。
+    """
     original = LLF._REJECT_NEGATIONS
+    original_prefix = LLF._REJECT_NEG_PREFIX_RE
     try:
         LLF._REJECT_NEGATIONS = ()
+        LLF._REJECT_NEG_PREFIX_RE = re.compile(r"(?!x)x")  # 永不匹配
         assert _codes("## 六、最终交易决定\n\n不否决 512800。\n") != [], "变异后仍不命中 ⇒ 没有牙"
     finally:
         LLF._REJECT_NEGATIONS = original
+        LLF._REJECT_NEG_PREFIX_RE = original_prefix
     assert _codes("## 六、最终交易决定\n\n不否决 512800。\n") == []
 
 

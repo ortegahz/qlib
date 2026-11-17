@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import time
@@ -91,8 +92,27 @@ OUT_COLS = [
 NUM_COLS = ["open", "high", "low", "close", "volume", "amount"]
 
 
-def fetch_one(code, start_date, end_date, max_retries, sleep_min, sleep_max):
-    """抓单只 ETF 的日线（重试 + 退避）。返回 (df, error)。"""
+def _is_rate_limited(err):
+    """判断异常是不是**行情源按 IP 限流**（东财 push2）。"""
+    text = str(err or "")
+    return ("RateLimit" in text) or ("限流" in text) or ("请求过多" in text)
+
+
+def fetch_one(code, start_date, end_date, max_retries, sleep_min, sleep_max,
+              rate_limit_backoff=900.0, fallback_module=None):
+    """抓单只 ETF 的日线（重试 + 退避）。返回 (df, error, source)。
+
+    🔴 **限流退避**（2026-11-13 夜跑实测）：东财 push2 按 IP 限流时，
+    普通退避（0.2~0.5s）**必然全废**（296 只全部失败）⇒ 命中限流关键字时
+    改用 `rate_limit_backoff`（默认 900s）的**静默等待**
+    （等待期**不重复调用**行情接口 ⇒ 不延长封禁）。
+
+    🔴 **兜底旁路**（2026-11-13 夜跑实测 · 本次新增）：
+    东财封禁窗口可达 40 分钟以上，而「等待」期间本轮就废了 ⇒
+    **命中限流的第一时间**切**兜底数据源**（腾讯 qfq 日线 + 新浪成交额，
+    见 `etf_fallback.py`）⇒ 不再傻等；兜底也失败才进入长退避重试。
+    `source` 用于父进程**只对兜底数据做回源校验**（东财数据不需要）。
+    """
     last = None
     for attempt in range(max_retries):
         try:
@@ -121,29 +141,69 @@ def fetch_one(code, start_date, end_date, max_retries, sleep_min, sleep_max):
                 out["ret"] = pd.to_numeric(out.get("pct_chg"), errors="coerce") / 100.0
                 out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
                 out = out.dropna(subset=["date"])
-                return out[OUT_COLS], None
+                return out[OUT_COLS], None, "eastmoney"
         except Exception as exc:  # noqa: BLE001 - 逐只记录失败原因，不让单只炸掉整轮
             last = f"{type(exc).__name__}: {exc}"
+        if _is_rate_limited(last) and fallback_module is not None:
+            # 🔴 **限流 ⇒ 立刻走兜底**（不等 `rate_limit_backoff`：等待只会让封禁窗口更长）
+            try:
+                frame, err = fallback_module.fetch_one_fallback(code, start_date, end_date)
+                if frame is not None and not frame.empty:
+                    return frame, None, "fallback"
+                last = f"东财限流 + 兜底失败：{err}"
+            except Exception as exc:  # noqa: BLE001
+                last = f"东财限流 + 兜底异常：{type(exc).__name__}: {exc}"
         if attempt < max_retries - 1:
-            time.sleep(sleep_min + attempt * (sleep_max - sleep_min))
-    return None, last
+            # 🔴 长退避只在**没有兜底**时才用：兜底可用时它是主路径，
+            #    每只都睡 `rate_limit_backoff` 会把整轮拖成几小时（实测口径）。
+            if _is_rate_limited(last) and fallback_module is None:
+                time.sleep(float(rate_limit_backoff))
+            else:
+                time.sleep(sleep_min + attempt * (sleep_max - sleep_min))
+    return None, last, None
+
+
+def load_fallback_module(path):
+    """按**绝对路径**加载兜底模块 `etf_fallback.py`（它在 ak env 里跑，依赖 akshare）。"""
+    if not path:
+        return None
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("etf_fallback_source", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:  # noqa: BLE001 - 兜底模块加载失败 ⇒ 退化成纯东财
+        print(f"[ak] 兜底模块加载失败：{type(exc).__name__}: {exc}", flush=True)
+        return None
 
 
 def main():
     spec = json.loads(sys.argv[1])
     codes = spec["codes"]
     frames, failed = [], []
+    fallback_codes = []
+    fallback = load_fallback_module(spec.get("fallback_module"))
+    if fallback is None:
+        print("[ak] ⚠️ 兜底模块不可用 ⇒ 东财一旦限流本轮必失败", flush=True)
     for i, code in enumerate(codes, 1):
-        df, err = fetch_one(
+        df, err, source = fetch_one(
             code, spec["start_date"], spec["end_date"],
             spec["max_retries"], spec["sleep_min"], spec["sleep_max"],
+            spec.get("rate_limit_backoff", 900.0),
+            fallback,
         )
         if df is None:
             failed.append({"code": code, "error": err})
         else:
             frames.append(df)
+            if source == "fallback":
+                fallback_codes.append(str(code))
         if i % 25 == 0:
-            print(f"[ak] {i}/{len(codes)}", flush=True)
+            print(f"[ak] {i}/{len(codes)}（兜底 {len(fallback_codes)}）", flush=True)
         # 🔴 **每次请求之间都限速**（和研究链 `fetch_etf_prices.py` 同口径）：
         #    连续几百次请求不打 eastmoney ⇒ IP 封禁 ⇒ 每日链路直接瘫。
         time.sleep(random.uniform(spec["sleep_min"], spec["sleep_max"]))
@@ -153,8 +213,10 @@ def main():
         out = pd.DataFrame(columns=OUT_COLS)
     out.to_csv(spec["out_path"], index=False, encoding="utf-8-sig")
     with open(spec["meta_path"], "w", encoding="utf-8") as fp:
-        json.dump({"rows": int(len(out)), "failed": failed}, fp, ensure_ascii=False)
-    print(f"[ak] 完成：{len(out)} 行，失败 {len(failed)} 只", flush=True)
+        json.dump({"rows": int(len(out)), "failed": failed,
+                   "fallback_codes": fallback_codes}, fp, ensure_ascii=False)
+    print(f"[ak] 完成：{len(out)} 行，失败 {len(failed)} 只，兜底 {len(fallback_codes)} 只",
+          flush=True)
     return 0
 
 
@@ -316,6 +378,19 @@ def fetch_etf_daily_bars(
     if not Path(ak_py).exists():
         raise RuntimeError(f"找不到 ak 环境解释器：{ak_py}")
 
+    # 🔴 **限流容忍（env 可覆盖）**（2026-11-13 夜跑实测）：
+    #   * `ETF_FETCH_SLEEP_MIN` / `ETF_FETCH_SLEEP_MAX` = **逐只请求间隔**（默认 0.2~0.5s）
+    #     ⇒ 东财 push2 按 IP 限流；296 只在 2 分钟内打完就会把自己打封
+    #     ⇒ 长时间拉开间隔才能安全过关。
+    #   * `ETF_FETCH_MAX_RETRIES` = 单只重试次数（默认 3）。
+    #   * `ETF_FETCH_RATE_LIMIT_BACKOFF` = **命中限流时的静默等待秒数**（默认 900）。
+    sleep_min = float(os.environ.get("ETF_FETCH_SLEEP_MIN", sleep_min))
+    sleep_max = float(os.environ.get("ETF_FETCH_SLEEP_MAX", sleep_max))
+    max_retries = int(os.environ.get("ETF_FETCH_MAX_RETRIES", max_retries))
+    rate_limit_backoff = float(
+        os.environ.get("ETF_FETCH_RATE_LIMIT_BACKOFF", 900.0)
+    )
+
     end_dt = datetime.strptime(end, "%Y-%m-%d")
     start = (end_dt - timedelta(days=int(lookback_days))).strftime("%Y%m%d")
     end_compact = end_dt.strftime("%Y%m%d")
@@ -335,6 +410,10 @@ def fetch_etf_daily_bars(
         "max_retries": int(max_retries),
         "sleep_min": float(sleep_min),
         "sleep_max": float(sleep_max),
+        "rate_limit_backoff": float(rate_limit_backoff),
+        # 🔴 2026-11-13：东财 push2 按 IP 封禁时的**兜底旁路**模块
+        #    （腾讯 qfq 日线 + 新浪成交额；口径校验在父进程做）
+        "fallback_module": str(Path(__file__).with_name("etf_fallback.py")),
     }
     proc = subprocess.run(
         [ak_py, str(script), json.dumps(spec)], capture_output=True, text=True, check=False
@@ -348,11 +427,22 @@ def fetch_etf_daily_bars(
     df["date"] = df["date"].astype(str).str.slice(0, 10)
     df = df[df["date"] <= end].copy()
     failed: list[dict] = []
+    fallback_codes: list[str] = []
     if meta_json.exists():
         try:
-            failed = json.loads(meta_json.read_text(encoding="utf-8")).get("failed", [])
+            meta = json.loads(meta_json.read_text(encoding="utf-8"))
+            failed = meta.get("failed", [])
+            fallback_codes = meta.get("fallback_codes", [])
         except json.JSONDecodeError:
             failed = []
+    if fallback_codes:
+        df, dropped = _validate_fallback_bars(df, fallback_codes, end)
+        failed.extend(dropped)
+        print(
+            f"[fetch] 兜底口径校验：{len(fallback_codes)} 只走兜底，"
+            f"丢弃 {len(dropped)} 只（fail-closed）",
+            flush=True,
+        )
     if df.empty:
         first = failed[0] if failed else {"code": "?", "error": "无数据"}
         raise RuntimeError(f"全部 {len(failed)} 只 ETF 抓取失败（第一只：{first}）")
@@ -383,6 +473,94 @@ def _canonical_columns(canonical: Path) -> list[str] | None:
             f"canonical 行情文件 `{canonical}` 缺少必需列：{missing}（实际列：{cols}）"
         )
     return cols
+
+
+def _validate_fallback_bars(
+    df: pd.DataFrame,
+    fallback_codes: Sequence[str],
+    asof: str,
+    *,
+    canonical_csv: Path | None = None,
+    close_tol: float = 0.005,
+    vwap_tol: float = 0.01,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """兜底数据的**口径回源校验**（fail-closed：不过 ⇒ **整只丢弃**，不许凑数）。
+
+    三道闸门：
+      ① **canonical 重叠日**：兜底序列与 canonical `etf_prices.csv` 的重叠交易日
+         收盘价相对偏差 <= `close_tol`（实测腾讯 qfq 与 canonical **逐位一致**）；
+      ② **额量自洽**：隐含均价 `amount/(volume*100)` 必须落在当根 bar 的
+         `[low, high]` 区间内（+-`vwap_tol`）—— 这条**不依赖 canonical**，
+         能抓住「量额单位搞错 / 成交额串行」这类脏数据；
+      ③ **含信号日**：必须**有** asof 那根 bar（否则底座差一天 ⇒ 均线/破位全废）。
+
+    返回 `(过滤后的 df, 被丢弃明细)`。
+    """
+    if not fallback_codes:
+        return df, []
+    codes = sorted({str(c).zfill(6) for c in fallback_codes})
+    sub = df[df["code"].isin(codes)].copy()
+    canon = None
+    canonical_path = Path(canonical_csv) if canonical_csv else DC.ETF_PRICES_CSV
+    if canonical_path.exists():
+        canon = pd.read_csv(canonical_path, dtype={"code": str})
+        canon["code"] = canon["code"].astype(str).str.zfill(6)
+        canon = canon[canon["code"].isin(codes)]
+    dropped: list[dict] = []
+    keep: list[str] = []
+    for code in codes:
+        rows = sub[sub["code"] == code]
+        reasons: list[str] = []
+        if rows.empty:
+            reasons.append("兜底无数据")
+        else:
+            latest = rows[rows["date"] == asof]
+            if latest.empty:
+                reasons.append(f"缺信号日 {asof} 的 bar")
+            else:
+                row = latest.iloc[0]
+                amount = row.get("amount")
+                volume = row.get("volume")
+                low = row.get("low")
+                high = row.get("high")
+                close = row.get("close")
+                if any(pd.isna(x) for x in (amount, volume, close)):
+                    reasons.append("信号日 bar 缺成交额/成交量/收盘价")
+                elif float(volume) <= 0:
+                    reasons.append("信号日 bar 成交量 <= 0")
+                else:
+                    vwap = float(amount) / (float(volume) * 100.0)
+                    lo = float(low) * (1.0 - vwap_tol)
+                    hi = float(high) * (1.0 + vwap_tol)
+                    if not (lo <= vwap <= hi):
+                        reasons.append(
+                            f"额量不自洽：隐含均价 {vwap:.4f} 不在 "
+                            f"[{float(low):.4f}, {float(high):.4f}]"
+                        )
+            if canon is not None and not canon.empty:
+                # 🔴 **必须按 code 过滤**：canonical 是**全池**行情
+                #    ⇒ 不按 code 收窄就会把 A 标的的收盘价和 B 标的比（跨代码串行）
+                canon_one = canon[canon["code"] == code]
+                merged = rows.merge(
+                    canon_one[["date", "close"]].rename(columns={"close": "close_canon"}),
+                    on="date",
+                    how="inner",
+                )
+                if not merged.empty:
+                    diff = (
+                        (merged["close"] - merged["close_canon"]).abs()
+                        / merged["close_canon"]
+                    )
+                    worst = float(diff.max())
+                    if worst > close_tol:
+                        reasons.append(
+                            f"与 canonical 重叠日收盘偏差 {worst:.4%} > {close_tol:.2%}"
+                        )
+        if reasons:
+            dropped.append({"code": code, "error": "兜底口径校验不过：" + "；".join(reasons)})
+        else:
+            keep.append(code)
+    return df[df["code"].isin(keep)].copy(), dropped
 
 
 def write_daily_prices(df: pd.DataFrame, out_dir: str | Path, asof: str) -> Path:

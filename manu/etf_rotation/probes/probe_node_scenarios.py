@@ -17,6 +17,27 @@ M-S7 之前，`reprice_node_day.py` 只会重算**纯规则层**清单 ⇒ 用�
 **没有任何工具**能算出「我选的那个方案在节点日价格下买多少股」⇒ 12-01 当天只能手算。
 本探针保证这条链**不会悄悄坏掉**，且**默认（规则层）路径一个字节都没变**。
 
+【🔴 为什么情景独立重算必须套用同一套最小调仓门槛（2026-11-13 方案一）】
+`manu/etf_rotation/min_trade_gate.py` 是**最小调仓门槛的单一事实源**（三档阈值 +
+交易性质分类 + 作废语义），**阶段 5**（`final_rebalance_plan.py`）与**阶段 6**
+（`reprice_node_day.py`，**含 `--scenario` 情景分支**）**共用**它
+⇒ **情景产物里的调仓行同样会被门槛作废** ⇒ 探针的独立重算若不套门槛，
+就会出现「重算说该建仓、产物说没建」的**假违例**。
+
+🔴 **门槛作废一行的语义**（`min_trade_gate.block_row`）：
+① **行保留**（不删行 ⇒ 市值不凭空蒸发）；② `delta_shares` **归零**；
+③ `est_amount` / `est_fee` **归零**；④ `action` 改「持有」（有持仓）/「不建仓」（原本 0 股）；
+⑤ `target_shares` **回退到当前股数**；⑥ `target_weight_effective` 按**当前市值**重算、
+差额（`weight_to_cash`，**有符号**）记进「权重归现金」。
+
+🔴 **2026-11-13 实测假红（修法依据）**：情景 `512800=B` 的意图调整 = 目标权重 16%
+   ⇒ 5,400 股 ⇒ 卖 2,300 股 × 0.874 = **2,010.20 元 < 存量微调门槛 2,800 元**
+   ⇒ **门槛作废**（行保留、delta=0、金额=0）⇒ 产物**不调仓是对的**；
+   旧口径的探针（不套门槛）却判它「应建仓但没建」⇒ **假红**。
+⇒ 本探针用 `min_trade_gate.resolve_thresholds` / `classify_min_amount_kind`
+   **复刻同一套阈值与分类**，并把「被作废的行」与门槛披露**逐条对账**
+   （code / kind / amount / threshold 一致 + 该行 delta=0、金额=0、目标股数回退到当前股数）。
+
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \\
         manu/etf_rotation/probes/probe_node_scenarios.py \\
@@ -46,6 +67,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -67,6 +89,7 @@ BATCH = REPO_ROOT / "manu" / "etf_rotation" / "make_node_scenarios.py"
 sys.path.insert(0, str(REPO_ROOT / "manu" / "etf_rotation"))
 import config as C  # noqa: E402  （落点常量单一事实源）
 import account as A  # noqa: E402
+import min_trade_gate as gate_mod  # noqa: E402  （最小调仓门槛：阶段5/阶段6 单一事实源）
 
 
 def _resolve_lot() -> int:
@@ -80,6 +103,27 @@ def _resolve_lot() -> int:
 
 #: 整手（ETF 最小交易单位）
 LOT = _resolve_lot()
+
+
+def _resolve_round_lot():
+    """整手取整：真源 = `final_rebalance_plan._round_lot`（兜底 = 向下取整到整手）。"""
+    try:
+        from final_rebalance_plan import _round_lot as _rl  # noqa: PLC0415
+        return _rl
+    except Exception:  # noqa: BLE001
+        def _rl(shares: float) -> int:
+            if shares is None or shares <= 0:
+                return 0
+            return int(math.floor(shares / LOT) * LOT)
+        return _rl
+
+
+#: 整手取整（**向下**取整 —— 与产品 `reprice_node_day._round_lot` 同口径）
+ROUND_LOT = _resolve_round_lot()
+
+#: 节点日（情景重算的节点日；**唯一一处**写死 ⇒ 不许在别处再散落字面量）
+NODE_DATE = "2026-11-04"
+
 #: 单席上限（账户级 20%）= 总资产 × 单席权重 —— **兜底**口径（`account.py` 研究链旧账户）
 #: 🔴 2026-11-10：这两个常量（5970.934 / 15518.87）是 **2026-11-04 的 5 只旧账户**口径。
 #:    本轮该探针跑的是 canonical 根（口径自洽），但 canonical 根一旦换上
@@ -126,7 +170,7 @@ def _account_basis(plan: dict | None) -> tuple[float, float, float, str]:
                float(A.TARGET_POSITION_WEIGHT) * 100))
 
 
-def _d4_empty_position_negative(agg: dict, slot_limit: float) -> tuple[bool, str]:
+def _d4_empty_position_negative(agg: dict, views: dict, slot_limit: float) -> tuple[bool, str]:
     """D4 真负例：给一个**空 positions** 的情景硬塞一条破单席 ⇒ 独立重算必须检出。
 
     🔴 2026-11-10（实测红灯）：本轮**不存在**空仓情景（分歧项只有 3 个，
@@ -158,25 +202,444 @@ def _d4_empty_position_negative(agg: dict, slot_limit: float) -> tuple[bool, str
     empty_scen["slot_breaches"] = [
         {"code": "999999", "name": "凭空破单席",
          "amount": 999999.0, "limit": slot_limit}]
-    detected = False
-    for s in mutated.get("scenarios", []):
-        if "positions" not in s:
-            continue
-        claimed = {b["code"] for b in s.get("slot_breaches", [])}
-        positions = s.get("positions") or []
-        recomputed = {
-            p["code"] for p in positions
-            if float(p.get("target_shares") or 0) * float(p.get("price") or 0.0)
-            > slot_limit + 0.005}
-        if claimed != recomputed:
-            detected = True
-            break
+    #: 🔴 2026-11-13：负例改成调用**真正的 P8 检查函数**（`_slot_breach_problems`）
+    #:    ⇒ 证明的是 P8 本身有牙，而不是另抄一份口径。
+    found, _stale = _slot_breach_problems(mutated.get("scenarios") or [], views, slot_limit)
+    detected = bool(found)
     if not detected:
         return False, "改坏后独立重算**未**检出 ⇒ 闸门无牙"
     detail = "空仓情景里凭空塞的破单席被独立重算检出 ⇒ 闸门会 FAIL"
     if synth:
         detail += "｜本轮无空仓情景 ⇒ 负例**自造**了一只「" + str(empty_scen.get("label")) + "」"
     return True, detail
+
+
+# ==============================================================================
+# 最小调仓门槛（方案一 · 2026-11-13）—— 探针侧的**独立重算**
+# ==============================================================================
+
+def _signature(choices: dict) -> str:
+    """情景选项的**规范签名**（按代码排序）⇒ 情景的唯一键（聚合件 ↔ 节点日产物对表用）。"""
+    return ",".join(f"{str(code).zfill(6)}={str(choices[code])}"
+                    for code in sorted(choices or {}))
+
+
+def _plan_actions_map(plan: dict) -> dict[str, dict]:
+    """计划件 `actions` ⇒ `{代码: 动作行}`（代码统一 6 位）。"""
+    out: dict[str, dict] = {}
+    for row in plan.get("actions") or []:
+        out[str(row.get("code") or "").zfill(6)] = row
+    return out
+
+
+def _llm_targets_map(plan: dict) -> dict[str, dict]:
+    """计划件 `llm_final_decision.targets` ⇒ `{代码: 裁决行}`。"""
+    targets = ((plan.get("llm_final_decision") or {}).get("targets") or {})
+    return {str(code).zfill(6): (row or {}) for code, row in targets.items()}
+
+
+def _intended_target_shares(code, letter, plan_action, llm_target, price, total_assets):
+    """独立重算「门槛作废**之前**」的目标股数（口径同 `reprice_node_day._recompute`）。
+
+    · 选项 A（规则层）⇒ `target_weight × 总资产` → **向下取整到整手**；
+    · 选项 B（LLM 最终裁决）⇒ `lots` ⇒ `lots × 整手`；`target_pct == 0` ⇒ 0 股；
+      其余 ⇒ `target_pct% × 总资产` → **向下取整到整手**；
+    · **TA 一票否决且保持现仓**的行 ⇒ 目标 = 当前股数（delta=0 ⇒ 不参与门槛）。
+
+    返回 `(目标股数 | None, 口径说明, 目标权重百分数 | None)`。
+    """
+    action = plan_action or {}
+    cur = int(action.get("current_shares") or 0)
+    if bool(action.get("ta_rejected")) and bool(action.get("held_not_touched")):
+        return cur, "TA 一票否决 ⇒ 保持现仓（不参与门槛）", None
+    if letter == "B":
+        lots = (llm_target or {}).get("lots")
+        pct = (llm_target or {}).get("target_pct")
+        if lots not in (None, ""):
+            return (int(lots) * LOT,
+                    f"LLM 裁决：买 {int(lots)} 手（固定 {int(lots) * LOT} 股）", None)
+        if pct is not None and float(pct) == 0:
+            return 0, "LLM 裁决：不建仓（目标权重 0%）", 0.0
+        if pct is None:
+            return None, "LLM 裁决既无 lots 也无 target_pct ⇒ 不猜", None
+        amount = float(pct) / 100.0 * float(total_assets or 0.0)
+        return (ROUND_LOT(amount / float(price)),
+                f"LLM 裁决目标权重 {float(pct):.4f}%", float(pct))
+    weight = float(action.get("target_weight") or 0.0)
+    amount = weight * float(total_assets or 0.0)
+    shares = ROUND_LOT(amount / float(price)) if amount > 0 else 0
+    return shares, f"规则层 target_weight {weight * 100:.4f}%", weight * 100.0
+
+
+def _gate_judgement(current_shares, intended_shares, price, ta_rejected, thresholds):
+    """独立重算**门槛判定**（分类 + 阈值**全部取自 `min_trade_gate` 单一事实源**）。
+
+    判定顺序与 `min_trade_gate.apply_min_trade_threshold` 一致：
+    `ta_rejected` 行不参与 ⇒ `delta == 0` 不参与 ⇒ 金额 ≤ 0 不参与 ⇒
+    分类（清仓止损 / 新开仓 / 存量微调）⇒ **金额 < 该档门槛 ⇒ 作废**（否则放行）。
+    """
+    delta = int(intended_shares) - int(current_shares)
+    amount = abs(delta) * float(price or 0.0)
+    thr = gate_mod.resolve_thresholds(thresholds)
+    if ta_rejected or delta == 0 or amount <= 0:
+        return {"kind": "", "amount": round(amount, 2), "threshold": None,
+                "blocked": False, "delta": delta}
+    kind = gate_mod.classify_min_amount_kind({
+        "current_shares": int(current_shares),
+        "target_shares": int(intended_shares),
+        "delta_shares": delta,
+    })
+    if not kind:
+        return {"kind": "", "amount": round(amount, 2), "threshold": None,
+                "blocked": False, "delta": delta}
+    limit = float(thr.get(kind, 0.0))
+    return {"kind": kind, "amount": round(amount, 2), "threshold": limit,
+            "blocked": bool(amount < limit), "delta": delta}
+
+
+def _scenario_gate_view(plan, choices, payload, total_assets, thresholds):
+    """一个情景的**独立重算**：逐行 ⇒「意图目标股数 + 门槛判定」。
+
+    ⇒ `{代码: {intended_shares, basis, target_pct, price, current_shares,
+                kind, amount, threshold, blocked, delta}}`
+    """
+    actions = _plan_actions_map(plan)
+    llm_targets = _llm_targets_map(plan)
+    view: dict[str, dict] = {}
+    for row in payload.get("actions") or []:
+        code = str(row.get("code") or "").zfill(6)
+        price = float(row.get("price") or 0.0)
+        if price <= 0:
+            continue
+        plan_action = actions.get(code)
+        if plan_action is None:
+            continue
+        cur = int(plan_action.get("current_shares") or 0)
+        letter = str((choices or {}).get(code) or "A")
+        shares, basis, pct = _intended_target_shares(
+            code, letter, plan_action, llm_targets.get(code), price, total_assets)
+        if shares is None:
+            continue
+        judgement = _gate_judgement(cur, shares, price,
+                                    bool(row.get("ta_rejected")), thresholds)
+        judgement.update({"intended_shares": int(shares), "basis": basis,
+                           "target_pct": pct, "price": price, "current_shares": cur})
+        view[code] = judgement
+    return view
+
+
+def _gate_disclosure_problems(payload, agg_scenario, view, thresholds):
+    """门槛披露对账（探针**独立重算** ⇔ 产物披露）+ 作废行语义核对。
+
+    ① 独立重算说「该作废」的行 ⇒ 必须出现在 `min_amount_gate.skipped` 里，
+       且 **code / kind / amount / threshold 逐项一致**；
+    ② 披露里的行 ⇒ 独立重算也要说「该作废」（否则是口径分叉）；
+    ③ 作废行在情景产物里 ⇒ **delta = 0、金额 = 0、目标股数回退到当前股数**（行保留）；
+    ④ 作废行在**聚合件**里不许出现调仓（delta ≠ 0）；
+    ⑤ 门槛阈值本身 ⇒ 必须与 `min_trade_gate.resolve_thresholds` 一致（同一套门槛）。
+    """
+    problems: list[str] = []
+    gate = payload.get("min_amount_gate") or {}
+    thr = gate_mod.resolve_thresholds(thresholds)
+    for kind_name, limit in thr.items():
+        got = (gate.get("thresholds") or {}).get(kind_name)
+        if got is None or abs(float(got) - float(limit)) > 0.005:
+            problems.append(f"门槛阈值 {kind_name} 产物 {got} vs 单一事实源 {limit}")
+    disclosed: dict[str, dict] = {}
+    for rec in gate.get("skipped") or []:
+        disclosed[str(rec.get("code") or "").zfill(6)] = rec
+    expected = {code: j for code, j in (view or {}).items() if j.get("blocked")}
+    for code, judge in sorted(expected.items()):
+        rec = disclosed.get(code)
+        if rec is None:
+            problems.append(
+                f"{code} 独立重算应被门槛作废（{judge['kind']} {judge['amount']:.2f} 元 "
+                f"< {judge['threshold']:.0f} 元）但门槛披露里没有")
+            continue
+        if str(rec.get("kind") or "") != str(judge["kind"]):
+            problems.append(f"{code} 门槛披露 kind {rec.get('kind')!r} vs 独立重算 {judge['kind']!r}")
+        if abs(float(rec.get("threshold") or 0.0) - float(judge["threshold"])) > 0.01:
+            problems.append(f"{code} 门槛披露 threshold {rec.get('threshold')} vs 独立重算 {judge['threshold']}")
+        if abs(float(rec.get("amount") or 0.0) - float(judge["amount"])) > 0.01:
+            problems.append(f"{code} 门槛披露 amount {rec.get('amount')} vs 独立重算 {judge['amount']}")
+    for code in sorted(disclosed):
+        if code not in expected:
+            problems.append(f"{code} 门槛披露里被作废，但独立重算不认为该作废（口径分叉）")
+    rows = {str(r.get("code") or "").zfill(6): r for r in payload.get("actions") or []}
+    for code in sorted(expected):
+        row = rows.get(code)
+        if row is None:
+            problems.append(f"{code} 门槛作废的行在情景产物里缺失")
+            continue
+        if int(row.get("delta_shares") or 0) != 0:
+            problems.append(f"{code} 被门槛作废 ⇒ delta 应为 0，实际 {row.get('delta_shares')}")
+        if abs(float(row.get("est_amount") or 0.0)) > 0.005:
+            problems.append(f"{code} 被门槛作废 ⇒ 金额应为 0，实际 {row.get('est_amount')}")
+        if int(row.get("target_shares") or 0) != int(row.get("current_shares") or 0):
+            problems.append(f"{code} 被门槛作废 ⇒ 目标股数应回退到当前股数 "
+                            f"{row.get('current_shares')}，实际 {row.get('target_shares')}")
+        if agg_scenario:
+            for t in agg_scenario.get("trades") or []:
+                if str(t.get("code") or "").zfill(6) == code and int(t.get("delta_shares") or 0) != 0:
+                    problems.append(f"{code} 被门槛作废 ⇒ 聚合件里却有 delta={t.get('delta_shares')} 的调仓")
+    return problems
+
+
+def _slot_breach_problems(scenarios, views, slot_limit):
+    """破单席标记完整性（**独立重算**，门槛感知）⇒ `(违例描述, 陈旧标记清单)`。
+
+    口径（与 `reprice_node_day.py` 的 `slot_breach` 判据同源）：
+    **落地持仓金额**（落地股数 × 节点日价）> 单席上限 ⇔ 有 `slot_breach` 标记；
+    宇宙 = 聚合件的**落地持仓全集** `positions`（含「本轮不动」的仓位）。
+
+    🔴 **被门槛作废的行按「门槛后」的最终落地判定**（2026-11-13 生产修复后）：
+       生产已把 `slot_breach` 的重算挪到 `apply_min_trade_threshold` **之后**
+       ⇒ 判据 = 门槛作废后的**最终落地股数 × 节点日价**。
+       🔴 为什么必须这样：门槛拦下一笔「超配减仓」时，账户**仍然超单席上限**
+       （实测：落地 6,729.80 元 > 上限 4,776.75 元）⇒ 破单席**必须报出来**，
+       否则产物自相矛盾（`landed_amount` 超限却 `slot_breach=false`）。
+       ⇒ 若产物仍按「门槛前」目标股数判定 ⇒ 本探针**判红**（口径分叉 ⇒ 硬失败）。
+    """
+    problems: list[str] = []
+    stale: list[str] = []
+    for s in scenarios:
+        view = views.get(_signature(s.get("choices") or {})) or {}
+        if "positions" not in s:
+            problems.append(
+                f"{s.get('label')} 聚合件里**没有 positions 键**（落地持仓全集）"
+                "⇒ 产物结构不完整 ⇒ 无法独立重算破单席")
+            continue
+        positions = s.get("positions") or []
+        recomputed: set[str] = set()
+        for p in positions:
+            code = str(p.get("code") or "").zfill(6)
+            price = float(p.get("price") or 0.0)
+            landed = int(p.get("target_shares") or 0) * price
+            judge = view.get(code) or {}
+            #: 🔴 2026-11-13（生产修复后）：破单席判据 = **门槛作废之后的最终落地金额**
+            #:    （生产已把 `slot_breach` 的重算挪到 `apply_min_trade_threshold` 之后 ⇒
+            #:    「门槛拦下一笔减仓」时，账户**仍然超单席上限** ⇒ 必须报出来）。
+            if landed > slot_limit + 0.005:
+                recomputed.add(code)
+            if judge.get("blocked"):
+                #: 口径分叉检测：**产物自己的标记**必须与「门槛后的落地金额」一致
+                #: （生产已于 2026-11-13 把破单席重算挪到门槛作废之后 ⇒ 不一致 ⇒ 硬失败）。
+                _prod_flag = bool(p.get("slot_breach"))
+                if _prod_flag != (landed > slot_limit + 0.005):
+                    stale.append(
+                        f"{s.get('label')}/{code}：门槛作废后落地 {landed:.2f} 元 vs "
+                        f"单席上限 {slot_limit:.2f} 元 ⇒ 应标记破单席="
+                        f"{landed > slot_limit + 0.005}，但产物标记={_prod_flag}"
+                        f"（门槛前意图股数 {judge.get('intended_shares')}）")
+        claimed = {str(b.get("code") or "").zfill(6) for b in s.get("slot_breaches") or []}
+        flagged = {str(p.get("code") or "").zfill(6)
+                   for p in positions if p.get("slot_breach")}
+        if claimed != recomputed:
+            problems.append(f"{s.get('label')} 重算 {recomputed} vs 产物 {claimed}")
+        if flagged != claimed:
+            problems.append(f"{s.get('label')} 逐行 slot_breach 标记 {flagged} "
+                            f"与破单席清单 {claimed} 不一致")
+    #: 🔴 2026-11-13：口径分叉（门槛作废前后判据不一致）**不再是「披露」而是硬失败**
+    #:    ⇒ 宁可红，不要「静默放过」一个没报出来的破单席。
+    for _msg in stale:
+        problems.append(f"[口径分叉] {_msg}")
+    return problems, stale
+
+
+def _p10_problems(scenarios, views, llm_targets):
+    """选项 B 的落地股数/权重必须与 `llm_final_decision` 一致（**门槛感知**）。
+
+    · 门槛**未**作废 ⇒ 产物里必须有这笔交易，且股数 / 权重与裁决一致；
+    · 门槛**已**作废（金额 < 该档门槛）⇒ 产物**不调仓**才是对的
+      （行保留、delta=0、金额=0 ⇒ 不进 `trades`）；
+    · 意图目标 = 当前持仓 ⇒ 本轮不该调仓（不许凭空多一笔）。
+    """
+    problems: list[str] = []
+    for s in scenarios:
+        choices = s.get("choices") or {}
+        view = views.get(_signature(choices)) or {}
+        for code, letter in choices.items():
+            if letter != "B":
+                continue
+            code = str(code).zfill(6)
+            tgt = llm_targets.get(code) or {}
+            lots = tgt.get("lots")
+            pct = tgt.get("target_pct")
+            judge = view.get(code)
+            hit = next((t for t in (s.get("trades") or []) if t["code"] == code), None)
+            if judge is None:
+                problems.append(f"{s.get('label')}/{code} 情景产物里找不到该行 ⇒ 无法核对落地")
+                continue
+            if judge.get("blocked"):
+                if hit is not None and int(hit.get("delta_shares") or 0) != 0:
+                    problems.append(
+                        f"{s.get('label')}/{code} 被门槛作废（{judge['kind']} "
+                        f"{judge['amount']:.2f} 元 < {judge['threshold']:.0f} 元）"
+                        f"却仍有 delta={hit.get('delta_shares')} 的调仓")
+                continue
+            if lots not in (None, ""):
+                want = int(lots) * LOT
+                if hit is None or int(hit.get("target_shares") or 0) != want:
+                    problems.append(
+                        f"{s.get('label')}/{code} 期望 {want} 股（买 {lots} 手），实际 "
+                        f"{hit.get('target_shares') if hit else '未建仓'}")
+            elif pct is not None and float(pct) == 0:
+                if hit is not None and int(hit.get("target_shares") or 0) > 0:
+                    problems.append(f"{s.get('label')}/{code} 应不建仓，实际建了仓")
+            elif int(judge.get("delta") or 0) == 0:
+                if hit is not None and int(hit.get("delta_shares") or 0) != 0:
+                    problems.append(
+                        f"{s.get('label')}/{code} 意图目标 = 当前持仓 ⇒ 本轮不该调仓，"
+                        f"却有 delta={hit.get('delta_shares')}")
+            elif hit is None:
+                problems.append(f"{s.get('label')}/{code} 应建仓但没建")
+            else:
+                want_pct = float(pct or 0.0)
+                got = float(hit.get("target_weight_pct") or 0.0)
+                if abs(got - want_pct) > 0.05:
+                    problems.append(
+                        f"{s.get('label')}/{code} 权重 {got:.4f}% vs 裁决 {want_pct:.4f}%")
+    return problems
+
+
+def _run_scenario_payloads(node_date, plan_path, prices_path, out_dir, combos):
+    """逐情景跑一次 `reprice_node_day.py --scenario` ⇒ 取回**带门槛披露**的产物。
+
+    🔴 **为什么探针要自己再跑一遍**：`make_node_scenarios.py` 的聚合件**只汇总**
+       股数 / 金额 / 破单席，**不携带 `min_amount_gate` 门槛披露**
+       ⇒ 「被门槛作废的行」在聚合件里看不出来 ⇒ 探针拿不到对账依据。
+    ⇒ 参数与 `make_node_scenarios.py` **逐项一致**（同一计划件 / 同一行情 / 同一总资产口径）。
+    """
+    out: dict[str, dict] = {}
+    for label, choices in combos:
+        spec = ",".join(f"{code}={choices[code]}" for code in sorted(choices))
+        rc, log = run([sys.executable, str(REPRICE), "--node-date", node_date,
+                       "--plan", str(plan_path), "--prices", str(prices_path),
+                       "--out-dir", str(out_dir), "--scenario", spec,
+                       "--total-assets-basis", "plan"], REPO_ROOT)
+        if rc != 0:
+            raise RuntimeError(f"情景 `{label}` 的节点日重算失败（退出码 {rc}）⇒ 闸门无法对账门槛披露：\n"
+                               f"{(log or '').strip()[-500:]}")
+        slug = "_".join(f"{code}{choices[code]}" for code in sorted(choices))
+        path = out_dir / f"node_reprice_{node_date.replace('-', '')}_sc_{slug}.json"
+        out[_signature(choices)] = read_json(path, f"情景 `{label}` 的节点日重算产物")
+    return out
+
+
+def _find_blocked_case(scen, payloads, views):
+    """找一个**真实的**「被门槛作废」案例 ⇒ `(情景行, 节点日产物, 独立重算, 代码)`。"""
+    for s in scen:
+        sig = _signature(s.get("choices") or {})
+        view = views.get(sig) or {}
+        payload = payloads.get(sig)
+        if payload is None:
+            continue
+        for code, judge in sorted(view.items()):
+            if judge.get("blocked"):
+                return s, payload, view, code
+    return None
+
+
+def _synth_blocked_case(total_assets: float):
+    """合成一个**自洽**的「被门槛作废」夹具（真实产物里没有作废行时，负例不许空过）。
+
+    ⇒ 返回 `(节点日产物, 聚合件情景行, 独立重算, 代码)`；
+    夹具本身**必须通过**门槛对账（否则负例证明不了任何事）。
+    """
+    code = "999998"
+    thr = gate_mod.resolve_thresholds()
+    weight = 500.0 / float(total_assets)      # ⇒ 意图目标股数 = 500 股（1.00 元/股）
+    plan = {
+        "meta": {"total_assets": float(total_assets), "cash": 0.0},
+        "actions": [{"code": code, "name": "合成门槛夹具", "action": "卖出",
+                     "current_shares": 1000, "target_shares": 500, "delta_shares": -500,
+                     "target_weight": weight, "target_amount": 500.0, "price": 1.0,
+                     "ta_rejected": False, "held_not_touched": False}],
+        "llm_final_decision": {"targets": {}},
+    }
+    payload = {
+        "meta": {"total_assets": float(total_assets)},
+        "min_amount_gate": {
+            "enabled": True, "thresholds": thr, "skipped_count": 1,
+            "skipped": [{"code": code, "name": "合成门槛夹具", "kind": "存量微调",
+                         "amount": 500.0, "threshold": float(thr["存量微调"]),
+                         "min_commission_saved": 5.0, "effective_bp": 100.0}],
+        },
+        "actions": [{"code": code, "name": "合成门槛夹具", "action": "持有",
+                     "current_shares": 1000, "target_shares": 1000, "delta_shares": 0,
+                     "est_amount": 0.0, "est_fee": 0.0, "price": 1.0,
+                     "target_weight": weight,
+                     "target_weight_effective": 1000.0 / float(total_assets),
+                     "weight_to_cash": weight - 1000.0 / float(total_assets),
+                     "min_amount_skipped": True, "min_amount_kind": "存量微调",
+                     "min_amount_threshold": float(thr["存量微调"]),
+                     "min_amount_skipped_amount": 500.0,
+                     "ta_rejected": False, "held_not_touched": False}],
+    }
+    agg_scenario = {"label": "合成夹具（门槛作废）", "choices": {}, "positions": [],
+                    "trades": [], "slot_breaches": []}
+    view = _scenario_gate_view(plan, {}, payload, total_assets, None)
+    return payload, agg_scenario, view, code
+
+
+def _d5_fake_open_negative(scen, payloads, views, total_assets):
+    """D5 真负例：把「被门槛作废」的行改成 **delta ≠ 0（伪造建仓）** ⇒ 门槛断言必须 FAIL。"""
+    case = _find_blocked_case(scen, payloads, views)
+    if case is None:
+        payload, agg_scenario, view, code = _synth_blocked_case(total_assets)
+        source = "合成夹具（本轮产物里没有「被门槛作废」的行）"
+    else:
+        s, payload, view, code = case
+        agg_scenario = s
+        source = f"真实产物情景 {s.get('label')}"
+    base = _gate_disclosure_problems(payload, agg_scenario, view, None)
+    mutated = copy.deepcopy(agg_scenario)
+    judge = view.get(code) or {}
+    mutated.setdefault("trades", []).append({
+        "code": code, "name": "伪造建仓", "action": "买入",
+        "current_shares": int(judge.get("current_shares") or 0),
+        "target_shares": int(judge.get("current_shares") or 0) + LOT,
+        "delta_shares": LOT, "price": float(judge.get("price") or 0.0),
+        "est_amount": LOT * float(judge.get("price") or 0.0), "est_fee": 0.0,
+        "target_weight_pct": 0.0, "slot_breach": False,
+    })
+    probs = _gate_disclosure_problems(payload, mutated, view, None)
+    detected = any(code in p for p in probs)
+    detail = (f"{source}：{code}（{judge.get('kind')} {judge.get('amount')} 元 "
+              f"< {judge.get('threshold')} 元 ⇒ 门槛作废）被伪造成 delta={LOT} 的建仓后，"
+              f"门槛对账检出 {len(probs)} 条违例 ⇒ 闸门会 FAIL")
+    if base:
+        detail = f"⚠️ 夹具本身就不自洽（{base[0]}）⇒ 负例证明力有限"
+    elif not detected:
+        detail = "改坏后门槛对账**未**检出 ⇒ 闸门无牙"
+    return detected and not base, detail
+
+
+def _d6_missing_disclosure_negative(scen, payloads, views, total_assets):
+    """D6 真负例：把门槛披露里某条 **skipped 记录删掉** ⇒ 门槛对账必须 FAIL。"""
+    case = _find_blocked_case(scen, payloads, views)
+    if case is None:
+        payload, agg_scenario, view, code = _synth_blocked_case(total_assets)
+        source = "合成夹具（本轮产物里没有「被门槛作废」的行）"
+    else:
+        s, payload, view, code = case
+        agg_scenario = s
+        source = f"真实产物情景 {s.get('label')}"
+    base = _gate_disclosure_problems(payload, agg_scenario, view, None)
+    mutated = copy.deepcopy(payload)
+    gate = mutated.get("min_amount_gate") or {}
+    gate["skipped"] = [rec for rec in (gate.get("skipped") or [])
+                       if str(rec.get("code") or "").zfill(6) != code]
+    mutated["min_amount_gate"] = gate
+    probs = _gate_disclosure_problems(mutated, agg_scenario, view, None)
+    detected = any(code in p for p in probs)
+    detail = (f"{source}：把 {code} 的 skipped 记录删掉后，门槛对账检出 {len(probs)} 条违例"
+              f"⇒ 闸门会 FAIL")
+    if base:
+        detail = f"⚠️ 夹具本身就不自洽（{base[0]}）⇒ 负例证明力有限"
+    elif not detected:
+        detail = "删掉披露记录后门槛对账**未**检出 ⇒ 闸门无牙"
+    return detected and not base, detail
 
 
 class Checker:
@@ -361,20 +824,44 @@ def main() -> int:
     tmp_root = tmp_parent / "_node_scen_probe_tmp"
     shutil.rmtree(tmp_root, ignore_errors=True)
     tmp_root.mkdir(parents=True, exist_ok=True)
+    #: 🔴 逐情景的节点日产物（含门槛披露）单独落**数据集工作区**（本项目允许的落点根之一）
+    #:    ⇒ 跑完必删（`finally`）。
+    payload_dir = C.WORK_ROOT / "_node_scen_probe_payloads"
+    shutil.rmtree(payload_dir, ignore_errors=True)
+    payload_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         # --- 跑默认（规则层）与聚合件 ---
-        rc_def, log_def = run([sys.executable, str(REPRICE), "--node-date", "2026-11-04",
+        rc_def, log_def = run([sys.executable, str(REPRICE), "--node-date", NODE_DATE,
+                               "--plan", str(plan_path), "--prices", str(C.ETF_PRICES_CSV),
                                "--out-dir", str(tmp_root / "def")], REPO_ROOT)
         default_payload = {}
         if rc_def == 0:
-            default_payload = read_json(tmp_root / "def" / "node_reprice_20261104.json",
-                                        "默认重算产物")
-        rc_batch, log_batch = run([sys.executable, str(BATCH), "--node-date", "2026-11-04",
+            default_payload = read_json(
+                tmp_root / "def" / f"node_reprice_{NODE_DATE.replace('-', '')}.json",
+                "默认重算产物")
+        rc_batch, log_batch = run([sys.executable, str(BATCH), "--node-date", NODE_DATE,
+                                   "--plan", str(plan_path), "--prices", str(C.ETF_PRICES_CSV),
+                                   "--choices-from", str(choices_path),
                                    "--out-dir", str(tmp_root / "agg")], REPO_ROOT)
         agg = {}
         if rc_batch == 0:
-            agg = read_json(tmp_root / "agg" / "node_scenarios_20261104.json", "情景聚合件")
+            agg = read_json(
+                tmp_root / "agg" / f"node_scenarios_{NODE_DATE.replace('-', '')}.json",
+                "情景聚合件")
+        #: 🔴 逐情景的节点日产物（**带门槛披露** `min_amount_gate`）——
+        #:    聚合件不携带门槛披露 ⇒ 探针必须自己再跑一遍 `reprice_node_day.py --scenario`
+        #:    （参数与 `make_node_scenarios.py` 逐项一致 ⇒ 同一份产物）。
+        scen_payloads = _run_scenario_payloads(NODE_DATE, plan_path, C.ETF_PRICES_CSV,
+                                               payload_dir, combos)
+        #: 每个情景的**独立重算**（意图目标股数 + 门槛判定）⇒ `{情景签名: {代码: 判定}}`
+        views: dict[str, dict] = {}
+        for _label, _choices in combos:
+            _sig = _signature(_choices)
+            _payload = scen_payloads.get(_sig)
+            if _payload is None:
+                continue
+            views[_sig] = _scenario_gate_view(plan, _choices, _payload, _total_assets, None)
         #: 分歧码集合 / 期望情景数：**从当前产物 payload 动态取**（N 个分歧项 ⇒ 2^N 情景）
         #: 🔴 不写死 8 / 16 / 3 / 4 ⇒ 分歧项换人时探针不用改，也不会与新产物错配。
         agg_codes = divergence_codes(agg.get("scenarios") or [])
@@ -498,48 +985,52 @@ def main() -> int:
                     "；".join(p7_problems) if p7_problems
                     else f"{len(scen)} 个情景手推全对")
 
-        # --- P8 破单席标记完整性（独立重算）---
+        # --- P8 破单席标记完整性（独立重算，**门槛感知**）---
+        #: 🔴 口径（与 `reprice_node_day.py` 的 `slot_breach` 判据同源）：
+        #:    **落地持仓金额**（落地股数 × 节点日价）> 单席上限 ⇔ 有 `slot_breach` 标记；
+        #:    宇宙 = 聚合件的**落地持仓全集** `positions`（含「本轮不动」的仓位）
+        #:    —— 用 `trades`（变动股数 ≠ 0）当宇宙 ⇒ 会漏掉「已经在仓、目标仍超单席上限」的席位
+        #:    ⇒ 口径对不上（产品按全集判、探针按变动集判）⇒ 假红。
+        #:    度量 = **自己算**（`target_shares × price`）—— **不信产品给的金额字段**
+        #:    ⇒ 与 `make_decision_scenarios.py` 的破单席清单同口径。
+        #: 🔴 2026-11-10 修（实测红灯）：**「positions 键缺失」与「positions 为空」是两回事**。
+        #:    合法空仓 ⇒ `positions` 键**存在**但**是空数组** ⇒ 独立重算的宇宙是 ∅
+        #:    ⇒ 破单席也必须为空（⇒ 照常校验）；**键缺失** = 产物结构不完整（⇒ FAIL）。
+        #: 🔴 2026-11-13 修（最小调仓门槛上线后的**真红**）：**被门槛作废的行**单列 ——
+        #:    产品把破单席判定算在**门槛作废之前**（`reprice_node_day.py` 第 408-438 行判、
+        #:    第 488 行才作废）⇒ 该行的标记按「**门槛前**的目标股数」判定
+        #:    ⇒ 本探针按**同一顺序**独立重算（闸门保持有牙），
+        #:    并把「落地后已超单席上限、但产物未标记」的事实**如实披露**（生产缺口）。
         p8_problems = list(_scen_missing)
-        for s in scen:
-            claimed = {b["code"] for b in s.get("slot_breaches", [])}
-            #: 🔴 宇宙 = 聚合件的**落地持仓全集** `positions`（含「本轮不动」的仓位）；
-            #:    用 `trades`（变动股数 ≠ 0）当宇宙 ⇒ 会漏掉「已经在仓、目标仍超单席上限」的席位
-            #:    ⇒ 口径对不上（产品按全集判、探针按变动集判）⇒ 假红。
-            #:    度量 = **落地金额**（落地股数 × 节点日价）—— **不信产品给的金额字段**，
-            #:    自己用 `target_shares × price` 算 ⇒ 与 `reprice_node_day.py` 的
-            #:    `slot_breach` 判据、`make_decision_scenarios.py` 的破单席清单同口径。
-            #: 🔴 2026-11-10 修（实测红灯）：**「positions 键缺失」与「positions 为空」是两回事**。
-            #:    实测：全 B 情景（`512010=B,512800=B,515450=B,515650=B`）是**合法的空仓**
-            #:    （现金 29,845.35 元 = 99.97%，落地持仓 0 只）⇒ `positions` 键**存在**但**是空数组**。
-            #:    旧实现用 `s.get("positions") or []` ⇒ 空数组被当成「键缺失」⇒ 误判 FAIL（假红）。
-            #:    正确口径：**键缺失** = 产物结构不完整（⇒ FAIL）；
-            #:    **键存在但为空** = 合法空仓 ⇒ 独立重算的宇宙是 ∅ ⇒ 破单席也必须为空（⇒ 照常校验）。
-            if "positions" not in s:
-                p8_problems.append(
-                    f"{s.get('label')} 聚合件里**没有 positions 键**（落地持仓全集）"
-                    "⇒ 产物结构不完整 ⇒ 无法独立重算破单席")
-                continue
-            positions = s.get("positions") or []
-            recomputed = {p["code"] for p in positions
-                          if float(p.get("target_shares") or 0) * float(p.get("price") or 0.0)
-                          > slot_limit + 0.005}
-            if claimed != recomputed:
-                p8_problems.append(f"{s.get('label')} 重算 {recomputed} vs 产物 {claimed}")
+        _p8_stale: list[str] = []
+        if scen:
+            _p8_found, _p8_stale = _slot_breach_problems(scen, views, slot_limit)
+            p8_problems.extend(_p8_found)
         p8_ok = not p8_problems
+        _p8_detail = "；".join(p8_problems) if p8_problems else (
+            f"{len(scen)} 个情景的破单席标记与独立重算全一致"
+            f"（落地金额 > 单席上限 {slot_limit:.2f} 元 ⇔ 标记）")
+        if _p8_stale:
+            _p8_detail += ("｜🔴 口径分叉（破单席标记与门槛后落地不一致）："
+                           + "；".join(_p8_stale))
         checker.add("P8", "独立重算：破单席标记完整（落地金额 > 单席上限 ⇔ 标记）", p8_ok,
-                    "；".join(p8_problems) if p8_problems
-                    else f"{len(scen)} 个情景的破单席标记与独立重算全一致")
+                    _p8_detail)
+        if _p8_stale:
+            print("🔴 [口径分叉 · 破单席标记与门槛后落地不一致] " + "；".join(_p8_stale)
+                  + "｜生产已于 2026-11-13 把破单席判定挪到 `apply_min_trade_threshold` "
+                    "**之后**（按最终落地股数 × 节点日价）⇒ 这里不一致 ⇒ 闸门判红")
 
         # --- P9 幂等 ---
         p9_detail = ""
         p9_ok = False
         if rc_batch == 0:
-            rc2, _ = run([sys.executable, str(BATCH), "--node-date", "2026-11-04",
+            rc2, _ = run([sys.executable, str(BATCH), "--node-date", NODE_DATE,
                           "--out-dir", str(tmp_root / "agg2")], REPO_ROOT)
             if rc2 == 0:
                 same = all(
                     sha1_of(tmp_root / "agg" / name) == sha1_of(tmp_root / "agg2" / name)
-                    for name in ("node_scenarios_20261104.json", "node_scenarios_20261104.md")
+                    for name in (f"node_scenarios_{NODE_DATE.replace('-', '')}.json",
+                                 f"node_scenarios_{NODE_DATE.replace('-', '')}.md")
                 )
                 p9_ok = same
                 p9_detail = "两次运行 json / md sha1 逐字节相同" if same else "两次运行 sha1 不同"
@@ -549,40 +1040,47 @@ def main() -> int:
             p9_detail = f"第一次运行退出码 {rc_batch}"
         checker.add("P9", "幂等：聚合件两次独立运行逐字节相同", p9_ok, p9_detail)
 
-        # --- P10 情景覆盖语义（选项 B 按 llm_final_decision 落地）---
+        # --- P10 情景覆盖语义（选项 B 按 llm_final_decision 落地，**门槛感知**）---
+        #: 🔴 2026-11-13 修（最小调仓门槛上线后的**真红**）：选项 B 的落地意图要**先过门槛** ——
+        #:    意图调整金额 < 该档门槛 ⇒ 门槛作废（行保留、delta=0、金额=0）⇒ 产物**不调仓是对的**
+        #:    ⇒ 旧口径（直接要求「必须有这笔交易」）把「门槛作废」判成「应建仓但没建」⇒ **假红**。
+        #:    实测：情景 `512800=B` 意图 5,400 股（卖 2,300 股 = 2,010.20 元）
+        #:    < 存量微调门槛 2,800 元 ⇒ 门槛作废 ⇒ 产物不建仓是对的。
         p10_problems = list(_scen_missing)
-        llm_targets = ((plan.get("llm_final_decision") or {}).get("targets") or {})
-        for s in scen:
-            choices = s.get("choices") or {}
-            for code, letter in choices.items():
-                if letter != "B":
-                    continue
-                tgt = llm_targets.get(code) or {}
-                lots = tgt.get("lots")
-                pct = tgt.get("target_pct")
-                hit = next((t for t in s.get("trades", []) if t["code"] == code), None)
-                if lots not in (None, ""):
-                    want = int(lots) * LOT
-                    if hit is None or int(hit.get("target_shares") or 0) != want:
-                        p10_problems.append(
-                            f"{s.get('label')}/{code} 期望 {want} 股（买 {lots} 手），实际 "
-                            f"{hit.get('target_shares') if hit else '未建仓'}")
-                elif pct is not None and float(pct) == 0:
-                    if hit is not None and int(hit.get("target_shares") or 0) > 0:
-                        p10_problems.append(f"{s.get('label')}/{code} 应不建仓，实际建了仓")
-                else:
-                    if hit is None:
-                        p10_problems.append(f"{s.get('label')}/{code} 应建仓但没建")
-                    else:
-                        want_pct = float(pct or 0.0)
-                        got = float(hit.get("target_weight_pct") or 0.0)
-                        if abs(got - want_pct) > 0.05:
-                            p10_problems.append(
-                                f"{s.get('label')}/{code} 权重 {got:.4f}% vs 裁决 {want_pct:.4f}%")
+        llm_targets = _llm_targets_map(plan)
+        if scen:
+            p10_problems.extend(_p10_problems(scen, views, llm_targets))
         p10_ok = not p10_problems
-        checker.add("P10", "情景覆盖语义：选项 B 的落地股数/权重与 llm_final_decision 一致", p10_ok,
+        _p10_blocked = sorted({code for _sig, _view in views.items()
+                                for code, _j in _view.items() if _j.get("blocked")})
+        checker.add("P10", "情景覆盖语义：选项 B 的落地股数/权重与 llm_final_decision 一致"
+                    "（门槛作废行按门槛语义：不调仓 + 披露对账）", p10_ok,
                     "；".join(p10_problems) if p10_problems
-                    else "B 选项逐项按 lots / target_pct 落地")
+                    else "B 选项逐项按 lots / target_pct 落地"
+                         f"（门槛作废行 {'/'.join(_p10_blocked) or '无'}：不调仓是符合门槛语义的）")
+
+        # --- P11 最小调仓门槛披露对账（独立重算 ⇔ 产物披露）---
+        #: 🔴 「被门槛作废的行」必须**如实披露**（`min_amount_gate.skipped`）且
+        #:    **逐条对账**（code / kind / amount / threshold 一致）+ 该行 **delta=0、金额=0**
+        #:    —— 否则「门槛悄悄把一笔调仓吃掉」谁也看不出来。
+        p11_problems = list(_scen_missing)
+        _p11_detail: list[str] = []
+        for s in scen:
+            _sig = _signature(s.get("choices") or {})
+            _payload = scen_payloads.get(_sig)
+            if _payload is None:
+                p11_problems.append(f"{s.get('label')} 缺该情景的节点日产物 ⇒ 无法对账门槛披露")
+                continue
+            _view = views.get(_sig) or {}
+            for _prob in _gate_disclosure_problems(_payload, s, _view, None):
+                p11_problems.append(f"{s.get('label')}/{_prob}")
+            _blocked = [f"{c}({j['kind']} {j['amount']:.2f}<{j['threshold']:.0f})"
+                        for c, j in sorted(_view.items()) if j.get("blocked")]
+            _p11_detail.append(f"{s.get('label')}：作废 {'/'.join(_blocked) or '无'}")
+        p11_ok = not p11_problems
+        checker.add("P11", "最小调仓门槛披露对账（独立重算 ⇔ 产物 skipped：code/kind/amount/threshold"
+                    " + 作废行 delta=0 / 金额=0 / 目标股数回退）", p11_ok,
+                    "；".join(p11_problems) if p11_problems else "；".join(_p11_detail))
 
         # --- D1 非法情景字母 ---
         # 🔴 负例必须用「当前产物里的**真实分歧码** + 非法字母」：
@@ -592,7 +1090,7 @@ def main() -> int:
         d1_ok = False
         d1_detail = "推不出分歧码集合 ⇒ 负例无法构造"
         if d1_code:
-            rc_d1, out_d1 = run([sys.executable, str(REPRICE), "--node-date", "2026-11-04",
+            rc_d1, out_d1 = run([sys.executable, str(REPRICE), "--node-date", NODE_DATE,
                                  "--out-dir", str(tmp_root / "d1"), "--scenario", f"{d1_code}=X"],
                                 REPO_ROOT)
             d1_ok = rc_d1 != 0 and ("X" in out_d1 and "非法" in out_d1)
@@ -601,7 +1099,7 @@ def main() -> int:
         checker.add("D1", "真负例：情景字母非法（X）⇒ 退出码 ≠ 0 且中文报错", d1_ok, d1_detail)
 
         # --- D2 未知代码 ---
-        rc_d2, out_d2 = run([sys.executable, str(REPRICE), "--node-date", "2026-11-04",
+        rc_d2, out_d2 = run([sys.executable, str(REPRICE), "--node-date", NODE_DATE,
                              "--out-dir", str(tmp_root / "d2"), "--scenario", "999999=B"],
                             REPO_ROOT)
         d2_ok = rc_d2 != 0 and "999999" in out_d2 and "不在计划件" in out_d2
@@ -640,13 +1138,24 @@ def main() -> int:
         #:    **必须**补一条负例钉死「空仓情景不许白过」——
         #:    给一个**空 positions** 的情景硬塞一条 `slot_breaches` ⇒ 独立重算（宇宙 = ∅）
         #:    必然与产物对不上 ⇒ 探针必须 FAIL。
-        d4_ok, d4_detail = _d4_empty_position_negative(agg, slot_limit)
+        d4_ok, d4_detail = _d4_empty_position_negative(agg, views, slot_limit)
         checker.add("D4",
                     "真负例：空仓情景（positions 为空）里塞破单席 ⇒ 独立重算必须 FAIL（证明闸门有牙）",
                     d4_ok, d4_detail)
 
+        # --- D5 伪造「被门槛作废」的行建仓 ⇒ 门槛对账必须 FAIL ---
+        d5_ok, d5_detail = _d5_fake_open_negative(scen, scen_payloads, views, _total_assets)
+        checker.add("D5", "真负例：把「被门槛作废」的行改成 delta≠0（伪造建仓）"
+                    " ⇒ 门槛对账必须 FAIL（证明闸门有牙）", d5_ok, d5_detail)
+
+        # --- D6 门槛披露漏记 ⇒ 门槛对账必须 FAIL ---
+        d6_ok, d6_detail = _d6_missing_disclosure_negative(scen, scen_payloads, views, _total_assets)
+        checker.add("D6", "真负例：把门槛披露里某条 skipped 记录删掉"
+                    " ⇒ 门槛对账必须 FAIL（证明闸门有牙）", d6_ok, d6_detail)
+
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+        shutil.rmtree(payload_dir, ignore_errors=True)
 
     failed = [it for it in checker.items if not it[2]]
     for check_id, name, ok, detail in checker.items:

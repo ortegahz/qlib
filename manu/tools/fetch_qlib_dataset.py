@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,22 @@ from pathlib import Path
 
 API = "https://api.github.com"
 UA = "manu-qlib-fetch/1.0"
+
+#: aria2c 的关键防坑参数（2026-11-16 线上事故后固化）：
+#:
+#: 上游会重新上传（re-upload）同一个 release 资产 —— 字节数可能变小（内容等价，
+#: 例如 11-13 的 571,492,836 B 变成 11-16 的 571,459,530 B）。
+#: aria2c 默认 --auto-file-renaming=true：目标文件已存在时它会自动改名写
+#: qlib_bin.tar.1.gz / .2.gz / .3.gz…，而本工具只检查 qlib_bin.tar.gz 的大小
+#: 于是每一轮都判定「未完成」，每轮空转约 12 分钟 x 40 轮，约等于 8 小时死循环。
+#:
+#: 修法（两条都要）：
+#:   1. --auto-file-renaming=false：禁止自动改名，直接写 dest；
+#:   2. --allow-overwrite=true：dest 已存在时不报错退出（配合 -c 走断点续传）。
+#:
+#: 另外「本地 >= 期望」也必须判为已完整（上游 re-upload 变小属正常），
+#: 否则会对着一个等价的旧资产反复重下。
+ARIA2_EXTRA_ARGS = ["--auto-file-renaming=false", "--allow-overwrite=true"]
 
 
 @dataclass
@@ -154,6 +171,56 @@ def md5_of(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def renamed_siblings(dest: Path) -> list[Path]:
+    """列出 aria2c 自动改名产生的兄弟文件（qlib_bin.tar.1.gz / .2.gz …）与 .aria2 控制文件。
+
+    aria2c 的改名规则是「把数字插在扩展名之前」：``qlib_bin.tar.gz`` -> ``qlib_bin.tar.1.gz``。
+    这些残留文件会白占磁盘（本例每个 571 MB），且掩盖「本地其实已经完整」的事实。
+    """
+    if not dest.exists() and not dest.parent.exists():
+        return []
+    stem = dest.name[: -len(dest.suffix)] if dest.suffix else dest.name
+    suffix = dest.suffix
+    pattern = re.compile(rf"^{re.escape(stem)}\.\d+{re.escape(suffix)}$")
+    out: list[Path] = []
+    for path in sorted(dest.parent.iterdir()):
+        if not path.is_file() or path == dest:
+            continue
+        if pattern.match(path.name) or path.name == dest.name + ".aria2":
+            out.append(path)
+    return out
+
+
+def cleanup_artifacts(dest: Path, *, remove_siblings: bool = True) -> list[str]:
+    """清理下载副产物：.aria2 控制文件 + aria2c 改名残留。返回被删文件列表。"""
+    removed: list[str] = []
+    ctrl = dest.with_suffix(dest.suffix + ".aria2")
+    if ctrl.exists():
+        ctrl.unlink()
+        removed.append(ctrl.name)
+    if remove_siblings:
+        for path in renamed_siblings(dest):
+            try:
+                path.unlink()
+            except OSError:  # noqa: BLE001
+                continue
+            removed.append(path.name)
+    return removed
+
+
+def gzip_ok(path: Path) -> bool | None:
+    """用 gzip -t 校验压缩包完整性。返回 True/False；环境没有 gzip 时返回 None（不判失败）。"""
+    if shutil.which("gzip") is None:
+        return None
+    proc = subprocess.run(
+        ["gzip", "-t", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
 def download_once(signed_url: str, dest: Path, expected: int, min_speed: int, speed_time: int) -> int:
     """跑一轮续传下载。返回退出码 (0 = 本轮完成)。
 
@@ -168,6 +235,8 @@ def download_once(signed_url: str, dest: Path, expected: int, min_speed: int, sp
             "--console-log-level=warn", "--summary-interval=30",
             "--connect-timeout=20", "--timeout=60",
             "--max-tries=3", "--retry-wait=3",
+            # 防「自动改名 ⇒ 本工具永远看不到完整文件」的死循环（见 ARIA2_EXTRA_ARGS）
+            *ARIA2_EXTRA_ARGS,
             # 注意: aria2 1.35 没有 --lowest-speed-limit/--lowest-speed-time (那是 curl 的选项),
             # 误加会让 aria2c 直接以 rc=28 退出, 之前 13 轮空转就是这么来的。
             # 停滞检测改由外层轮次比较字节数完成。
@@ -202,7 +271,7 @@ def fetch(src: Source, min_speed: int, speed_time: int, max_rounds: int, verify_
         if src.expected_size is None:
             _, src.expected_size = resolve_asset(src.repo, src.tag, src.asset)
         size = dest.stat().st_size if dest.exists() else 0
-        ok = size == src.expected_size
+        ok = size >= src.expected_size
         log(f"[{src.key}] 校验: 本地 {size:,} / 期望 {src.expected_size:,} -> {'OK' if ok else '不完整'}")
         return ok
 
@@ -219,21 +288,33 @@ def fetch(src: Source, min_speed: int, speed_time: int, max_rounds: int, verify_
         src.signed_url = signed
 
         have = dest.stat().st_size if dest.exists() else 0
-        if have == size:
-            log(f"[{src.key}] 文件已完整 {have:,} 字节, 跳过下载")
-            return True
+        if have >= size:
+            # 🔴 必须是 >= 而不是 ==：上游 re-upload 后资产变小（内容等价），
+            #    本地旧资产比期望大 => 依然算「已完整」，不该再白下 12 分钟。
+            log(f"[{src.key}] 文件已完整 {have:,} 字节 (>= 期望 {size:,}), 跳过下载")
+            ok_gz = gzip_ok(dest)
+            if ok_gz is False:
+                log(f"[{src.key}] ⚠️ gzip 完整性校验失败, 删除后重新下载")
+                dest.unlink(missing_ok=True)
+                cleanup_artifacts(dest, remove_siblings=False)
+                have = 0
+            else:
+                removed = cleanup_artifacts(dest)
+                if removed:
+                    log(f"[{src.key}] 清理下载副产物: {removed}")
+                return True
         log(f"[{src.key}] 第 {round_no}/{max_rounds} 轮 | 已有 {have:,} / 期望 {size:,} "
             f"({100.0 * have / size:.1f}%)")
         log(f"[{src.key}] 直链已解析 (签名直链, 绕过 github.com 重定向)")
 
         rc = download_once(signed, dest, size, min_speed, speed_time)
         now = dest.stat().st_size if dest.exists() else 0
-        if src.expected_size and now == src.expected_size:
+        if src.expected_size and now >= src.expected_size:
             log(f"[{src.key}] ✅ 下载完成 {now:,} 字节")
-            # aria2c 的续传控制文件已无意义, 删掉避免下次误判为未完成
-            ctrl = dest.with_suffix(dest.suffix + ".aria2")
-            if ctrl.exists():
-                ctrl.unlink()
+            # aria2c 的续传控制文件与改名残留已无意义, 删掉避免下次误判为未完成
+            removed = cleanup_artifacts(dest)
+            if removed:
+                log(f"[{src.key}] 清理下载副产物: {removed}")
             return True
         src.history.append(f"round{round_no}: rc={rc} {now:,}/{size:,}")
         progressed = now > have
@@ -252,6 +333,11 @@ def main() -> int:
     ap.add_argument("--speed-time", type=int, default=30, help="停滞判定秒数")
     ap.add_argument("--max-rounds", type=int, default=40, help="单源最大重试轮数")
     ap.add_argument("--verify-only", action="store_true", help="只校验本地文件完整性")
+    ap.add_argument(
+        "--cleanup-only",
+        action="store_true",
+        help="只清理下载副产物（aria2c 改名残留 + .aria2 控制文件），不下载",
+    )
     args = ap.parse_args()
 
     if shutil.which("curl") is None:
@@ -259,6 +345,13 @@ def main() -> int:
         return 2
 
     keys = args.source or ["chenditc", "sunsetwolf_cn", "sunsetwolf_simple"]
+    if args.cleanup_only:
+        for key in keys:
+            meta = SOURCES[key]
+            dest = Path(args.dest_dir) / meta["asset"]
+            removed = cleanup_artifacts(dest)
+            log(f"[{key}] 清理 {dest}: {removed or '无残留'}")
+        return 0
     sources = [
         Source(key=k, repo=SOURCES[k]["repo"], tag=SOURCES[k]["tag"], asset=SOURCES[k]["asset"],
                dest_dir=args.dest_dir, note=SOURCES[k]["note"])

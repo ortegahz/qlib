@@ -387,6 +387,34 @@ def _md_table_rows(decision_md: str) -> list[tuple[int, list[str]]]:
     return rows
 
 
+#: 「纯代码格」允许的**分隔符**（代码之间只能有这些 + 反引号/括号/空白）。
+#: 🔴 2026-11-17（真机跑批 `snapshots/20261117_085229` · G-TA1 假红实证）：
+#:    真机研究经理表里有一行是「**多个**代码共用一个方向格」：
+#:       「| `516310`、`515020`、`512820` | **卖/不买，正式否决** | …」
+#:    ⇒ 旧口径只认「整格就是一个代码」⇒ 这 12 只**取不到任何方向证据**
+#:    ⇒ 闸门把它们判成「**不适用**（≠ 通过）」⇒ 整个阶段退出码 2（不是通过）。
+#:    ⇒ 修法：**纯代码格**放宽到「格子里**只有**代码与分隔符」⇒ 多代码格同样算数。
+#:    ⚠️ 「与 `515450` 相关性 0.917」这种**顺带提到**的格**仍然不算**
+#:       （格里有非代码文字 ⇒ 直接排除）⇒ 老口径的护栏不丢。
+_PURE_CODE_CELL_RE = re.compile(r"^[\s*_~`（()）]*(?:[、，,/·;；]*[\s*_~`（()）]*)*$")
+
+
+def _cell_codes(cell: str) -> list[str]:
+    """单元格里的**纯代码列表** ⇒ `[code, ...]`；格子里混了别的字 ⇒ `[]`。
+
+    🔴 口径：把格子里所有 6 位代码抠出来 ⇒ 剩下的部分**只允许**空白 / 反引号 /
+       括号 / 分隔符（、，,/ · 等）⇒ 任何实义文字 ⇒ 判「不是纯代码格」。
+    """
+    text = str(cell or "")
+    codes = re.findall(r"[1-9]\d{5}", text)
+    if not codes:
+        return []
+    rest = re.sub(r"[1-9]\d{5}", "", text)
+    if not _PURE_CODE_CELL_RE.match(rest):
+        return []
+    return codes
+
+
 def _md_table_directions(decision_md: str, code: str) -> list[tuple[str, str]]:
     """决策 md **表格行**里该代码的方向证据 ⇒ `[(来源, 方向词)]`。
 
@@ -394,25 +422,28 @@ def _md_table_directions(decision_md: str, code: str) -> list[tuple[str, str]]:
       · **只认表格行** —— 2026-11-11 事故的根因正是**散文归属错位**
         （`llm_final._prose_hits` 把「不建仓」挂到了「与 515450 相关性…」里的
         515450 上）⇒ 拿散文当证据 = 重犯同一个错；
-      · **只认「纯代码格」** —— 该格**整个**就是一个 6 位代码 ⇒「与 515450 相关性 0.917」
-        这种顺带提到代码的格子**不算**代码格（否则会把别的行的方向挂到它头上）；
+      · **只认「纯代码格」** —— 该格**整个**就是一个 6 位代码（**或**若干个代码
+        加分隔符，见 `_cell_codes`）⇒「与 515450 相关性 0.917」这种顺带提到
+        代码的格子**不算**代码格（否则会把别的行的方向挂到它头上）；
       · 方向格 = 代码格**相邻**的格子（方向列在代码列**前**或**后**两种版式都见过）。
     """
     found: list[tuple[str, str]] = []
     for line_no, cells in _md_table_rows(decision_md):
+        row_seen: set[str] = set()
         for index, cell in enumerate(cells):
-            if _norm_cell(cell) != code:
-                continue
-            for offset in range(-_DIR_WINDOW, _DIR_WINDOW + 1):
-                if offset == 0:
+            for cell_code in _cell_codes(cell):
+                if cell_code != code or cell_code in row_seen:
                     continue
-                pos = index + offset
-                if not 0 <= pos < len(cells):
-                    continue
-                direction = _classify_cell_direction(cells[pos])
-                if direction:
-                    found.append((f"md:L{line_no}", direction))
-            break
+                row_seen.add(cell_code)
+                for offset in range(-_DIR_WINDOW, _DIR_WINDOW + 1):
+                    if offset == 0:
+                        continue
+                    pos = index + offset
+                    if not 0 <= pos < len(cells):
+                        continue
+                    direction = _classify_cell_direction(cells[pos])
+                    if direction:
+                        found.append((f"md:L{line_no}", direction))
     return found
 
 
@@ -565,6 +596,18 @@ def find_ta_reject_mis_hits(plan: dict, decision_md: str | None = None) -> dict:
         ranks = _plan_direction_ranks(plan, code)
         ranks.update(_md_direction_ranks(decision_md or "", code))
         buy_rank = max((ranks.get(src, 0) for src, _d in buy_evidence), default=-1)
+        # 🔴 2026-11-17（真机跑批 `snapshots/20261117_085229` · G-TA1 假红实证）：
+        #    **层级 0 = 观点层 / 认不出来的章节** ⇒ 「观点层的『买』」**不构成**
+        #    「TA 明确要买」（与 `tests/test_probe_ta_reject_authority_rank.py::
+        #    test_opinion_level_buy_evidence_is_not_enough` 同一口径：
+        #    观点层没有否决权，也没有「要买」的约束力）。
+        #    ⇒ 旧口径把「层级 0 的买侧证据」与「层级 0（认不出出处）的否决」**打平**
+        #    ⇒ 真机件里「多头表写 `515650` 买入」被当成「否决名单误伤」⇒ **假红**
+        #    （真机事实：515650 在**研究经理层**是**真否决**，多头那句只是观点，
+        #      最终裁决/研究经理/辩论裁决三处都否决它 ⇒ 否决成立）。
+        #    ⇒ 层级 0 的买侧证据**一律不构成**买指令（不是放行，是「不构成证据」）。
+        if buy_rank <= 0:
+            continue
         if buy_rank >= veto_rank:
             mis_hits.append({
                 "code": code,
@@ -627,6 +670,21 @@ def _inject_rejected_code(plan: dict, code: str) -> dict:
     screening.setdefault("enabled", True)
     out["ta_screening"] = screening
     return out
+
+
+def _pick_target_code(plan: dict) -> str | None:
+    """从 `llm_targets` 里挑一个**真有非零目标**的代码（优先 512800）。
+
+    🔴 2026-11-09 修：N9/N10 原先**写死** `llm_targets["512800"]`
+    ⇒ 计划里没有 512800 的目标（LLM 裁决没提它）时直接 KeyError 崩溃。
+    🔴 2026-11-17：提到**模块级**（原先是 `main()` 里的闭包）⇒ 单测能直接盖住它。
+    """
+    _targets = plan.get("llm_targets") or {}
+    for _code in ("512800", *sorted(_targets)):
+        _row = _targets.get(_code)
+        if isinstance(_row, dict) and (_row.get("target_pct") or 0):
+            return _code
+    return None
 
 
 def _pick_buy_side_code(plan: dict, excluded: list[str]) -> str | None:
@@ -1005,17 +1063,6 @@ def main() -> int:
         shutil.rmtree(scratch, ignore_errors=True)
         return 2
 
-    def _pick_target_code(plan: dict) -> str | None:
-        """🔴 2026-11-09 修：N9/N10 原先**写死** `llm_targets["512800"]`
-        ⇒ 计划里没有 512800 的目标（LLM 裁决没提它）时直接 KeyError 崩溃。
-        ⇒ 改成「从 llm_targets 里挑一个**真有非零目标**的代码」（优先 512800）。
-        """
-        _targets = plan.get("llm_targets") or {}
-        for _code in ("512800", *sorted(_targets)):
-            _row = _targets.get(_code)
-            if isinstance(_row, dict) and (_row.get("target_pct") or 0):
-                return _code
-        return None
     lines: list[str] = []
     failures = 0
     passes = 0
@@ -1274,10 +1321,19 @@ def main() -> int:
     #    代码就 KeyError 崩溃；现在「从 llm_targets 里挑一个真有非零目标的代码」）。
     #    若**一个都没有** ⇒ 无从构造变异 ⇒ 显式判红并**整块跳过** N9/N10
     #    （不许拿「未变异的计划」去跑负例 ⇒ 那会把负例变成假阳性）。
-    _probe_code = _pick_target_code(baseline_plan)
+    # 🔴 2026-11-17（真机跑批 `snapshots/20261117_085229` 假红实证）：
+    #    旧口径从**本轮真实产物**里找「带非零 target_pct 的 llm_targets 条目」
+    #    ⇒ 本轮 LLM 的裁决表**只有方向、没有目标百分比**（9 条 target_pct 全 0.0）
+    #    ⇒ 前置不满足 ⇒ N9/N10 **整块判红**（红的原因是「LLM 输出的形状」，
+    #      与守卫本身有没有牙**无关**）⇒ **探针假红**。
+    #    ⇒ 修法：与 N1~N6 **同一口径** —— 用**自建夹具**（`_fixture_plan` 里
+    #      `target_pct=10%` 的 REDUCE 条目）⇒ 任何一轮都能真的构造变异。
+    #    ⚠️ 期望**不许**从「期望 FAIL」改成「期望 PASS」（那是把断言改弱）。
+    _probe_code = _pick_target_code(_fixture)
+    _probe_base_plan = _fixture
     if _probe_code is None:
-        _record(False, "N9/N10 前置：llm_targets 里必须有带非零 target_pct 的代码（否则无从构造变异）",
-                f"llm_targets {len(baseline_plan.get('llm_targets') or {})} 条"
+        _record(False, "N9/N10 前置：自建夹具里必须有带非零 target_pct 的代码（否则无从构造变异）",
+                f"自建夹具 llm_targets {len(_fixture.get('llm_targets') or {})} 条"
                 "｜期望 ≥1 条带非零 target_pct")
         _record(False, "N9 英文方向词 Sell 配 26.96% ⇒ 语义守卫必须 FAIL（旧实现 PASS ⇒ 漏检）",
                 "**未执行**：前置不满足（无可变异的 llm_targets 条目）⇒ 不得记 PASS")
@@ -1285,7 +1341,7 @@ def main() -> int:
                 "**未执行**：前置不满足（无可变异的 llm_targets 条目）⇒ 不得记 PASS")
     else:
         # ---- N9 英文方向词（Sell）配非零目标 ⇒ 语义守卫必须 FAIL ----
-        bad_en = json.loads(json.dumps(baseline_plan))
+        bad_en = json.loads(json.dumps(_probe_base_plan))
         _v = bad_en["llm_targets"][_probe_code]
         _v["direction"] = "Sell"
         _v["target_pct"] = 26.96
@@ -1298,7 +1354,7 @@ def main() -> int:
                 "（期望 False：Sell 属 ZERO ⇒ 目标必须 0%）")
 
         # ---- N10 未分类方向词 ⇒ 语义守卫必须 FAIL（不许静默放过）----
-        bad_unk = json.loads(json.dumps(baseline_plan))
+        bad_unk = json.loads(json.dumps(_probe_base_plan))
         bad_unk["llm_targets"][_probe_code]["direction"] = "减持到三成"
         plan_path.write_text(json.dumps(bad_unk, ensure_ascii=False, indent=2), encoding="utf-8")
         exit_code, verdicts = _run_verify(scratch, project_dir)

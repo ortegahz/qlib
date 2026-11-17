@@ -49,6 +49,22 @@ for arg in "$@"; do
 done
 [ ${#PATHS[@]} -eq 0 ] && PATHS=("manu")
 
+#: 🔴 **2026-11-16 实测事故（硬护栏）**：`--delete` 会把**服务器上的构建产物**一起删掉 ——
+#:    `qlib/data/_libs/rolling*.so` / `expanding*.so` / `qlib/_version.py`
+#:    （host 是 **git 检出**，没有这些文件 ⇒ rsync 认为「服务器侧多出来的」⇒ 删掉）
+#:    ⇒ `import qlib` 直接炸：`No module named 'qlib.data._libs.rolling'`
+#:    ⇒ 整条流水线在阶段 2（S 层重算）失败。
+#:    ⇒ **硬规则：`--delete` 只许作用于 `manu/` 之内**；
+#:      任何指向仓库根 / `qlib/` / `qlib/` 子包的路径 ⇒ **直接拒绝执行**。
+if [ "$DO_DELETE" -eq 1 ]; then
+  for p in "${PATHS[@]}"; do
+    case "$p" in
+      manu|manu/*) : ;;
+      *) echo "❌ --delete 只许作用于 manu/ 之内（当前路径：$p）—— 服务器上的 qlib 构建产物（*.so / _version.py）会被误删" >&2; exit 2 ;;
+    esac
+  done
+fi
+
 echo "== 源仓库 : $SRC_REPO"
 echo "== 服务器 : $SSH_HOST:$SSH_PORT$REMOTE_ROOT"
 echo "== 同步路径: ${PATHS[*]}"

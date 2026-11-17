@@ -47,6 +47,14 @@ ASOF_PIPE="${ASOF_PIPE:-2026-11-09}"
 #: 研究链基线的 asof（**不许动**：文件名/日历下标不变 ⇒ 指纹表登记项集合恒定）
 ASOF_BASE="${ASOF_BASE:-2026-11-03}"
 
+#: 🔴 **2026-11-16 真机事故（必须钉在这里，不许依赖调用方的 shell）**：
+#:    服务器工程目录 `/tmp/pycharm_project_658d3fc4` **无 .git** ⇒ `import qlib` 会退到
+#:    `setuptools_scm.get_version()` ⇒ **探测不到版本** ⇒ `LookupError`
+#:    ⇒ 阶段 1 的 `verify_provider`（qlib 读回校验）直接炸 ⇒ **整条流水线 rc=1**
+#:    （现象：阶段 1 把 11-16 的全市场 bar 都取齐了，最后一步读回校验才挂，白跑 75 分钟）。
+#:    ⇒ 判据：`python -c "import qlib"` 在服务器上必须**免环境变量**也能过。
+export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-0.9.8}"
+
 mkdir -p "$LOG_DIR" || exit 2
 : > "$LOG"
 
@@ -112,12 +120,68 @@ cd "$PROJ" || { say "FATAL: 进不去 $PROJ"; exit 2; }
 say "=== 完整生产链启动 === proj=$PROJ run_root=$RUN asof_pipe=$ASOF_PIPE asof_base=$ASOF_BASE"
 
 # ---- 步骤 1：生产基线向前重建（含 LLM 决策；自带备份）-------------------
-say "=== 步骤 1/5：生产基线重建（rebuild_baseline.sh，含 LLM 决策）==="
-bash manu/etf_rotation/rebuild_baseline.sh --asof "$ASOF_BASE" --out-dir "$RUN" \
-     > "$LOG_DIR/step1_rebuild_baseline.log" 2>&1
-RC=$?
-record "生产基线重建（含 LLM）" "$RC" "step1_rebuild_baseline.log"
-say "   退出码=$RC"
+# 🔴 2026-11-13：新增 `SKIP_BASELINE=1` 开关（缺省 0 = 行为不变）。
+#    理由：每日链对 canonical 根（研究链基线）是**只读**的；而 canonical 根若**已经**
+#    用**当前**代码重建过（例：11:22 用修后解析器重建、决策层零漂移），
+#    再跑一遍 `rebuild_baseline.sh` 只会**重复调一次 LLM**（20+ 分钟）、
+#    并可能把已验证过的基线换成新的漂移版本 ⇒ 允许显式跳过。
+if [ "${SKIP_BASELINE:-0}" = "1" ]; then
+  say "=== 步骤 1/5：生产基线重建 —— **已显式跳过**（SKIP_BASELINE=1；canonical 根已是当前代码的产物）==="
+  record "生产基线重建（含 LLM）" "0" "—（显式跳过：SKIP_BASELINE=1）"
+else
+  say "=== 步骤 1/5：生产基线重建（rebuild_baseline.sh，含 LLM 决策）==="
+  bash manu/etf_rotation/rebuild_baseline.sh --asof "$ASOF_BASE" --out-dir "$RUN" \
+       > "$LOG_DIR/step1_rebuild_baseline.log" 2>&1
+  RC=$?
+  record "生产基线重建（含 LLM）" "$RC" "step1_rebuild_baseline.log"
+  say "   退出码=$RC"
+fi
+
+# ---- 步骤 1.5：qlib 可用性预检（自愈）--------------------------------------
+#: 🔴 **2026-11-16 实测事故**：服务器工程目录里的 **Cython 扩展**
+#:    （`qlib/data/_libs/rolling*.so` / `expanding*.so`）与 `qlib/_version.py`
+#:    被一次 `--delete` 同步误删（host 是 git 检出 ⇒ 没有这些构建产物）
+#:    ⇒ `import qlib` 炸 ⇒ **阶段 2（S 层重算）才暴露** ⇒ 白跑取数 + 75 分钟预期。
+#:    ⇒ 预检必须**在开跑前**做，且**能自愈**（重建扩展是确定性动作）。
+say "=== 步骤 1.5/5：qlib 可用性预检（import qlib ＋ Cython 扩展）==="
+_qlib_ok(){
+  ( cd "$PROJ" && SETUPTOOLS_SCM_PRETEND_VERSION="$SETUPTOOLS_SCM_PRETEND_VERSION" \
+      "$QL_PY" -c "import qlib; from qlib.data._libs import rolling, expanding" ) >/dev/null 2>&1
+}
+if _qlib_ok; then
+  say "   ✅ qlib 可用（$( cd "$PROJ" && "$QL_PY" -c 'import qlib; print(qlib.__version__)' 2>/dev/null )）"
+else
+  say "   ⚠️ qlib 不可用（多半是 Cython 扩展 / _version.py 缺失）⇒ 现场重建"
+  if "$QL_PY" -m pip install --no-deps --quiet cython >>"$LOG" 2>&1 \
+     && ( cd "$PROJ" && SETUPTOOLS_SCM_PRETEND_VERSION="$SETUPTOOLS_SCM_PRETEND_VERSION" \
+          "$QL_PY" setup.py build_ext --inplace ) >>"$LOG" 2>&1 \
+     && _qlib_ok; then
+    say "   ✅ 重建成功（qlib 可用）"
+  else
+    say "   🔴 **重建失败** ⇒ qlib 不可用 ⇒ 本轮无法开跑（详见 $LOG）"
+    record "qlib 预检（重建自愈）" "2" "—（qlib 不可用且重建失败）"
+    write_summary
+    exit 2
+  fi
+fi
+
+#: 🔴 **2026-11-16 实测事故**：服务器工程目录里的 **`TradingAgents/` 子项目整个被删**
+#:    （`run_tradingagents.py --ta-dir $PROJ/TradingAgents` ⇒ `sys.path.insert` 指向空目录
+#:    ⇒ `from tradingagents.default_config import DEFAULT_CONFIG` ⇒ `ModuleNotFoundError`
+#:    ⇒ 阶段 4（多智能体辩论）炸 ⇒ 前面 23 分钟白跑）。
+#:    ⇒ 同样**必须开跑前预检**（这次只需 1 秒；缺了则要 23 分钟才暴露）。
+say "=== 步骤 1.6/5：TradingAgents 可用性预检（ta-dir ＋ import）==="
+TA_DIR="${ETF_ROTATION_TA_DIR:-$PROJ/TradingAgents}"
+TA_PY="${ETF_ROTATION_LLM_PY:-/home/huangzhe/anaconda3/envs/llm/bin/python}"
+if [ -d "$TA_DIR" ] && ( cd "$PROJ" && "$TA_PY" -c "import sys; sys.path.insert(0, '$TA_DIR'); from tradingagents.default_config import DEFAULT_CONFIG" ) >/dev/null 2>&1; then
+  say "   ✅ TradingAgents 可用（$TA_DIR）"
+else
+  say "   🔴 **TradingAgents 不可用**（$TA_DIR 缺失或 import 失败）⇒ 阶段 4 必炸 ⇒ 本轮无法开跑"
+  say "      修法：把 host 的 TradingAgents/ 同步到 $TA_DIR（含 .env），再重跑"
+  record "TradingAgents 预检" "2" "—（$TA_DIR 缺失或 import 失败）"
+  write_summary
+  exit 2
+fi
 
 # ---- 步骤 2：统一流水线真实跑（--full：取数 + 换库 + S 层 + LLM）----------
 say "=== 步骤 2/5：统一流水线真实跑（--full，asof=$ASOF_PIPE，观察态，LLM 开）==="
@@ -130,29 +194,50 @@ run_full(){
   say "   退出码=$rc"
   return $rc
 }
-run_full "第 1 尝试：--full"
+# 🔴 2026-11-13：新增 `INITIAL_WAIT_SECONDS`（缺省 0 = 不等，保持旧行为）。
+#    东财按 IP 限流时原文明确写着「**等待期间不要重复调用行情接口，否则会延长限流**」
+#    ⇒ 允许把「**静默等待**」放在**第一次尝试之前**（2026-11-13 下午实测：
+#    第一次尝试 15:45 立刻撞限流 → 退避 600s 后第二次 16:03 仍全挂
+#    ⇒ 限流窗口比 10 分钟长 ⇒ 必须「先静默、后开跑」）。
+INITIAL_WAIT_SECONDS="${INITIAL_WAIT_SECONDS:-0}"
+if [ "$INITIAL_WAIT_SECONDS" -gt 0 ]; then
+  say "   ⏳ **限流静默等待 ${INITIAL_WAIT_SECONDS}s**（等待期**不碰行情接口**）…"
+  sleep "$INITIAL_WAIT_SECONDS"
+fi
+
+# 🔴 2026-11-13：新增 `RETRY_MAX_ATTEMPTS`（缺省 1 = 旧行为：只重试一次）。
+#    `RETRY_BACKOFF_SECONDS` 缺省 600s（沿用）。
+#    🔴 判定必须**只看本次尝试**的日志（多次尝试写在同一个 pipeline.log 里
+#       ⇒ 全文 grep 会把**上一次**的限流痕迹当成本次的 ⇒ 误判成「该退避」）。
+RETRY_MAX_ATTEMPTS="${RETRY_MAX_ATTEMPTS:-1}"
+RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-600}"
+#: 🔴 2026-11-16：首轮时 `step2_pipeline/pipeline.log` **还不存在**
+#:    ⇒ `wc -l < 文件` 的**重定向**失败（shell 自己报错，`2>/dev/null` 管不到它）
+#:    ⇒ 日志里常驻一条 "No such file or directory" 假告警 ⇒ 先把文件**建出来**。
+PIPELINE_LOG="$LOG_DIR/step2_pipeline/pipeline.log"
+mkdir -p "$(dirname "$PIPELINE_LOG")"
+[ -f "$PIPELINE_LOG" ] || : > "$PIPELINE_LOG"
+LOG_MARK="$(wc -l < "$PIPELINE_LOG" 2>/dev/null || echo 0)"
+ATTEMPT=1
+run_full "第 ${ATTEMPT} 尝试：--full"
 RC=$?
-if [ "$RC" -ne 0 ]; then
-  # 🔴 2026-11-13（2026-11-12 夜跑实测）：第 1 次失败的**主因是东方财富按 IP 限流**
-  #    （`Push2RateLimitError`）⇒ 原文明确写着「等待期间不要重复调用行情接口，
-  #    否则会延长限流」⇒ **立刻重试 = 再撞一次限流**（2026-11-12 第 2 次尝试
-  #    296 只 ETF 全挂 ⇒ 整轮从「降级成功」变成「全链路失败」）。
-  #    ⇒ 重试前**真的等**（默认 600s，可用 RETRY_BACKOFF_SECONDS 覆盖）。
-  RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-600}"
+while [ "$RC" -ne 0 ] && [ "$ATTEMPT" -lt "$RETRY_MAX_ATTEMPTS" ]; do
   # 🔴 2026-11-13（独立审查 D-2）：**退避只对限流生效**。
-  #    理由：限流的恢复要时间（等待期重复调用只会延长限流）⇒ 该等；
-  #    但若是 LLM/解析侧的真错 ⇒ 等 10 分钟再整轮重跑**纯属浪费**
-  #    （而且会**再调一次 LLM**、再产一份快照）⇒ 直接判失败。
-  if grep -q "Push2RateLimitError" "$LOG_DIR/step2_pipeline/pipeline.log" 2>/dev/null; then
-    say "   ⚠️ 第 1 次 --full 未过（**限流**）⇒ 等 ${RETRY_BACKOFF_SECONDS}s 再重试一次（**仍用 --full**：行情缺口是根因，不能降级；等待期不碰行情接口）"
+  #    限流的恢复要时间（等待期重复调用只会延长限流）⇒ 该等；
+  #    但若是 LLM/解析侧的真错 ⇒ 等再久也只是再调一次 LLM、还多产一份快照 ⇒ 直接判失败。
+  if tail -n "+$((LOG_MARK+1))" "$LOG_DIR/step2_pipeline/pipeline.log" 2>/dev/null \
+       | grep -q "Push2RateLimitError"; then
+    ATTEMPT=$((ATTEMPT+1))
+    LOG_MARK="$(wc -l < "$LOG_DIR/step2_pipeline/pipeline.log" 2>/dev/null || echo 0)"
+    say "   ⚠️ 第 $((ATTEMPT-1)) 次 --full 未过（**限流**）⇒ 等 ${RETRY_BACKOFF_SECONDS}s 后重试（第 ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} 次；**仍用 --full**：行情缺口是根因，不能降级；等待期不碰行情接口）"
     sleep "$RETRY_BACKOFF_SECONDS"
-    run_full "第 2 尝试：--full（重试）"
+    run_full "第 ${ATTEMPT} 尝试：--full（限流退避后重试）"
     RC=$?
   else
-    say "   ⚠️ 第 1 次 --full 未过（**非限流**）⇒ **不退避、不重跑**（真错重跑只会再调一次 LLM）；详见 step2_pipeline/pipeline.log"
-    RC=$?
+    say "   ⚠️ 第 ${ATTEMPT} 次 --full 未过（**非限流**）⇒ **不再重跑**（真错重跑只会再调一次 LLM）；详见 step2_pipeline/pipeline.log"
+    break
   fi
-fi
+done
 record "统一流水线真实跑（--full，含 LLM）" "$RC" "step2_pipeline/pipeline.log"
 
 # ---- 步骤 3：指纹表重生成 + --dry-run 复验 -------------------------------
@@ -199,14 +284,30 @@ cleanup_project_tmp(){
   return 0
 }
 CLEANED=0
-for _t in "$WORK_ROOT/"* ; do
-  [ -e "$_t" ] || continue
-  if cleanup_project_tmp "$_t"; then
-    CLEANED=$((CLEANED+1))
-  else
-    say "   ⚠️ 跳过（不在本项目落点根下）：$_t"
-  fi
-done
+#: 🔴 **2026-11-16 实测事故**：并发跑时，本步骤把**另一个活实例**的 `_work/` 删了
+#:    ⇒ 那个实例的 ak 子进程落盘失败（`Cannot save file into a non-existent directory`）
+#:    ⇒ 整条链 rc=1。
+#:    ⇒ 守卫：**流水线实例锁**（`daily_config.LOCK_FILE` = `$RUN_ROOT/.lock`，内核 flock）
+#:    **被持有** ⇒ 说明还有活实例在用 `_work/` ⇒ **一律不许清 `_work`**。
+#:    （本步骤跑在步骤 2 之后 ⇒ 自己这一轮早退出 ⇒ 锁空闲 ⇒ 正常清理不受影响。）
+INSTANCE_LOCK="${ETF_ROTATION_LOCK_FILE:-$RUN/.lock}"
+SKIP_WORK_CLEAN=0
+if flock -n "$INSTANCE_LOCK" -c true 2>/dev/null; then
+  say "   ℹ️ 流水线实例锁空闲（$INSTANCE_LOCK）⇒ 可清理 _work"
+else
+  say "   ⚠️ 流水线实例锁**被持有**（$INSTANCE_LOCK）⇒ 还有活实例在用 _work ⇒ **跳过 _work 清理**"
+  SKIP_WORK_CLEAN=1
+fi
+if [ "$SKIP_WORK_CLEAN" -eq 0 ]; then
+  for _t in "$WORK_ROOT/"* ; do
+    [ -e "$_t" ] || continue
+    if cleanup_project_tmp "$_t"; then
+      CLEANED=$((CLEANED+1))
+    else
+      say "   ⚠️ 跳过（不在本项目落点根下）：$_t"
+    fi
+  done
+fi
 #: 本项目的编排锁（只删自己那个 ⇒ 不影响别人的进程）
 cleanup_project_tmp "$RUN/.pipeline.lock" && CLEANED=$((CLEANED+1))
 cleanup_project_tmp "$RUN/.pipeline.lock.info" && CLEANED=$((CLEANED+1))

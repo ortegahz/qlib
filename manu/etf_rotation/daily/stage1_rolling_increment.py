@@ -630,7 +630,68 @@ def factor_mults(codes, prev_day, day):
             out[code] = float(hfq["收盘"].iloc[-1]) / float(hfq["收盘"].iloc[-2])
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] {code} hfq 取数失败：{exc}", file=sys.stderr)
+            # 🔴 2026-11-13 夜跑实测（东财 push2 按 IP 封禁 ⇒ hfq 取不到）：
+            #    走**腾讯原始日线**兜底 —— 用「每股派息 D」与「上一交易日原始收盘 P_prev」
+            #    还原后复权累计因子的跳变：mult = 1 / (1 − D / P_prev)。
+            #    **口径依据**：上游 qlib `factor` 序列在除权日的真实跳变 = 1/(1 − D/P_prev)；
+            #    用 2026-11-05 的 6 只除权样本交叉验证 ⇒ 腾讯公式相对偏差 ≤ 7e-4，
+            #    而东财 `hfq(t)/hfq(t−1)` 口径偏差最高 **6.5e-2**（300170）⇒ 兜底更准。
+            try:
+                mult = tencent_factor_mult(code, prev_day, day)
+                if mult is not None:
+                    out[code] = mult
+            except Exception as exc2:  # noqa: BLE001
+                print(f"[warn] {code} 腾讯因子兜底也失败：{exc2}", file=sys.stderr)
     return out
+
+
+def tencent_factor_mult(code, prev_day, day):
+    """腾讯原始日线 ⇒ 除权因子倍数 `1/(1 − D/P_prev)`；拿不到 ⇒ `None`（不瞎猜）。
+
+    🔴 **只支持现金分红**（腾讯行尾字典给的是 `fh_sh` = 每 10 股派息）：
+       若 `FHcontent` 里含「送 / 转增」⇒ 股本也变了 ⇒ 单靠 `fh_sh` 算不出因子
+       ⇒ 返回 `None`（该标的按 1.0 处理，**如实打日志**、不静默造数）。
+    """
+    import requests
+
+    code = str(code).zfill(6)
+    symbol = ("sh" + code) if code[0] in "569" else (("bj" + code) if code[0] in "48" else "sz" + code)
+    resp = requests.get(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?param={symbol},day,,,12,",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        timeout=25,
+    )
+    resp.raise_for_status()
+    node = ((resp.json() or {}).get("data") or {}).get(symbol) or {}
+    closes: dict = {}
+    info: dict = {}
+    for row in node.get("day") or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        row_day = str(row[0])[:10]
+        try:
+            closes[row_day] = float(row[2])
+        except (TypeError, ValueError):
+            continue
+        if len(row) > 6 and isinstance(row[6], dict):
+            info[row_day] = row[6]
+    meta = info.get(day) or {}
+    fh_sh = meta.get("fh_sh")
+    content = str(meta.get("FHcontent") or "")
+    if fh_sh is None:
+        return None
+    if ("送" in content) or ("转" in content):
+        print(f"[warn] {code} {day} 含送转（{content}）⇒ 腾讯口径算不出因子 ⇒ 跳过", file=sys.stderr)
+        return None
+    prev_close = closes.get(prev_day)
+    if not prev_close:
+        return None
+    dividend = float(fh_sh) / 10.0
+    ratio = 1.0 - dividend / prev_close
+    if ratio <= 0:
+        return None
+    return 1.0 / ratio
 
 
 def trade_days(calendar_csv, start, end):
@@ -892,42 +953,50 @@ def fetch_missing_bars(
     history_days = [d for d in days if d != today]
     spot_days = [d for d in days if d == today]
 
+    def run_history_channel(need: list[str]) -> None:
+        """搜狐批量历史通道：抓 `need` 里的交易日 ⇒ 逐日 CSV 落 `out_dir` ⇒ 进快照档案。
+
+        🔴 **一条通道覆盖整段区间**（一次请求 8 只、一次请求覆盖整段）⇒
+        **「当天」也走它**（东财 spot 被 IP 封禁时的兜底；搜狐的当日收盘 bar 已定型）。
+        """
+        codes = extendable_codes(base_dir)
+        if not codes:
+            raise RuntimeError(f"读不到可延展标的清单 ⇒ 历史通道放弃（base={base_dir}）")
+        codes_file = out_dir / "_codes.txt"
+        codes_file.write_text("\n".join(codes) + "\n", encoding="utf-8")
+        start = _shift_days(min(need), -20)
+        worker = out_dir / "_ak_hist_worker.py"
+        worker.write_text(_AK_HISTORY_WORKER, encoding="utf-8")
+        cmd = [
+            ak_python or DC.AK_PY,
+            str(worker),
+            str(out_dir),
+            start,
+            max(need),
+            str(codes_file),
+            str(DC.TRADE_CALENDAR_CSV),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        worker.unlink(missing_ok=True)
+        codes_file.unlink(missing_ok=True)
+        for line in (proc.stderr or "").splitlines():
+            if line.startswith("[INFO]") or line.startswith("[warn]"):
+                print(line)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"历史批量通道失败 rc={proc.returncode}: {(proc.stderr or '')[-600:]}"
+            )
+        # 🔴 **归档**：工作目录里的逐日产物 ⇒ 进快照档案（以后可直接回填）
+        for day in need:
+            produced = out_dir / f"bars_{day.replace('-', '')}.csv"
+            if produced.exists():
+                archive_snapshot(day, produced)
+
     # ---- 历史日：一条批量通道覆盖整段区间 ----
     if history_days:
         need = [d for d in history_days if load_archived_snapshot(d) is None]
         if need:
-            codes = extendable_codes(base_dir)
-            if not codes:
-                raise RuntimeError(f"读不到可延展标的清单 ⇒ 历史通道放弃（base={base_dir}）")
-            codes_file = out_dir / "_codes.txt"
-            codes_file.write_text("\n".join(codes) + "\n", encoding="utf-8")
-            start = _shift_days(min(need), -20)
-            worker = out_dir / "_ak_hist_worker.py"
-            worker.write_text(_AK_HISTORY_WORKER, encoding="utf-8")
-            cmd = [
-                ak_python or DC.AK_PY,
-                str(worker),
-                str(out_dir),
-                start,
-                max(need),
-                str(codes_file),
-                str(DC.TRADE_CALENDAR_CSV),
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            worker.unlink(missing_ok=True)
-            codes_file.unlink(missing_ok=True)
-            for line in (proc.stderr or "").splitlines():
-                if line.startswith("[INFO]") or line.startswith("[warn]"):
-                    print(line)
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"历史批量通道失败 rc={proc.returncode}: {(proc.stderr or '')[-600:]}"
-                )
-            # 🔴 **归档**：工作目录里的逐日产物 ⇒ 进快照档案（以后可直接回填）
-            for day in need:
-                produced = out_dir / f"bars_{day.replace('-', '')}.csv"
-                if produced.exists():
-                    archive_snapshot(day, produced)
+            run_history_channel(need)
         for day in history_days:
             path = load_archived_snapshot(day)
             if path is None:
@@ -947,16 +1016,37 @@ def fetch_missing_bars(
             # 🔴 **必须传 prev_day**：spot 通道的「昨收」是**除权调整后的参考价**
             #    ⇒ 除权股的原始前收盘要靠 EM 原始 K 线补 ⇒ 不传 prev_day 会**整段跳过**
             #    除权修正（实测会白白丢掉当日 2 只除权股）。
-            fetch_market_snapshot(
-                day, csv, ak_python=ak_python, prev_day=_prev_trade_day(day)
-            )
-            archive_snapshot(day, csv)
-            path = csv
+            source = "spot_em"
+            try:
+                fetch_market_snapshot(
+                    day, csv, ak_python=ak_python, prev_day=_prev_trade_day(day),
+                    # 🔴 2026-11-13：重试次数可由 env 覆盖（默认 3 次 = 旧行为）。
+                    #    东财按 IP 封禁时，3 次重试要等 300s+600s 才轮到搜狐兜底 ⇒
+                    #    整轮白等 15 分钟 ⇒ 封禁场景下设 `ETF_STAGE1_SPOT_RETRY_TIMES=1`。
+                    retry_times=int(os.environ.get("ETF_STAGE1_SPOT_RETRY_TIMES", "3")),
+                )
+            except Exception as exc:  # noqa: BLE001 - 限流 ⇒ 换搜狐批量通道
+                # 🔴 2026-11-13 夜跑实测：东财 push2 按 IP 封禁 ⇒ spot 通道拿不到当日全市场
+                #    ⇒ 退到**搜狐批量通道**（同一份 schema；搜狐的当日收盘 bar 已定型）。
+                print(
+                    f"[increment] ⚠️ 当日快照通道失败（{type(exc).__name__}）"
+                    "⇒ 改走搜狐批量通道（同一 schema）",
+                    flush=True,
+                )
+                run_history_channel([day])
+                archived = archive_snapshot_path(day)
+                if not archived.exists():
+                    raise
+                path = archived
+                source = "sohu_hisHq(当日兜底)"
+            else:
+                archive_snapshot(day, csv)
+                path = csv
         frame = pd.read_csv(path, dtype={"code": str})
         frame["code"] = frame["code"].astype(str).str.zfill(6)
         frame["date"] = frame["date"].astype(str).str.slice(0, 10)
         frames[day] = frame
-        stats[day] = {"source": "spot_em", "rows": int(len(frame))}
+        stats[day] = {"source": source, "rows": int(len(frame))}
 
     return {"frames": frames, "stats": stats}
 

@@ -43,12 +43,12 @@ def _codes(text: str) -> list[str]:
 
 
 # ───────────────────────── ① 节点日重算：TA 维持行 ─────────────────────────
-def _plan(ta_hold: bool) -> dict:
+def _plan(ta_hold: bool, target_weight: float = 0.2254) -> dict:
     act = {
         "code": "512800",
         "name": "银行ETF华宝",
         "action": "维持" if ta_hold else "卖出",
-        "target_weight": 0.2254,
+        "target_weight": target_weight,
         "current_shares": 7700,
         "target_shares": 7700,
         "price": 0.874,
@@ -60,9 +60,9 @@ def _plan(ta_hold: bool) -> dict:
     return {"actions": [act]}
 
 
-def _recompute(ta_hold: bool) -> dict:
+def _recompute(ta_hold: bool, target_weight: float = 0.2254) -> dict:
     return reprice_node_day._recompute(
-        plan=_plan(ta_hold),
+        plan=_plan(ta_hold, target_weight),
         prices={"512800": (0.900, "2026-12-01")},   # 节点日价 ≠ 快照价
         node_date="2026-12-01",
         total_assets=29854.67,
@@ -89,11 +89,36 @@ def test_节点日重算_TA维持行_标记必须透传():
 
 
 def test_节点日重算_非TA行_仍按节点日价重算():
-    """🔴 反向护栏：**普通行**必须照常按节点日价重算（否则本修复会误伤正常行）。"""
-    row = _recompute(False)["actions"][0]
+    """🔴 反向护栏：**普通行**必须照常按节点日价重算（否则本修复会误伤正常行）。
+
+    🔴 2026-11-13（方案一 · 最小调仓门槛）：本护栏改用**金额达标的普通行**
+    （目标 5% ⇒ 卖 6,100 股 = **5,490 元** > 存量微调门槛 2,800 元）
+    ⇒ 断言与改造前**逐字一致**（护栏强度不变）：
+    「金额**不**达标的普通行会被门槛拦下」另立一条钉子（下一个测试），
+    避免把「门槛行为」混进「TA 否决行为」里 ⇒ 两者必须可区分。
+    """
+    row = _recompute(False, target_weight=0.05)["actions"][0]
     assert row["delta_shares"] != 0, "普通行不应被强制成维持"
     assert row["target_shares"] != 7700, row
     assert "ta_rejected" not in row, "普通行不应被写上 TA 标记"
+
+
+def test_节点日重算_普通行金额不达标_被门槛拦下():
+    """🔴 2026-11-13 方案一：**非** TA 行、金额低于存量微调门槛 ⇒ 本轮不调仓。
+
+    目标 22.54% ⇒ 只卖 300 股 = **270 元** < 2,800 元 ⇒ 按「方案一」**整笔作废**
+    （行保留、delta=0、金额/费用归零）。
+    🔴 这条钉子守的是「**阶段 6 也有这道闸**」：若只在阶段 5（规则层）设门槛，
+    阶段 6 会把被拦下的碎单**重新算回来** ⇒ 门槛形同虚设。
+    """
+    row = _recompute(False)["actions"][0]
+    assert row["delta_shares"] == 0, row
+    assert float(row["est_amount"]) == 0.0, row
+    assert float(row["est_fee"]) == 0.0, row
+    assert row.get("min_amount_skipped") is True, row
+    assert row.get("min_amount_kind") == "存量微调", row
+    assert "门槛" in row["reason"], row
+    assert "ta_rejected" not in row, "门槛拦下 ≠ TA 一票否决（两者必须可区分）"
 
 
 # ───────────────────────── ② 表格行：目标权重列 ─────────────────────────

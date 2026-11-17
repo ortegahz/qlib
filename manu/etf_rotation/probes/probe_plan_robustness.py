@@ -316,15 +316,23 @@ def main() -> int:
     class _PlanArgs:
         """`build_plan` 需要的参数集（全部指向合成输入）。"""
 
-        def __init__(self, root: Path):
+        def __init__(self, root: Path, no_min_amount_gate: bool = False):
             self.report = str(root / "etf_analysis_report.json")
             self.decision = str(root / "不存在的决策件.md")
             self.prices = str(root / "prices.csv")
             self.universe = str(root / "universe.csv")
             self.account = str(root / "account.csv")
             self.out_dir = str(root)
+            #: 🔴 2026-11-13（方案一 · 最小调仓门槛）：**关掉**门槛 ⇒ 单独验「现金削减口径」；
+            #:    门槛**开着**的同一场景另跑一遍（R7d~R7g）⇒ 两层政策各自被钉死。
+            self.no_min_amount_gate = bool(no_min_amount_gate)
 
-    plan_r7 = frp.build_plan(_PlanArgs(r7_root))
+    #: 🔴 2026-11-13（方案一）：R7 系列原本钉的是 **M-F（削减后权重口径）**，
+    #:    而 2026-11-13 起同一场景还会撞上**最小调仓门槛**（碎额整笔作废）
+    #:    ⇒ 两个口径混在一份产物里 ⇒ R7b/R7c 必红。
+    #:    ⇒ 拆成两层：**R7/R7b/R7c 关门槛**（保留 M-F 回归网）＋
+    #:      **R7d~R7g 开门槛**（新增「门槛 ⇒ 碎额作废 ⇒ 权重归零」的政策网）。
+    plan_r7 = frp.build_plan(_PlanArgs(r7_root, no_min_amount_gate=True))
     flow_r7 = plan_r7["cash_flow"]
     total_r7 = 2000.0
     #: 独立重算：削减后的**实际**现金占比
@@ -352,6 +360,59 @@ def main() -> int:
     lines.append(f"[{'PASS' if ok3 else 'FAIL'}] R7c 计划权益权重按**可达**口径求和（不是削减前的目标权重）")
     lines.append(f"        计划权益权重={float(flow_r7.get('invested_weight_planned') or 0):.4f}"
                  "（期望 0.9000 = 512800 的 0.50 + 563020 可达的 0.40；旧实现是 1.0000）")
+
+    # ============ R7d~R7g 同一场景 · **开着**最小调仓门槛（方案一 · 2026-11-13）============
+    #: 场景同上，但门槛**开着**（默认）⇒ 现金削减后剩下的碎额（800 元 < 新开仓门槛 3,800）
+    #: ⇒ **整笔作废**（不许买半仓：半仓照样吃 5 元最低佣金）⇒ 席位可达权重 = 0%。
+    plan_r7g = frp.build_plan(_PlanArgs(r7_root, no_min_amount_gate=False))
+    flow_r7g = plan_r7g["cash_flow"]
+    gate_r7g = plan_r7g.get("min_amount_gate") or {}
+    md_r7g = frp.render_markdown(plan_r7g)
+    row_r7g = next((ln for ln in md_r7g.splitlines() if ln.startswith("| 563020")), "")
+    act_r7g = next((a for a in (plan_r7g.get("actions") or []) if a.get("code") == "563020"), {})
+
+    ok4 = ("50.0% → **0%**" in row_r7g)
+    failures += 0 if ok4 else 1
+    lines.append(f"[{'PASS' if ok4 else 'FAIL'}] R7d 门槛开着：碎额被整笔作废 ⇒ md 权重列显示「原值 → 0%」")
+    lines.append(f"        563020 行权重列={row_r7g.split('|')[7].strip() if row_r7g else '(该行不存在)'}"
+                 "（期望 50.0% → **0%**：现金削减后只剩 800 元 < 新开仓门槛 3,800 ⇒ 整笔作废）")
+
+    ok5 = abs(float(flow_r7g.get("invested_weight_planned") or 0.0) - 0.50) < 1e-9
+    failures += 0 if ok5 else 1
+    lines.append(f"[{'PASS' if ok5 else 'FAIL'}] R7e 门槛开着：被拦席位**不计入**计划权益权重")
+    lines.append(f"        计划权益权重={float(flow_r7g.get('invested_weight_planned') or 0):.4f}"
+                 "（期望 0.5000 = 只剩 512800 的 0.50；门槛拦下的席不算权益）")
+
+    skipped_r7g = gate_r7g.get("skipped") or []
+    ok6 = (
+        bool(gate_r7g.get("enabled"))
+        and int(gate_r7g.get("skipped_count") or 0) == 1
+        and len(skipped_r7g) == 1
+        and str(skipped_r7g[0].get("code")) == "563020"
+        and str(skipped_r7g[0].get("kind")) == "新开仓"
+        and bool(gate_r7g.get("deadlock_risk")) is True
+    )
+    failures += 0 if ok6 else 1
+    lines.append(f"[{'PASS' if ok6 else 'FAIL'}] R7f 门槛开着：被拦明细如实披露（含数学死锁报警）")
+    lines.append(f"        enabled={gate_r7g.get('enabled')}｜skipped_count={gate_r7g.get('skipped_count')}"
+                 f"｜明细={[{'code': s.get('code'), 'kind': s.get('kind'), 'amount': s.get('amount'), 'threshold': s.get('threshold')} for s in skipped_r7g]}"
+                 f"｜deadlock_risk={gate_r7g.get('deadlock_risk')}"
+                 "（期望：唯一的新开仓被拦 ⇒ 死锁=True）")
+
+    ok7 = (
+        bool(act_r7g)
+        and int(act_r7g.get("delta_shares") or 0) == 0
+        and abs(float(act_r7g.get("est_amount") or 0.0)) < 1e-9
+        and abs(float(act_r7g.get("est_fee") or 0.0)) < 1e-9
+        and abs(float(act_r7g.get("target_weight_effective") or 0.0)) < 1e-12
+    )
+    failures += 0 if ok7 else 1
+    lines.append(f"[{'PASS' if ok7 else 'FAIL'}] R7g 门槛开着：被拦行**仍在 actions 里**且 delta/金额/费用归零")
+    lines.append(f"        action={act_r7g.get('action')}｜delta={act_r7g.get('delta_shares')}"
+                 f"｜est_amount={act_r7g.get('est_amount')}｜est_fee={act_r7g.get('est_fee')}"
+                 f"｜effective={act_r7g.get('target_weight_effective')}"
+                 f"｜weight_to_cash={act_r7g.get('weight_to_cash')}"
+                 "（行不删 ⇒ 市值不蒸发；差额归现金）")
 
     # ============ R10 第一环按「报告**内容指纹**」判（M-G / F4）============
     # 🔴 2026-11-04 夜实测修（M-G / F4，专题档 §21.4）：

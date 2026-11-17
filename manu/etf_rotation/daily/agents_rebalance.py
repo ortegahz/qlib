@@ -1616,12 +1616,25 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             })
             continue
 
+        # 🔴 2026-11-17（缺陷：**执行卡 vs 计划件口径不一致** · 根因修复）
+        #     研究链的动作行**已经**给出最终股数（``target_shares``）与股数差（``delta_shares``），
+        #     执行卡却按 ``target_amount`` **重新推导**股数，再无脑套「单只金额上限」⇒
+        #     把研究链明确「本轮不调仓」的持仓
+        #     （存量微调 2292.5 元 < 2800 元门槛 ⇒ 维持 7700 股）**凭空砍成 6500 股**
+        #     ⇒ 凭空生成 1200 股 / 1100.40 元的卖单
+        #     （该笔金额本身也 < 2800 元存量微调门槛 ⇒ 双重违规）。
+        #     ⇒ 修法（两条，缺一不可）：
+        #       ① 行里有**明确的 ``target_shares``** ⇒ 以它为准
+        #          （执行层**不得改写**研究链的股数决策；只做整手取整）；
+        #       ② 「单只金额上限」**只约束建仓侧**（目标股数 > 当前股数 ⇒ 才可能触发）
+        #          ⇒ 执行层**永远不反向削减存量持仓**（否则等于私自下减仓单）。
+        explicit_target = _i(act.get("target_shares"))
         requested = _f(act.get("target_amount"))
-        if requested is None:
+        if requested is None and explicit_target is None:
             weight = _f(act.get("target_weight"))
             if weight is not None and total_assets is not None:
                 requested = weight * total_assets
-        if requested is None:
+        if requested is None and explicit_target is None:
             warnings.append(
                 f"{code} {name}：动作件里既没有 target_amount 也没有 target_weight"
                 f" ⇒ 目标股数无法确定（记 None，不编数字）"
@@ -1631,22 +1644,32 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         target_amount: float | None = None
         capped = False
         cap_note = ""
-        if requested is not None:
-            target_shares = int((requested / price) // lot) * lot
-            target_shares = max(target_shares, 0)
+        if explicit_target is not None or requested is not None:
+            if explicit_target is not None:
+                target_shares = max(int(explicit_target // lot) * lot, 0)
+            else:
+                target_shares = max(int((requested / price) // lot) * lot, 0)
             target_amount = target_shares * price
-            if target_amount > max_amt + 1e-9:
+            pre_cap_amount = target_amount
+            #: ② 金额上限**只约束建仓侧** ⇒ 目标股数 ≤ 当前股数（维持 / 减仓）时**不封顶**
+            if target_shares > current_shares and pre_cap_amount > max_amt + 1e-9:
                 capped_shares = max(int((max_amt / price) // lot) * lot, 0)
+                #: 封顶后**不得低于现仓** ⇒ 最多「本轮不建仓」，绝不反向变成减仓单
+                capped_shares = max(capped_shares, current_shares)
                 target_shares = capped_shares
                 target_amount = target_shares * price
                 capped = True
                 cap_note = (
-                    f"目标金额 {requested:.2f} 元 > 单只上限 {max_amt:.2f} 元"
+                    f"目标金额 {pre_cap_amount:.2f} 元 > 单只上限 {max_amt:.2f} 元"
                     f" ⇒ 股数按上限缩减到 {target_shares} 股（{target_amount:.2f} 元）"
                 )
 
         one_lot_amount = price * lot
-        if (requested is not None and requested > 0 and current_shares == 0
+        #: 有效目标金额（显式股数 ⇒ 按股数折算；否则用动作件的 target_amount）
+        effective_requested = requested
+        if effective_requested is None and target_shares is not None:
+            effective_requested = target_shares * price
+        if (effective_requested is not None and effective_requested > 0 and current_shares == 0
                 and one_lot_amount > max_amt + 1e-9):
             unbuildable.append({
                 "code": code,

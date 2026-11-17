@@ -52,6 +52,7 @@ if str(ROOT) not in sys.path:
 
 import account as A  # noqa: E402
 import config as C  # noqa: E402
+import min_trade_gate as gate_mod  # noqa: E402  （最小调仓门槛：与阶段5 同一口径/同一模块）
 from final_rebalance_plan import (  # noqa: E402
     LOT,
     _f,
@@ -290,6 +291,9 @@ def _recompute(
     current_shares: dict[str, int],
     fee_rate: float,
     overrides: dict[str, dict] | None = None,
+    min_amount_enabled: bool = True,
+    min_amount_thresholds: dict | None = None,
+    commission_rate: float = 0.0,
 ) -> dict:
     """按节点日价重算每个 action 的股数 / 金额 / 费用，并算现金流。
 
@@ -474,6 +478,48 @@ def _recompute(
             _row["held_not_touched"] = True
         actions.append(_row)
 
+    # ---- 🔴 最小调仓门槛（方案一 · 2026-11-13）----
+    #: 🔴 **阶段 6 也必须有这道闸**：本脚本按**节点日价**重算股数与金额
+    #:    ⇒ 若只在阶段 5（`final_rebalance_plan.py`）设门槛，阶段 6 会把
+    #:       被拦下的碎单**重新算回来** ⇒ 门槛形同虚设。
+    #: ⇒ 两个阶段**共用** `min_trade_gate`（同一套阈值/分类/披露口径）。
+    #:    判定金额口径 = **节点日价**（阶段 5 用的是信号日价）⇒ 两阶段可能不同
+    #:    （价格跨过门槛）⇒ 各阶段各自如实披露，不互相覆盖。
+    min_amount_gate = gate_mod.apply_min_trade_threshold(
+        actions,
+        total_assets=total_assets,
+        commission_rate=commission_rate,
+        thresholds=min_amount_thresholds,
+        enabled=min_amount_enabled,
+        price_basis=f"{node_date} 收盘价（节点日价）",
+    )
+
+    # ---- 🔴 2026-11-13 夜实测修（方案一 · 门槛后**重算**破单席标记）----
+    #: 破单席判定原先在**逐行构造时**做 ⇒ 发生在**门槛作废之前**
+    #:   ⇒ 被门槛拦下的行仍按「门槛前的目标股数」判 ⇒ **产物自相矛盾**：
+    #:   实测（11-03 基线 · 情景 512800=B）：门槛作废后落地 7,700 股 × 0.874 =
+    #:   **6,729.80 元 > 单席上限 4,776.75 元**（22.54% > 16%），
+    #:   但产物 `positions[512800].landed_amount = 6729.8` 却 `slot_breach = false`
+    #:   （按门槛前 5,400 股 = 4,719.60 元判的）⇒ 破单席**没被报出来**。
+    #: ⇒ 修法：门槛作废**之后**按**最终落地股数 × 节点日价**重算这四个字段
+    #:   （口径 = 落地持仓金额 > 单席上限，与 `make_node_scenarios.py` 等五处同口径）。
+    #: ⚠️ 默认（非情景）路径不受影响 ⇒ 零回归产物逐字节不变。
+    if scenario_mode:
+        _slot_limit = total_assets * float(A.TARGET_POSITION_WEIGHT) if total_assets else 0.0
+        for _a in actions:
+            _shares = int(_a.get("target_shares") or 0)
+            _px = float(_a.get("price") or 0.0)
+            _landed = _shares * _px if _shares > 0 else 0.0
+            _breach = bool(_landed > _slot_limit + 0.005)
+            _a["slot_limit_amount"] = round(_slot_limit, 6)
+            _a["slot_landed_amount"] = round(_landed, 6)
+            _a["slot_breach"] = _breach
+            _a["slot_breach_note"] = (
+                f"落地金额 {_landed:.2f} 元 > 单席上限 {_slot_limit:.2f} 元"
+                f"（账户级单席权重 {A.TARGET_POSITION_WEIGHT * 100:.0f}% × 总资产）⇒ 破单席"
+                if _breach else ""
+            )
+
     # ---- 「买不进的席位」权重归现金（口径同 final_rebalance_plan）----
     unbuildable: list[dict] = []
     for a in actions:
@@ -545,7 +591,9 @@ def _recompute(
             after_value = (a["current_shares"] + (a["delta_shares"] or 0)) * a["price"]
             eff = after_value / total_assets
             a["target_weight_effective"] = eff
-            a["weight_to_cash"] = max(0.0, plan_w - eff)
+            #: 🔴 2026-11-13 夜实测修：与阶段5（`final_rebalance_plan.py`）**同一有符号口径**
+            #:    —— 差额可负（超配没减仓 ⇒ 现金相应更少）⇒ 不许截断成非负。
+            a["weight_to_cash"] = plan_w - eff
 
     invested_weight = float(sum(a["target_weight_effective"] for a in actions))
     target_cash_weight = float(max(0.0, 1.0 - invested_weight))
@@ -568,6 +616,8 @@ def _recompute(
 
     return {
         "actions": actions,
+        # 🔴 方案一：三档门槛的披露结构（与阶段5 同口径）
+        "min_amount_gate": min_amount_gate,
         "cash_flow": {
             "cash_begin": round(cash, 6),
             "sell_proceeds": round(proceeds, 6),
@@ -824,6 +874,40 @@ def _render_md(payload: dict) -> str:
             f"{a['target_amount']:.2f} | {a['target_shares']} | {a['delta_shares']:+d} | "
             f"{a['est_amount']:+.2f} | {a['est_fee']:.2f} | {note} |")
     add("")
+    # ---- 一之五 · 最小调仓门槛（方案一 · 三档）----
+    _gate = payload.get("min_amount_gate") or {}
+    if _gate:
+        _thr = _gate.get("thresholds") or {}
+        _mc = float(_gate.get("min_commission_strict") or 5.0)
+        add("## 一之五、🔴 最小调仓门槛（方案一 · 按交易性质拆三档）")
+        add("")
+        add(f"> 口径：**清仓/止损 {float(_thr.get('清仓止损') or 0):.0f} 元（无条件执行）**"
+            f"｜**新开仓 {float(_thr.get('新开仓') or 0):.0f} 元**"
+            f"｜**存量微调 {float(_thr.get('存量微调') or 0):.0f} 元**；"
+            f"折合费率按 **单边 {_mc:.0f} 元最低佣金**（研究链费用模型「免 5 元」⇒ 下限口径）。")
+        if _gate.get("deadlock_risk"):
+            add("")
+            add("🔴 **门槛与账户规模不匹配（数学死锁）**：本轮**所有**新开仓都被门槛拦下"
+                " ⇒ 以后**再也买不进任何新 ETF** ⇒ 必须下调「新开仓」门槛或提高账户规模。")
+        _sk = _gate.get("skipped") or []
+        if _sk:
+            add("")
+            add(f"本轮被门槛拦下 **{len(_sk)}** 笔（**不删行**，改为「持有 / 不建仓」）：")
+            add("")
+            add("| 代码 | 名称 | 档位 | 金额（元） | 门槛（元） | 折合 bp | 省最低佣金（元） |")
+            add("|:--|:--|:--|--:|--:|--:|--:|")
+            for _s in _sk:
+                add(f"| {_s.get('code')} | {_s.get('name')} | {_s.get('kind')} | "
+                    f"{float(_s.get('amount') or 0):.2f} | "
+                    f"{float(_s.get('threshold') or 0):.0f} | "
+                    f"{float(_s.get('effective_bp') or 0):.1f} | "
+                    f"{float(_s.get('min_commission_saved') or 0):.2f} |")
+            add("")
+            add(f"⇒ 合计省下最低佣金 **{float(_gate.get('min_commission_saved') or 0):.2f} 元**。")
+        else:
+            add("")
+            add("本轮**没有被门槛拦下的调仓动作**（所有动作金额均达标）。")
+        add("")
     add("## 二、与计划件（信号日价）的差异")
     add("")
     add("| 代码 | 名称 | 计划目标股数 | 节点日目标股数 | 差异 | 计划价 | 节点日价 | 价差 |")
@@ -957,6 +1041,16 @@ def main() -> int:
     ap.add_argument("--scenario", default=None,
                     help="分歧情景规格：`代码=A|B` 逗号分隔（如 `511880=B,512800=A,563020=A`）；"
                          "A=规则层、B=LLM 最终裁决；不给则按计划件（纯规则层）重算")
+    # 🔴 2026-11-13 方案一：最小调仓门槛（三档）的 CLI 开关（与阶段5 同名同义）。
+    #    缺省 = **开**（config 三档）⇒ 每日链不传任何门槛参数 ⇒ 与阶段5 同一口径。
+    ap.add_argument("--no-min-amount-gate", action="store_true",
+                    help="关闭最小调仓门槛（回退/对比用；默认开）")
+    ap.add_argument("--min-amount-new", type=float, default=None,
+                    help="新开仓门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_NEW")
+    ap.add_argument("--min-amount-adjust", type=float, default=None,
+                    help="存量仓位微调门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_ADJUST")
+    ap.add_argument("--min-amount-liquidate", type=float, default=None,
+                    help="清仓/止损门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_LIQUIDATE")
     args = ap.parse_args()
 
     node_date = _parse_date(args.node_date)
@@ -1086,7 +1180,10 @@ def main() -> int:
         slippage_bp = float(C.ETF_SLIPPAGE) * 10000.0
 
     result = _recompute(plan, prices, node_date, total_assets, cash,
-                        current_shares, fee_rate, overrides=overrides)
+                        current_shares, fee_rate, overrides=overrides,
+                        min_amount_enabled=gate_mod.gate_enabled(args),
+                        min_amount_thresholds=gate_mod.thresholds_from_args(args),
+                        commission_rate=(commission_bp / 10000.0))
 
     # ---- 双口径对照（M-S5）：计划件口径 vs 节点日口径，目标股数差多少、阈值在哪 ----
     basis_rows = _basis_comparison(
@@ -1235,6 +1332,8 @@ def main() -> int:
         },
         "cash_flow": result["cash_flow"],
         "landing": result["landing"],
+        # 🔴 方案一：三档门槛的披露结构（阶段6 = 节点日价口径）
+        "min_amount_gate": result["min_amount_gate"],
         "actions": result["actions"],
         "diff_vs_plan": diff_vs_plan,
         "basis_comparison": basis_rows,

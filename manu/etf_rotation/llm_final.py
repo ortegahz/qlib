@@ -368,7 +368,17 @@ def _negated(text: str, pos: int, matched: str = "") -> bool:
 #:    ⇒ 修法：**裸「卖出」只是默认推断**（默认整仓卖出）；
 #:      同一句里若该标的被**明确**说成「减仓 / 部分卖出」⇒ 裸卖出**不生效**
 #:      ⇒ 交给更明确的表述裁决（第 ② 档「卖出约 N 份」/ 第 ③ 档「明确减仓」）。
-_PARTIAL_SELL_MARKERS: tuple[str, ...] = ("减仓", "减持", "减掉")
+#: 🔴 2026-11-17（真机跑批 `snapshots/20261117_085229` · A20⑥ 红灯实证）：
+#:    **「部分卖出」也是「部分卖出」** —— 旧词表只有「减仓 / 减持 / 减掉」，
+#:    没有「部分卖出」⇒ 真机原句
+#:       「最终交易决定：对 `512800` 执行**部分卖出、降低超配**，不是清仓」
+#:    ⇒ 裸「卖出」规则（第 ④ 档）命中 ⇒ 方向='卖'、目标权重=**0%**（＝清仓）
+#:    ⇒ 而原文**明写**「不是清仓」，真实裁决是「减至规则层 16% 标准槽」
+#:    ⇒ 交付件把「减仓」写成「清仓 0%」⇒ 与动作表自相矛盾 ⇒ A20⑥ 判红
+#:    （连带把「与规则层不一致」的缺口夸成 -23.5pp，真缺口只有 -7.5pp）。
+#:    ⇒ 修法：把「部分卖出」补进**句级部分卖出标记**（与「减仓/减持/减掉」同级）。
+#:    ⚠️ 「部分减仓 / 部分减持」**已被**「减仓 / 减持」覆盖（子串命中）⇒ 不用重复登记。
+_PARTIAL_SELL_MARKERS: tuple[str, ...] = ("减仓", "减持", "减掉", "部分卖出")
 
 #: 「减仓」标记后**多远**以内出现代码 ⇒ 认为该标记**点名**那只标的。
 _PARTIAL_SELL_NAMED_TAIL = 12
@@ -1340,6 +1350,23 @@ _REJECT_NEGATIONS: tuple[str, ...] = (
     "不予否决", "不得否决", "并非否决", "不是否决", "不构成否决", "不算否决",
     # ③ 2026-11-11 审计补齐：「**不排除** X」= 仍可入选 ⇒ 不是否决
     "不排除",
+    # 🔴 2026-11-16（真机交付件 `snapshots/20261113_202504` 实证）：「不**正式**否决」
+    #    ⇒ 旧词表只有**紧贴**写法（「不否决」/「未否决」/「并非否决」）⇒
+    #    「不**正式**否决」逃过护栏 ⇒ 512800 被误判成一票否决 ⇒ 全链路错。
+    #    ⇒ 这里补齐**复合**否定前缀的紧贴写法（通用形态见 `_REJECT_NEG_PREFIX_RE`）。
+    "不正式否决", "未正式否决", "不再否决", "不再正式否决", "并未否决",
+    "不予正式否决", "不是正式否决",
+)
+
+#: 「**强调**」否定前缀：`不得不` / `未尝不` / `无不` + 否决动词
+#:    ⇒ **真否决**（「不得不否决 X」= 必须否掉 X）。
+#: 🔴 2026-11-16（独立审查 I2）：`_REJECT_NEGATIONS` 是**子串**匹配
+#:    ⇒ 「**不得**否决」是「**不得不**否决」的子串 ⇒ 旧口径把**强调句**整条中和
+#:    ⇒ 真否决被**漏判**（实测 `不得不否决 516620` ⇒ 名单里没有 516620）。
+#:    ⇒ 现在：`_guarded()` 判定前先把强调片段改写成**中性占位**
+#:    ⇒ 护栏看不见「不得/无不/未尝不」⇒ 动词保留 ⇒ 判成真否决。
+_REJECT_EMPHASIS_RE = re.compile(
+    r"(?:不得不|未尝不|无不)(?:否决|剔除|排除|移除|回避|暂缓|放弃)"
 )
 
 #: 「**禁止性**」反向语义（**中间允许隔字**）：例 `不得被判成否决` / `不可否决`。
@@ -1361,6 +1388,32 @@ _REJECT_NEGATION_RE = re.compile(
     r"(?:不得|不可|不应|不能|不至于|无须|无需|不予|并非|不是|不构成|不算|避免|禁止|杜绝|而不是|而非|不作|不做)"
     r"[^，；。｜|\n]{0,16}?"
     r"(?:否决|剔除|排除|不选|移除|放弃|回避|暂缓|拒绝|不配置|不予配置|不参与|不纳入)"
+)
+
+#: 🔴 2026-11-16（真机交付件 `snapshots/20261113_202504` 实证 · Stage 4 真缺陷）：
+#:    **否定前缀 + 裸否决动词** ⇒ 该动词**不是**否决（那是「澄清不否决」）。
+#:
+#:    事故原文（Trader 交易计划段）：「因此**不正式否决** `512800`，但将其降至16%」
+#:    ⇒ 旧口径只认「不否决」「未否决」「并非否决」这类**紧贴**写法
+#:    ⇒ 「不**正式**否决」逃过护栏 ⇒ 512800 被当成**一票否决**
+#:    ⇒ 交付层把它变成「维持席位」（`orphaned_holdings`）⇒ 该顺延补位的 515450 消失
+#:    ⇒ 权益上限 80%→32% 时只剩 584.4 元 ⇒ 又被 3800 元新开仓门槛拦下 ⇒ 全链路错。
+#:
+#: 🔴 中间的修饰词用**白名单**（不是「≤N 字」）：否则「**不**满足条件即**剔除** `512170`」
+#:    （**真否决**！）会被误吞 ⇒ 白名单只放「正式 / 再 / 会 / 予以 / 进行 / 做 / 作」这类
+#:    **纯修饰**词、不含任何动词 ⇒ 真否决**不受伤**。
+#: 🔴 排除「不得不否决」「未尝不否决」「无不否决」：那些是**强调**（= 真否决）。
+#: 🔴 动词表只含**裸**动词（否决 / 剔除 / 排除 / 移除 / 回避 / 暂缓 / 放弃）：
+#:    「不买」「不建仓」「不予配置」这类**自带否定**的动词**不在**表里
+#:    ⇒ 「不买 `516620`」仍然是**真否决**。
+_REJECT_NEG_PREFIX_RE = re.compile(
+    # 🔴 2026-11-16（独立审查 I2 补）：强调句家族一律**排除**
+    #    「不得不否决」（`不` 前是「得」）、「未尝不否决」（`不` 前是「未尝」）、
+    #    「无不否决」（`不` 前是「无」）⇒ 那三个动词是**真否决**。
+    r"(?<!得)(?<!未尝)(?<!无)"
+    r"(?:尚未|从未|不再|不予|不得|不可|不能|不应|无需|无须|避免|禁止|杜绝|并非|不|未)"
+    r"[\s*`_~]*(?:正式|再|会|予以|进行|做|作|考虑|准备|打算)?[\s*`_~]*"
+    r"(?P<verb>否决|剔除|排除|移除|回避|暂缓|放弃)"
 )
 
 #: 「能力陈述」标记：说了「TA **可以**否决」≠ 本轮否决了谁。
@@ -1522,8 +1575,20 @@ def _reject_verb_hits(text: str) -> list[tuple[int, str]]:
     """
     keep_alt = "|".join(_REJECT_KEEP_ACTIONS)
     out: list[tuple[int, str]] = []
+    #: 🔴 2026-11-16（真机交付件 `snapshots/20261113_202504` 实证）：
+    #    「不**正式**否决」这类**否定前缀 + 裸否决动词** ⇒ 那个动词**不是**裁决
+    #    ⇒ 命中作废（否则 512800 被误判成一票否决 ⇒ 全链路错）。
+    #    ⚠️ 只作废**贴脸**的那一个动词 ⇒ 同句里别的真否决不受影响。
+    # 🔴 2026-11-16（独立审查 I1）：用**区间重叠**判定，不是「起点相等」。
+    #    「**不**考虑**剔除** `512800`」里 `_REJECT_VERBS` 命中的 token 是「不考虑」
+    #    （起点 0），而裸动词「剔除」起点是 3 ⇒ 只比「起点相等」⇒ 护栏失效
+    #    ⇒ 「不考虑剔除」被误判成一票否决。
+    #    ⇒ 现在记录整个「否定前缀 + 裸动词」**匹配区间**，命中起点落在区间内即作废。
+    _negated_spans = [(m.start(), m.end()) for m in _REJECT_NEG_PREFIX_RE.finditer(text)]
     for _word, rx in _REJECT_VERB_RES:
         for m in rx.finditer(text):
+            if any(start <= m.start() < end for start, end in _negated_spans):
+                continue
             # 🔴 2026-11-11 审计修：允许「也/则/并」+ 可选「不」再接持有动作
             #    （`不买也不卖 512800` = 维持 ⇒ 不是否决；旧口径只认紧邻的「卖」）。
             if re.match(r"[\s*`_~]*(?:也|则|并|且)?不?(" + keep_alt + ")", text[m.end():]):
@@ -1583,13 +1648,17 @@ _REJECT_NEG_NECESSITY_RE = re.compile(
 
 def _guarded(clause: str) -> bool:
     """本子句是否被反向语义护栏 / 能力陈述中和。"""
-    if any(neg in clause for neg in _REJECT_NEGATIONS):
+    # 🔴 2026-11-16（独立审查 I2）：「**不得不否决**」= **真否决**
+    #    ⇒ 不能被 `_REJECT_NEGATIONS` 的**子串**匹配吞掉 ⇒ 先改写成中性占位。
+    probe = (_REJECT_EMPHASIS_RE.sub("〔强调〕", clause)
+             if _REJECT_EMPHASIS_RE.search(clause) else clause)
+    if any(neg in probe for neg in _REJECT_NEGATIONS):
         return True
-    if _REJECT_NEGATION_RE.search(clause):
+    if _REJECT_NEGATION_RE.search(probe):
         return True
-    if _REJECT_NEG_NECESSITY_RE.search(clause):
+    if _REJECT_NEG_NECESSITY_RE.search(probe):
         return True
-    return any(mark in clause for mark in _REJECT_CAPABILITY)
+    return any(mark in probe for mark in _REJECT_CAPABILITY)
 
 
 def _buy_intent(text: str) -> tuple[bool, set[str]]:
@@ -2503,6 +2572,41 @@ _AUTHORITY_MD_MARKERS: tuple[str, ...] = (
     "辩论裁决", "风险裁决", "基准调仓表", "最终调仓方向表",
 )
 
+#: 🔴 2026-11-16（真机交付件 `snapshots/20261113_202504` 实证）：
+#:    **否决名单的来源章节** = **裁决段全集**（研究经理 / 辩论裁决 / 风险裁决 /
+#:    Trader 交易计划 / 最终交易决定）。
+#:
+#:    事故：Trader 交易计划里写「因此**不正式否决** `512800`，但将其降至16%」
+#:    ⇒ 旧口径把**执行计划散文**当裁决源 ⇒ 512800 被误判成一票否决
+#:    ⇒ 交付层把它变成「维持席位」⇒ 该顺延补位的 515450 消失
+#:    ⇒ 权益上限 80%→32% 时只剩 584.4 元 ⇒ 又被 3800 元新开仓门槛拦下 ⇒ 全链路错。
+#:
+#: 🔴 为什么**不能**只认「最终交易决定」一段（收敛过头 ⇒ 漏判）：
+#:    真机 20261110 决策件里「最终交易决定」只列了 **4** 只否决，
+#:    另外 **9** 只真否决写在「研究经理 / 辩论裁决」段
+#:    ⇒ 硬收敛到一段 ⇒ **漏判 9 只**（探针 A1「恰好 13 只」当场变红）。
+#:
+#: 🔴 为什么**不能**整段砍掉「Trader 交易计划」（2026-11-16 独立审查 B1）：
+#:    ① 整段砍 ⇒ `('Trader', 30)` 这一权威层级**永不可达**
+#:       ⇒ 与 `tests/test_probe_ta_reject_authority_rank.py` 钉死的不变式冲突
+#:       （观点 0 < 研究经理 10 < 辩论/风险裁决 20 < **Trader 30** < 最终交易决定 40）；
+#:    ② 只写在 Trader 段的**真否决**（结构化裁决表里的「不买，正式否决」）会被丢掉
+#:       ⇒ 与本次事故**同型**的漏判（方向相反）。
+#:    ⇒ 折中：**Trader 段保留，但只采信它的「表格行」、丢弃「散文」**
+#:      （散文 = 执行计划的自然语言叙述；表格行 = 结构化裁决）。
+#:      事故句「因此不正式否决 512800」在**散文**里 ⇒ 不再被采信；
+#:      Trader 表格里 512800 那行是「**减**」⇒ 本就不是否决 ⇒ 口径自洽。
+REJECT_SOURCE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = AUTHORITY_SECTIONS
+
+#: 「**只采信表格行、丢弃散文**」的来源章节（JSON 路径按标题**精确**匹配）。
+REJECT_SOURCE_TABLE_ONLY_SECTIONS: tuple[str, ...] = ("Trader 交易计划",)
+
+#: `.md` 展示件里**允许作为否决来源**的章节标题关键词（= 权威段全集）。
+REJECT_SOURCE_MD_MARKERS: tuple[str, ...] = _AUTHORITY_MD_MARKERS
+
+#: `.md` 展示件里**只采信表格行**的章节关键词（按标题**子串**匹配）。
+REJECT_SOURCE_TABLE_ONLY_MD_MARKERS: tuple[str, ...] = ("Trader",)
+
 
 def _dig(payload: dict, key_path: tuple[str, ...]) -> str:
     """按路径取嵌套字符串（任一层缺失/类型不对 ⇒ 空串）。"""
@@ -2514,7 +2618,23 @@ def _dig(payload: dict, key_path: tuple[str, ...]) -> str:
     return cur if isinstance(cur, str) else ""
 
 
-def _authority_md_text(text: str) -> str:
+def _table_rows_only(body: str) -> str:
+    """只保留 markdown **表格行**（丢弃散文）。
+
+    🔴 2026-11-16（独立审查 B1 · 方案 B）：「Trader 交易计划」段里
+       **散文**是执行计划的自然语言叙述（事故句「因此不正式否决 512800」就在里面），
+       **表格行**才是结构化裁决 ⇒ 只采信表格行。
+    """
+    return "\n".join(
+        line for line in body.splitlines() if line.strip().startswith("|")
+    )
+
+
+def _authority_md_text(
+    text: str,
+    markers: tuple[str, ...] = _AUTHORITY_MD_MARKERS,
+    table_only_markers: tuple[str, ...] = (),
+) -> str:
     """从 `.md` 展示件里**只保留权威章节**（含其子章节）。
 
     🔴 2026-11-11 审计修（发现 3 · 高）：旧口径只按 `## ` 一级标题切块 ⇒
@@ -2525,6 +2645,10 @@ def _authority_md_text(text: str) -> str:
        ⇒ 权威标题命中即保留**整个章节（含子章节）**。
 
     🔴 观点章节（多头/空头/激进派/保守派/中立派）**一律不保留** ⇒ 观点没有否决权。
+
+    🔴 2026-11-16：`markers` 可覆盖 ⇒ **否决来源**用 `REJECT_SOURCE_MD_MARKERS`；
+       `table_only_markers` 命中的章节 ⇒ **只保留标题行 + 表格行**（丢弃散文）
+       ⇒ 「Trader 交易计划」只以**结构化裁决表**的身份参与否决判定。
     """
     lines = text.splitlines()
     heads: list[tuple[int, int, str]] = []
@@ -2536,13 +2660,20 @@ def _authority_md_text(text: str) -> str:
         return ""
     keep_idx: set[int] = set()
     for pos, (start, level, title) in enumerate(heads):
-        if not any(marker in title for marker in _AUTHORITY_MD_MARKERS):
+        if not any(marker in title for marker in markers):
             continue
         end = len(lines)
         for n_start, n_level, _t in heads[pos + 1:]:
             if n_level <= level:
                 end = n_start
                 break
+        if any(marker in title for marker in table_only_markers):
+            # 只保留**标题行 + 表格行** ⇒ 散文（执行计划叙述）整段丢弃。
+            for i in range(start, end):
+                stripped = lines[i].strip()
+                if stripped.startswith("|") or stripped.startswith("#"):
+                    keep_idx.add(i)
+            continue
         keep_idx.update(range(start, end))
     return "\n".join(line for i, line in enumerate(lines) if i in keep_idx)
 
@@ -2559,12 +2690,18 @@ def extract_authority_rejections(decision_path: str | Path | None) -> list[dict]
       * 空头观点「暂不买入 `515450`、`515650`」 ⇒ 误伤 2 只（TA 最终裁决是**买**）；
       * 激进派观点「清仓512800，等于放弃…」      ⇒ 误伤 1 只（TA 最终裁决是**减**）。
 
-    ⇒ 本函数**只**把 `AUTHORITY_SECTIONS` 这 5 段拼起来喂给 `extract_rejections`，
-    实测真实决策件 ⇒ 恰好 **13 只**、且 **515450 / 515650 / 512800 零误伤**。
+    ⇒ 本函数**只**把 `REJECT_SOURCE_SECTIONS` 这 **5** 段（裁决段全集）拼起来喂给
+    `extract_rejections`，实测真实决策件 ⇒ 恰好 **13 只**、且
+    **515450 / 515650 / 512800 零误伤**。
 
-    🔴 **兜底**：没有 `.json` 时退到 `.md`，且**只保留**「研究经理 / Trader /
-    最终交易决定」三个章节（观点章节仍丢弃）。
-    🔴 **不改既有语义**：`extract_rejections` / `extract_final_decision` 一字未改。
+    🔴 **兜底**：没有 `.json` 时退到 `.md`，同样**只保留**权威章节
+    （观点章节一律丢弃）。
+    🔴 **「Trader 交易计划」段只采信「表格行」、丢弃「散文」**（2026-11-16 方案 B）：
+       事故句「因此**不正式否决** `512800`」在**散文**里 ⇒ 不再被采信；
+       该段**表格行**里的「不买，正式否决」仍是**结构化裁决** ⇒ 必须保留
+       （否则 `('Trader', 30)` 权威层级永不可达 ⇒ 同型漏判）。
+    🔴 **不改既有语义**：`extract_rejections` / `extract_final_decision` 的
+       **判定规则**一字未改；本函数只决定**喂进去的文本范围**。
     """
     if not decision_path:
         return []
@@ -2576,11 +2713,16 @@ def extract_authority_rejections(decision_path: str | Path | None) -> list[dict]
         except (OSError, json.JSONDecodeError):
             payload = None
         if isinstance(payload, dict):
-            chunks = [
-                f"## {title}\n{body}"
-                for title, key_path in AUTHORITY_SECTIONS
-                if (body := _dig(payload, key_path)).strip()
-            ]
+            chunks: list[str] = []
+            for title, key_path in REJECT_SOURCE_SECTIONS:
+                body = _dig(payload, key_path)
+                if not body.strip():
+                    continue
+                if title in REJECT_SOURCE_TABLE_ONLY_SECTIONS:
+                    body = _table_rows_only(body)
+                    if not body.strip():
+                        continue
+                chunks.append(f"## {title}\n{body}")
             if chunks:
                 return extract_rejections("\n\n".join(chunks))
     md_path = path if path.suffix == ".md" else path.with_suffix(".md")
@@ -2590,7 +2732,13 @@ def extract_authority_rejections(decision_path: str | Path | None) -> list[dict]
         text = md_path.read_text(encoding="utf-8")
     except OSError:
         return []
-    return extract_rejections(_authority_md_text(text))
+    return extract_rejections(
+        _authority_md_text(
+            text,
+            REJECT_SOURCE_MD_MARKERS,
+            REJECT_SOURCE_TABLE_ONLY_MD_MARKERS,
+        )
+    )
 
 
 def load_from_decision(decision_path: str | Path | None) -> dict:

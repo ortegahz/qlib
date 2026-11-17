@@ -691,6 +691,14 @@ def _render_pipeline(result: Mapping, account: object,
     lines.append("## 调仓后仓位分布")
     lines.append("")
     positions = _get(post_trade, "positions") or []
+    #: 🔴 2026-11-16（渲染层「幽灵零仓位行」修复 · 真机交付件 `20261113_202504`）：
+    #    被最小调仓门槛拦下的标的（`target_shares = 0`、金额归零）**仍留在 `actions` 里**
+    #    —— 那是为保会计恒等式 `Σw_i + w_cash = 1`、让被拦金额**精准回流现金**。
+    #    但它**调仓后一股没买** ⇒ 不该在《调仓后仓位分布》里印出
+    #    「0 股 / 0 元 / 0.00%」这种**假持仓**行（看得懂、但会误导）。
+    #: ⚠️ **只动渲染层**：账目层（现金 / 权重恒等式 / 执行明细）一个字都不改；
+    #:    被拦标的的**披露**仍在「无动作（维持）」表里（写明「低于 3800 元门槛」）。
+    positions = [pos for pos in positions if (_to_float(_get(pos, "shares")) or 0.0) > 0]
     if positions:
         lines.extend(_table(
             ["代码", "名称", "股数", "市值（元）", "权重", "备注"],

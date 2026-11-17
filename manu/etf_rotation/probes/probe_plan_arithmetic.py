@@ -17,6 +17,26 @@ M-H 审计发现：交付件把「**计划**权益权重 40.0%」当成「**实�
 **不信任产物自述**：所有数字都从 `actions` / `meta` **独立重算**再比对；
 并且用**负例**证明这些断言**真的会拦人**（把产物改坏 ⇒ 对应断言必须 FAIL）。
 
+【🔴 P4「整手取整缺口」口径（2026-11-13 修正）——价格基差与取整缺口必须分开看】
+交付件里这三个金额字段**分属两套价格基准**（生产 `final_rebalance_plan.py` 权威口径）：
+   · `planned_equity_amount` = 计划权重 × **账户快照口径**总资产（计划口径，**未**取整）
+   · `equity_amount_realized` = Σ 目标股数 × **执行价**（asof 收盘价）
+   · `lot_rounding_gap_amount` = 前两者相减 ⇒ **跨了两套价格基准**
+     ⇒ 当**执行价 > 账户快照价**时，这个差值**必然为负**，**与整手取整本身无关**。
+实测（2026-11-13 交付件，asof=2026-11-13）：快照市值 6668.20 / 执行价市值 6906.90
+⇒ 价格基差 **−238.70**、字段缺口 **−238.70**（计划 6668.20 − 实际 6906.90）
+⇒ 但**同轮真实取整损失 = 0.00**（512800：目标金额 6906.90 元 ⇒ 7700 股 × 0.897 = 6906.90 元，
+   一分不多；515450 被最小交易门槛拦下不建仓）⇒ 字段缺口的负号来自**价格基差**，不是取整质量。
+⚠️ 由此 P4 拆成**两条各自站得住**的断言（互不替代）：
+   (a) **字段自洽**：`lot_rounding_gap_amount` == `planned_equity_amount − equity_amount_realized`
+       （产物 vs 独立重算）——这是交付件**自己**承诺的恒等式，必须成立。
+   (b) **取整质量（逐条 · 同价口径）**：整手**向下**取整 ⇒ 每条「落地金额 ≤ 目标金额」
+       （`target_shares × price ≤ target_amount`）——这才是与取整**直接**相关、
+       且**不会被价格基差污染**的不变量（11-03 canonical 实测：1800 × 0.88 = 1584.00 ≤ 1592.25 ✔，
+       取整损失 8.25 元）。
+⚠️ 聚合层面的「缺口 ≥ 0」**不是**不变量（纯买入场景下计划口径与执行口径本就不可直接相减，
+   聚合缺口可以为负而与取整质量无关）⇒ 不再拿它当断言；价格基差由 P5 单独校验（两口径不许混算）。
+
 【用法】
     PYTHONHASHSEED=0 /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_plan_arithmetic.py
@@ -101,6 +121,12 @@ def evaluate(plan: dict, md_text: str, cal: list[str]) -> list[tuple[str, bool, 
     overshoot: list[str] = []
     unbuildable_bad: list[str] = []
     fee_bad: list[str] = []
+    #: ---- P4(b) 逐条取整质量（整手**向下**取整 ⇒ 落地金额不许超目标金额，同价口径）----
+    lot_over: list[str] = []   # 落地金额 > 目标金额的行（取整被破坏）
+    lot_checked = 0            # 参与逐条检查的行数（target_amount > 0 且 target_shares > 0）
+    lot_skipped = 0            # 无目标金额可比（target_amount ≤ 0）⇒ 天然满足
+    lot_nobuild = 0            # 目标股数 = 0（不可建仓 / 清仓）⇒ 天然满足
+    lot_loss = 0.0             # 逐条取整损失合计（目标金额 − 落地金额，元）
     fee_rate = (_f(meta.get("commission_bp"), 0.0) + _f(meta.get("slippage_bp"), 0.0)) / 1e4
     for a in actions:
         shares = int(a.get("target_shares") or 0)
@@ -127,8 +153,19 @@ def evaluate(plan: dict, md_text: str, cal: list[str]) -> list[tuple[str, bool, 
             lot_bad.append(f"{a.get('code')}({shares})")
         if shares and price:
             tgt_amt = _f(a.get("target_amount"), 0.0)
-            if shares * price > tgt_amt + TOL_MONEY:
+            over = shares * price > tgt_amt + TOL_MONEY
+            if over:
                 overshoot.append(f"{a.get('code')}({shares * price:.2f}>{tgt_amt:.2f})")
+            #: P4(b)：同一价格口径（执行价）下的取整质量 —— 落地金额必须 ≤ 目标金额
+            if tgt_amt > 0:
+                lot_checked += 1
+                lot_loss += tgt_amt - shares * price
+                if over:
+                    lot_over.append(f"{a.get('code')}({shares * price:.2f}>{tgt_amt:.2f})")
+            else:
+                lot_skipped += 1
+        elif not shares:
+            lot_nobuild += 1
         if str(a.get("action")) == "不可建仓":
             if shares != 0 or abs(_f(a.get("weight_to_cash"), 0.0) - _f(a.get("target_weight"), 0.0)) > TOL_WEIGHT:
                 unbuildable_bad.append(str(a.get("code")))
@@ -158,13 +195,30 @@ def evaluate(plan: dict, md_text: str, cal: list[str]) -> list[tuple[str, bool, 
     out.append(("P3 实际落地现金权重 = 期末现金 ÷ 总资产", ok,
                 f"产物 {got_cw * 100:.4f}% vs 重算 {exp_cw * 100:.4f}%"))
 
-    # ---- P4 整手取整缺口 ----
+    # ---- P4 整手取整缺口（口径修正 2026-11-13）----
+    #: 🔴 字段口径：`lot_rounding_gap_amount` = 计划权益 − 实际权益，而**计划权益是账户快照口径**、
+    #:    **实际权益是执行价口径** ⇒ 这个差**跨了两套价格基准** ⇒ 它的**符号不代表取整质量**
+    #:    （执行价 > 账户快照价时必然为负，与整手取整无关）。
+    #:    ⇒ 拆成两条各自站得住的断言：(a) 字段自洽（产物 vs 独立重算）；
+    #:      (b) 取整质量（逐条 · 同价口径）：整手向下取整 ⇒ 落地金额 ≤ 目标金额。
     planned_amt = _f(cf.get("planned_equity_amount"), 0.0)
     exp_gap = planned_amt - realized_equity
     got_gap = _f(cf.get("lot_rounding_gap_amount"), -1.0)
-    ok = abs(got_gap - exp_gap) <= TOL_MONEY and got_gap >= -TOL_MONEY
-    out.append(("P4 整手取整缺口 = 计划权益 − 实际权益（且 ≥ 0）", ok,
-                f"产物 {got_gap:.2f} vs 重算 {exp_gap:.2f}｜计划 {planned_amt:.2f} / 实际 {realized_equity:.2f}"))
+    field_ok = abs(got_gap - exp_gap) <= TOL_MONEY
+    lot_ok = not lot_over
+    ok = field_ok and lot_ok
+    #: 价格基差（与 P5 同一重算口径；P4 只用它**说明**结论，不参与判定）
+    basis_amt = snapshot_mv - exec_mv
+    out.append(("P4 整手取整缺口字段自洽（计划权益 − 实际权益）且逐条落地 ≤ 目标金额", ok,
+                f"产物 {got_gap:.2f} vs 重算 {exp_gap:.2f}"
+                f"｜计划权益 {planned_amt:.2f} / 实际权益 {realized_equity:.2f}"
+                f" / 字段缺口 {got_gap:.2f} / 价格基差 {basis_amt:.2f}"
+                f"｜逐条取整质量：检查 {lot_checked} 条（落地 ≤ 目标），越界 {len(lot_over)} 条"
+                f"{'：' + ', '.join(lot_over[:3]) if lot_over else ''}"
+                f"｜跳过 {lot_skipped} 条（无目标金额）+ {lot_nobuild} 条（目标股数 = 0）"
+                f"｜逐条取整损失合计 {lot_loss:.2f}"
+                f"｜字段口径 = 计划权益 − 实际权益，跨了账户快照价与执行价两套基准 ⇒ 字段缺口的符号"
+                f"不代表取整质量；取整质量由逐条断言（落地 ≤ 目标）保证"))
 
     # ---- P5 价格基差 ----
     exp_basis = snapshot_mv - exec_mv
@@ -214,23 +268,40 @@ def evaluate(plan: dict, md_text: str, cal: list[str]) -> list[tuple[str, bool, 
     out.append((f"P11 每笔费用 = 金额 ×（佣金 {meta.get('commission_bp')}bp + 滑点 {meta.get('slippage_bp')}bp）", ok,
                 f"费率 {fee_rate * 1e4:.2f}bp｜异常 {len(fee_bad)} 条{'：' + ', '.join(fee_bad[:3]) if fee_bad else ''}"))
 
-    # ---- P12 计划权重口径：Σ目标权重 + 计划现金权重 = 1，且计划现金权重 ≥ 现金预留比例 ----
+    # ---- P12 计划权重口径：Σ有效权重 + 计划现金权重 = 1，且计划现金权重 ≥ 现金预留比例 ----
     #: 🔴 2026-11-10：现金预留比例**从常量读**（研究链 `config.CASH_RESERVE_RATIO`），
     #:    **不许写死 0.2** ⇒ 口径改了探针跟着改，不靠人记得改数字。
     reserve_ratio = float(C.CASH_RESERVE_RATIO)
     #: 计划现金权重 —— 口径 = `final_rebalance_plan.py` 的 `cash_flow.target_cash_weight`
     #: （= 1 - 计划权益权重；权益部分含「不可建仓 / 整手取整」缺口 ⇒ 权重归现金）
     plan_cash_weight = _f(cf.get("target_cash_weight"), 0.0)
-    sum_ok = abs(w_target + plan_cash_weight - 1.0) <= TOL_WEIGHT
+    #: 🔴 2026-11-13（方案一 · 最小调仓门槛）：**口径升级**（不是放松断言）。
+    #:    旧口径 `Σ目标权重 + 计划现金权重 == 1` **只在「Σ有效 == Σ目标」时成立**
+    #:    （账户里没有任何「席位缺口」：不可建仓 / 现金削减 / **门槛拦下的碎单**）。
+    #:    🔴 探针自己在下面那段注释里写了这个前提（"Σ权重归现金 >0 ⇒ 上面恒等式按同额偏大"），
+    #:    但**断言没有把它算进去** ⇒ 门槛一上线（合法地产生席位缺口）就**假红**。
+    #:    ⇒ 修法（沿用 2026-11-11 对 P13 的同款升级，**不是**把断言改弱）：
+    #:      ① 恒等式改用**有效权重**（`target_weight_effective` = 可达权重）⇒ 精确成立；
+    #:      ② 补一条**分解式**（未分配权重 + **带符号**席位缺口）
+    #:         ⇒ 目标权重与有效权重的差额必须被**如实记账**（正=归现金，负=超配不可归现金）。
+    #:      ⇒ 比旧口径**更强**：既查「账平」，也查「差额有没有被漏记」；
+    #:         且在旧世界（无席位缺口）里与旧断言**逐字等价**。
+    w_gap_signed = w_target - w_eff      # 正 = 该席位权重归了现金；负 = 超配
+    sum_ok = abs(w_eff + plan_cash_weight - 1.0) <= TOL_WEIGHT
+    decomp_ok = abs(
+        plan_cash_weight - ((1.0 - w_target) + w_gap_signed)) <= TOL_WEIGHT
     reserve_ok = plan_cash_weight >= reserve_ratio - TOL_WEIGHT
     out.append((
-        "P12 Σ目标权重 + 计划现金权重 = 1（且计划现金权重 ≥ 现金预留比例）",
-        bool(sum_ok and reserve_ok),
-        f"Σ目标权重 {w_target:.6f} + 计划现金权重 {plan_cash_weight:.6f}"
-        f" = {w_target + plan_cash_weight:.6f}（{'✔' if sum_ok else '✘'}）"
+        "P12 Σ有效权重 + 计划现金权重 = 1（且计划现金权重 ≥ 现金预留比例）",
+        bool(sum_ok and decomp_ok and reserve_ok),
+        f"Σ有效权重 {w_eff:.6f} + 计划现金权重 {plan_cash_weight:.6f}"
+        f" = {w_eff + plan_cash_weight:.6f}（{'✔' if sum_ok else '✘'}）"
+        f"｜分解：未分配(1 − Σ目标权重) {1.0 - w_target:.6f}"
+        f" + 带符号席位缺口 {w_gap_signed:.6f} = {(1.0 - w_target) + w_gap_signed:.6f}"
+        f"（{'✔' if decomp_ok else '✘'}）"
         f"｜现金预留比例（常量 C.CASH_RESERVE_RATIO）{reserve_ratio:.6f}"
         f" ⇒ 计划现金权重 {'≥' if reserve_ok else '<'} 预留比例"
-        f"｜Σ权重归现金 {w_cash:.6f}（不可建仓 / 削减席位；>0 ⇒ 上面恒等式按同额偏大）",
+        f"｜Σ权重归现金 {w_cash:.6f}（不可建仓 / 削减席位 / 门槛拦下）",
     ))
 
     # ---- P12b 权益权重不许超配（≤ 1 - 现金预留比例）----
@@ -370,7 +441,11 @@ def main() -> int:
         p2["cash_flow"]["equity_weight_realized"] = 0.5
 
     def _n2(p2, _m):
-        p2["cash_flow"]["lot_rounding_gap_amount"] = 0.0
+        # 🔴 2026-11-13：改成「固定偏移 +1000.00」而不是「置 0.0」
+        #    ⇒ 无论产物真值是多少（有的轮次真值恰好 = 0.00），改后的值都**必然**与真值不等
+        #    ⇒ 守卫恒被触发（原来的「置 0.0」在真值 = 0.00 的产物上等于「改了个寂寞」）。
+        p2["cash_flow"]["lot_rounding_gap_amount"] = (
+            _f(p2["cash_flow"].get("lot_rounding_gap_amount"), 0.0) + 1000.0)
 
     def _n3(p2, _m):
         # 🔴 两个字段都篡改 ⇒ P5（基差字段）+ P7（执行口径总资产字段）必须同时 FAIL。
@@ -402,10 +477,22 @@ def main() -> int:
         if tgt8 is not None:
             tgt8["weight_to_cash"] = _f(tgt8.get("weight_to_cash"), 0.0) + 0.01
 
+    def _n9(p2, _m):
+        # 🔴 变异反证（2026-11-13 方案一 · 最小调仓门槛）：把某条 action 的**可达权重**
+        #    （`target_weight_effective`）改坏 ⇒ **P12 与 P13 必须同时转红**。
+        #: 钉的是「门槛把权重归现金之后，**有效权重与现金桶仍然账平**」这一条：
+        #: 门槛拦下一笔碎单 ⇒ 该席位的可达权重变 0、权重归现金 ⇒
+        #: 若这两处没有**同时**如实记账 ⇒ 恒等式立刻炸 ⇒ 闸门必须抓得到。
+        acts9 = p2.get("actions") or []
+        if acts9:
+            acts9[0]["target_weight_effective"] = (
+                _f(acts9[0].get("target_weight_effective"), 0.0) + 0.01)
+
     negatives = [
         ("N1 篡改「实际落地权益金额」⇒ P1/P2 必须 FAIL", _n1, ["P1 实际落地权益金额（独立重算 Σ 目标股数×执行价）",
                                                             "P2 实际落地权益权重 = 实际金额 ÷ 总资产"]),
-        ("N2 篡改「整手取整缺口」⇒ P4 必须 FAIL", _n2, ["P4 整手取整缺口 = 计划权益 − 实际权益（且 ≥ 0）"]),
+        ("N2 篡改「整手取整缺口」⇒ P4 必须 FAIL", _n2,
+         ["P4 整手取整缺口字段自洽（计划权益 − 实际权益）且逐条落地 ≤ 目标金额"]),
         ("N3 篡改「价格基差」⇒ P5/P7 必须 FAIL", _n3, ["P5 价格基差 = 快照市值 − 执行价市值（两口径不许混算）",
                                                       "P7 执行口径总资产 = 账户总资产 − 价格基差"]),
         ("N4 篡改「期末现金」⇒ P3/P8 必须 FAIL", _n4, ["P3 实际落地现金权重 = 期末现金 ÷ 总资产",
@@ -416,6 +503,9 @@ def main() -> int:
          ["P13 Σ有效权重 + Σ权重归现金 = 1（归现金 = 计划现金权重：未分配 + 席位缺口）"]),
         ("N8 篡改某条 action 的「权重归现金」⇒ P13 必须 FAIL", _n8,
          ["P13 Σ有效权重 + Σ权重归现金 = 1（归现金 = 计划现金权重：未分配 + 席位缺口）"]),
+        ("N9 篡改某条 action 的「可达权重」⇒ P12/P13 必须 FAIL", _n9,
+         ["P12 Σ有效权重 + 计划现金权重 = 1（且计划现金权重 ≥ 现金预留比例）",
+          "P13 Σ有效权重 + Σ权重归现金 = 1（归现金 = 计划现金权重：未分配 + 席位缺口）"]),
     ]
     for title, fn, expect_fail in negatives:
         p2 = copy.deepcopy(plan)

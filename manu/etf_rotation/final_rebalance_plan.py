@@ -42,6 +42,7 @@ import config as C  # noqa: E402  （落点常量单一事实源）
 import direction_vocab  # noqa: E402  （LLM 方向词表单一事实源：与语义守卫同表）
 import llm_final as llm_final_mod  # noqa: E402
 import overlap as overlap_mod  # noqa: E402  （候选池重合度筛查：唯一口径来源）
+import min_trade_gate as gate_mod  # noqa: E402  （最小调仓门槛：阶段5/阶段6 单一事实源）
 
 LOT = 100  # ETF 最小交易单位：100 股（一手）
 
@@ -1497,8 +1498,13 @@ def _build_llm_final_decision(args, plans: list[dict], llm_targets: dict,
             status = "与规则层不一致" if abs(gap) > 2.0 else "与规则层一致"
         notes: list[str] = []
         if rule_pct is not None and rule_eff is not None and abs(rule_pct - rule_eff) > 0.01:
-            notes.append(f"规则层计划 {rule_pct:.1f}% 但**整手买不起 ⇒ 实际落地 {rule_eff:.1f}%**"
-                         f"（权重归现金 {rule_cash_map.get(code, 0.0):.1f}%）")
+            #: 🔴 2026-11-13：`weight_to_cash` 是**有符号**差额（超配没减仓 ⇒ 负）
+            #:    ⇒ 文案必须分两支，不许把负数写成「权重归现金 −2.7%」（读起来像 bug）。
+            _cash_pp = float(rule_cash_map.get(code, 0.0))
+            _cash_txt = (f"权重归现金 {_cash_pp:.1f}%" if _cash_pp >= 0
+                         else f"**超配 {-_cash_pp:.1f}% 留在场内**（现金相应少 {-_cash_pp:.1f}%）")
+            notes.append(f"规则层计划 {rule_pct:.1f}% 但**实际落地 {rule_eff:.1f}%**"
+                         f"（{_cash_txt}）")
         if t.get("target_pct_source"):
             notes.append(f"目标权重来源：{t['target_pct_source']}")
         if t.get("shares_keep") is not None:
@@ -2408,6 +2414,14 @@ def apply_ta_screening(
     return {"actions": kept, "ta_screening": ta_screening}
 
 
+# =============================================================================
+# 🔴 最小调仓门槛（2026-11-13 方案一）：按**交易性质**拆成三档，不许单一金额一刀切
+# =============================================================================
+#: 实现**不在本文件** ⇒ 落在 `manu/etf_rotation/min_trade_gate.py`（**单一事实源**）
+#: 理由：阶段 5（本文件，信号日价）与阶段 6（`reprice_node_day.py`，节点日价）
+#:      **必须用同一套口径**，否则阶段 6 会把阶段 5 拦下的碎单**重新算回来**
+#:      ⇒ 门槛形同虚设 ⇒ 两个脚本都 import 同一个模块。
+
 def build_plan(args) -> dict:
     # 🔴 M-B①：F5 判定走「运行内快照」⇒ 每次构建**先清缓存**（新构建必读新盘）
     reset_decision_failure_cache()
@@ -2525,7 +2539,9 @@ def build_plan(args) -> dict:
     )
     # 🔴 一票否决**只认权威裁决段落**（观点段落没有否决权）——
     #    真实决策件里空头说「暂不买入 515450/515650」、激进派说「清仓512800，
-    #    等于放弃…」⇒ 旧实现（扫全文）误伤 3 只 ⇒ 见 llm_final.AUTHORITY_SECTIONS。
+    #    等于放弃…」⇒ 旧实现（扫全文）误伤 3 只
+    #    ⇒ 见 llm_final.REJECT_SOURCE_SECTIONS（否决来源 = 裁决段全集，
+    #    「Trader 交易计划」只采信**表格行**、丢弃散文）。
     _rejections_all = llm_final_mod.extract_authority_rejections(args.decision)
     # 🔴 2026-11-11（真机缺陷 ①）：**池外代码剔除**（fail-closed）。
     #    LLM 笔误出来的池外代码（如 566620；池内是 516620）**不得**进入否决名单
@@ -2846,6 +2862,50 @@ def build_plan(args) -> dict:
                     "属 5 只等权结构之外的额外决策，不是本计划的持仓",
         })
 
+    # ---- 🔴 最小调仓门槛（方案一 · 2026-11-13）：按交易性质拆三档 ----
+    #: 🔴 **位置纪律**：门槛**必须在现金可行性之前**跑。理由：
+    #:    ① 被拦下的买卖**不进现金流**（卖出回款少一笔、买入支出少一笔）
+    #:       ⇒ 期末现金自然自洽（否则「卖出回款」与「期末现金」两个数字互相打架）；
+    #:    ② 「现金不足 ⇒ 削减买入」那条路径能**自动接手**（少卖 ⇒ 缺口 ⇒ 削减买入）。
+    #: 🔴 若放在现金可行性**之后** ⇒ 被拦下的卖出会让回款对不上 ⇒ 位置错了数字就错。
+    _gate_enabled = gate_mod.gate_enabled(args)
+    _gate_thresholds = gate_mod.resolve_thresholds(gate_mod.thresholds_from_args(args))
+    min_amount_gate = gate_mod.apply_min_trade_threshold(
+        plans,
+        total_assets=total_assets,
+        commission_rate=(commission_bp / 1e4),
+        thresholds=gate_mod.thresholds_from_args(args),
+        enabled=_gate_enabled,
+        price_basis=f"{asof} 收盘价（信号日价）",
+    )
+
+    def _gate_block(p: dict, amount: float, reason_suffix: str = "") -> dict:
+        """门槛作废一行（**行保留**）⇒ 并把披露并回 `min_amount_gate`。"""
+        _kind = gate_mod.classify_min_amount_kind(p) or "存量微调"
+        _rec = gate_mod.block_row(
+            p,
+            kind=_kind,
+            amount=amount,
+            threshold=float(_gate_thresholds.get(_kind, 0.0)),
+            commission_rate=(commission_bp / 1e4),
+            min_commission=float(C.ETF_MIN_COMMISSION_STRICT),
+            total_assets=total_assets,
+            reason_suffix=reason_suffix,
+        )
+        min_amount_gate["skipped"].append(_rec)
+        min_amount_gate["skipped_count"] = len(min_amount_gate["skipped"])
+        min_amount_gate["min_commission_saved"] = round(
+            float(min_amount_gate["min_commission_saved"])
+            + float(_rec["min_commission_saved"]), 2)
+        if _kind == "新开仓":
+            min_amount_gate["new_open_skipped"] = int(
+                min_amount_gate["new_open_skipped"]) + 1
+            min_amount_gate["deadlock_risk"] = bool(
+                int(min_amount_gate["new_open_total"]) > 0
+                and int(min_amount_gate["new_open_skipped"])
+                >= int(min_amount_gate["new_open_total"]))
+        return _rec
+
     # ---- 现金可行性：卖出回款 + 期初现金 能不能覆盖买入 ----
     sells = [p for p in plans if (p["delta_shares"] or 0) < 0]
     buys = [p for p in plans if (p["delta_shares"] or 0) > 0]
@@ -2877,6 +2937,19 @@ def build_plan(args) -> dict:
             if p["est_amount"] + p["est_fee"] > budget:
                 lots = int(budget / (p["price"] * (1 + fee_rate)) / LOT) * LOT
                 new_amount = lots * p["price"]
+                # 🔴 方案一 · 第二道闸：现金削减后剩下的**碎片买入**（例如只剩 2,600 元）
+                #    ⇒ 按门槛**整笔作废**（不许买半仓：半仓照样吃 5 元最低佣金）。
+                #    ⇒ 作废后这笔预算留给后面的席位（碎片不占钱 ⇒ 不占预算）。
+                if _gate_enabled and lots > 0:
+                    _kind = gate_mod.classify_min_amount_kind(p) or "存量微调"
+                    if new_amount < float(_gate_thresholds.get(_kind, 0.0)):
+                        _gate_block(
+                            p, new_amount,
+                            reason_suffix="现金削减后只剩碎片金额 ⇒ 门槛一并作废",
+                        )
+                        scaled.append({"code": p["code"], "name": p["name"], "cut": True,
+                                       "planned_delta": None, "min_amount_blocked": True})
+                        continue
                 p["target_shares"] = p["current_shares"] + lots
                 p["delta_shares"] = lots
                 p["est_amount"] = new_amount
@@ -2911,7 +2984,9 @@ def build_plan(args) -> dict:
             _after_value = (p["current_shares"] + (p["delta_shares"] or 0)) * (p["price"] or 0.0)
             _eff = _after_value / total_assets
             p["target_weight_effective"] = _eff
-            p["weight_to_cash"] = max(0.0, _plan_w - _eff)
+            #: 🔴 2026-11-13 夜实测修（与 `min_trade_gate.block_row` 同一口径）：
+            #:    差额**有符号**，不许截断成非负（超配没减仓 ⇒ 负差额 ⇒ 现金相应更少）。
+            p["weight_to_cash"] = _plan_w - _eff
             _note = f"；现金不足 ⇒ 可达权重 {_eff * 100:.1f}%"
             if _eff < _plan_w - 1e-12:
                 _note += f"（原目标 {_plan_w * 100:.1f}%）"
@@ -3146,6 +3221,8 @@ def build_plan(args) -> dict:
             "exec_basis_total_assets": _exec_basis_total_assets,
         },
         "actions": plans,
+        # 🔴 2026-11-13 方案一：三档门槛的**披露结构**（阈值 / 被拦明细 / 死锁风险）
+        "min_amount_gate": min_amount_gate,
         "cash_alternatives": cash_alternatives,
         "tradingagents_view": _decision_view(args.decision),
         "llm_targets": llm_targets,
@@ -3309,6 +3386,22 @@ def render_markdown(plan: dict) -> str:
                 f"| {u['code']} | {u['name']} | {u['target_weight'] * 100:.1f}% | "
                 f"{u['one_lot_cost']:.0f} | **不可建仓 ⇒ 权重归现金** |"
             )
+        #: 🔴 2026-11-13 夜实测修（口径披露）：「整手取整缺口」字段 = 计划权益 − 实际权益，
+        #:    而**计划权益按账户快照价口径、实际权益按执行价口径** ⇒ 两者不是同一基准
+        #:    ⇒ 缺口**为负**时（执行价 > 账户快照价）旧文案会说成
+        #:    「整手取整缺口 −238.70 元 / −0.79pp，缺口自动留在现金」⇒ 自相矛盾
+        #:    （负的缺口怎么"留在现金"）⇒ 改成**按符号分两支**如实说明。
+        _gap = float(flow.get("lot_rounding_gap_amount") or 0.0)
+        _gap_pp = _gap / (meta["total_assets"] or 1) * 100
+        if _gap >= 0:
+            _gap_txt = (
+                f"整手取整缺口 **{_gap:.2f} 元 / {_gap_pp:.2f}pp**，缺口**自动留在现金**")
+        else:
+            _gap_txt = (
+                f"计划权益 − 实际权益 = **{_gap:.2f} 元 / {_gap_pp:.2f}pp**"
+                f"（🔴 该口径**跨了「账户快照价」与「执行价」两套基准** ⇒ 负号表示实际落地**多于**计划"
+                f"（价格基差 {(flow.get('price_basis_diff_amount') or 0):.2f} 元），**不代表取整超买**；"
+                f"整手取整质量以逐条「落地金额 ≤ 目标金额」为准）")
         lines += [
             "",
             f"⇒ **计划**权益仓位 = **{flow.get('invested_weight_planned', 0) * 100:.1f}%**"
@@ -3317,10 +3410,8 @@ def render_markdown(plan: dict) -> str:
             f"⇒ 🔴 **实际落地**（100 股整手**向下取整**后）："
             f"权益 **{(flow.get('equity_amount_realized') or 0):.2f} 元 = "
             f"{(flow.get('equity_weight_realized') or 0) * 100:.2f}%**"
-            f"（= 计划 {(flow.get('invested_weight_planned') or 0) * 100:.1f}% − 整手取整缺口 "
-            f"**{(flow.get('lot_rounding_gap_amount') or 0):.2f} 元 / "
-            f"{((flow.get('lot_rounding_gap_amount') or 0) / (meta['total_assets'] or 1) * 100):.2f}pp**，"
-            f"缺口**自动留在现金**）；现金 **{flow['cash_end']:.2f} 元 = "
+            f"（= 计划 {(flow.get('invested_weight_planned') or 0) * 100:.1f}% − {_gap_txt}）；"
+            f"现金 **{flow['cash_end']:.2f} 元 = "
             f"{(flow.get('cash_weight_realized') or 0) * 100:.2f}%**。",
             f"⇒ ℹ️ 为何「实际权益% + 实际现金% ≠ 100%」：账户快照价与调仓节点执行价**不是同一口径** ⇒ "
             f"价格基差 **{(flow.get('price_basis_diff_amount') or 0):.2f} 元** ＋ 已付费用 "
@@ -3344,6 +3435,54 @@ def render_markdown(plan: dict) -> str:
                     f"{('%.1f%%' % (_w * 100)) if _w else '—'} |"
                 )
             lines += [""]
+
+    # ---- 一之三 · 最小调仓门槛（方案一 · 三档） ----
+    _gate = plan.get("min_amount_gate") or {}
+    if _gate:
+        _thr = _gate.get("thresholds") or {}
+        _mc = float(_gate.get("min_commission_strict") or 5.0)
+        lines += [
+            "",
+            "## 一之三、🔴 最小调仓门槛（方案一 · 按交易性质拆三档）",
+            "",
+            f"> 口径：**不许**用单一金额一刀切 ⇒ 按交易性质分三档："
+            f"**清仓/止损 {float(_thr.get('清仓止损') or 0):.0f} 元"
+            f"（无条件执行，风控优先于手续费）**"
+            f"｜**新开仓 {float(_thr.get('新开仓') or 0):.0f} 元**"
+            f"｜**存量微调 {float(_thr.get('存量微调') or 0):.0f} 元**。",
+            f"> 折合费率口径 = **单边 {_mc:.0f} 元最低佣金**"
+            f"（研究链费用模型是「免 5 元」⇒ 本节 bp 与「省下的最低佣金」是**下限口径**，"
+            f"不参与现金流）。",
+            "",
+        ]
+        if _gate.get("deadlock_risk"):
+            lines += [
+                "🔴 **门槛与账户规模不匹配（数学死锁）**：本轮**所有**新开仓都被门槛拦下"
+                " ⇒ 以后**再也买不进任何新 ETF** ⇒ 必须下调「新开仓」门槛或提高账户规模。",
+                "",
+            ]
+        _skipped = _gate.get("skipped") or []
+        if _skipped:
+            lines += [
+                f"本轮被门槛拦下 **{len(_skipped)}** 笔"
+                f"（**动作不删行**，改为「持有 / 不建仓」⇒ 持仓市值与现金流仍自洽）：",
+                "",
+                "| 代码 | 名称 | 档位 | 金额（元） | 门槛（元） | 折合 bp | 省最低佣金（元） |",
+                "|:--|:--|:--|--:|--:|--:|--:|",
+            ]
+            for _s in _skipped:
+                lines.append(
+                    f"| {_s.get('code')} | {_s.get('name')} | {_s.get('kind')} | "
+                    f"{float(_s.get('amount') or 0):.2f} | {float(_s.get('threshold') or 0):.0f} | "
+                    f"{float(_s.get('effective_bp') or 0):.1f} | "
+                    f"{float(_s.get('min_commission_saved') or 0):.2f} |")
+            lines += [
+                "",
+                f"⇒ 合计省下最低佣金 **{float(_gate.get('min_commission_saved') or 0):.2f} 元**。",
+                "",
+            ]
+        else:
+            lines += ["本轮**没有被门槛拦下的调仓动作**（所有动作金额均达标）。", ""]
 
     lines += [
         "",
@@ -3680,6 +3819,26 @@ def main() -> int:
         help="账户基准 CSV（缺省 = account.ACCOUNT_SNAPSHOT_CSV）",
     )
     ap.add_argument("--out-dir", default=str(C.ETF_RUN_ROOT))
+    # 🔴 2026-11-13 方案一：最小调仓门槛（三档）的 CLI 开关。
+    #    ⚠️ 缺省 = **开**（config 的三档阈值）⇒ 每日链（子进程调用本脚本）
+    #    不传任何门槛参数 ⇒ **默认走 config** ⇒ 研究链与每日链同一口径（单一事实源）。
+    ap.add_argument(
+        "--no-min-amount-gate",
+        action="store_true",
+        help="关闭最小调仓门槛（回退/对比用；默认开）",
+    )
+    ap.add_argument(
+        "--min-amount-new", type=float, default=None,
+        help="新开仓门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_NEW",
+    )
+    ap.add_argument(
+        "--min-amount-adjust", type=float, default=None,
+        help="存量仓位微调门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_ADJUST",
+    )
+    ap.add_argument(
+        "--min-amount-liquidate", type=float, default=None,
+        help="清仓/止损门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_LIQUIDATE（0 = 无条件执行）",
+    )
     args = ap.parse_args()
 
     plan = build_plan(args)

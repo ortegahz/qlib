@@ -1,0 +1,555 @@
+# qlib 量化 ETF 轮动工程 · 主索引（Core Memory & Navigation）— 精简版
+
+> **本文件是「可直接贴给别的模型」的精简档**（对标红外工程 `ultralytics/manu/memory/.slim_memory.md` 的瘦身体系）。
+> **定位**：只保留**当前状态、当前口径、真值速查、铁律速览、导航表**；**历史全文**在主档 `manu/memory/memory.md`。
+> **怎么用**：① 把本文件整份贴给另一个模型，它就能接手这个工程；② 需要某段历史时按 §8 导航表跳主档/专题档；
+> ③ 需要"怎么做"（SOP）时看 `manu/skills/`。
+> 🔴 **memory 是四层**：**精简档（本文件，贴给别的模型）→ 速览卡 `memory_compact.md` → 主档 `memory.md` → 铁律 `rules.md`**。
+> 🔴 **四层都必须实时更新**，新鲜度链路 = **主档 → 速览卡 → 精简档**（下游 mtime 不得早于上游）；
+> 闸门：`python3 manu/tools/sync_slim_memory.py --check`（**退出码 0 = 四层新鲜**）。铁律见 `rules.md §十四.93` 第 2 条第 ⑤ 款 + §十五 第 7 条。
+
+<!-- AUTO:BEGIN -->
+> **版本**：2026-11-12 17:55:59 +0800 · **本文件由 `manu/tools/sync_slim_memory.py` 自动标注行数**
+| **精简档（本文件）** | `manu/memory/.slim_memory.md` | 511 | **贴给别的模型 / 新会话第一眼** |
+| 速览卡 | `manu/memory/memory_compact.md` | 922 | 5 分钟读完事实与数字 |
+| 主档 | `manu/memory/memory.md` | 2938 | 全量事实与变更记录 |
+| 铁律 | `manu/memory/rules.md` | 2448 | 规约正文（**必读**） |
+<!-- AUTO:END -->
+
+---
+
+## 0. 铁律速览（正文在 `manu/memory/rules.md`，**必读**）
+
+| # | 铁律 | 一句话 |
+|:--|:--|:--|
+| 〇 | **本地优先** | 代码永远先改本地 host `/media/manu/1TB-Volume/workspace/qlib/`，再 `bash manu/tools/sync_to_server.sh` 同步；**严禁直接改服务器代码**；同步判据**只能靠 md5 双侧比对**；🔴 **报告例外**：**报告真值落结果根 `<RESULTS_ROOT>/reports/`**（🔴 **默认不回传 host** —— 用户 2026-11-10：「低效率」）；确需回传时**手动**跑 `manu/tools/pull_reports.sh` 拉回（产物方向 server→host，代码方向永远 host→server） |
+| 〇之二 | **上游冻结** | 不碰 `qlib/` `examples/` `tests/` `scripts/`；自研代码全在 `manu/`；🔴 **在别人管的数据集上补数据 ⇒ 只写派生目录**（`cn_data_live`），**绝不写上游 `cn_data`**（否则 `compare_calendars` 前缀闸门永远拒绝换库）＋ 写前 **copy-on-write** ＋ 按**日历下标**定位 |
+| 一 | **禁擅自启动重活** | 下载 / 训练 / 回测 / 特征重建 / 打分 / LLM>5min 必须**当轮授权** |
+| 二 | **算力上服务器** | host 只做编辑与抽检；服务器重活用 `setsid nohup`，**禁止裸 `nohup &`** |
+| 二之二 | 🔴 **子 Agent 并发纪律（2026-11-12 用户亲定）** | **开 subagent 必须先监控 host 内存**：`free -m` 的 **available < 3 GB ⇒ 不许开新的子 Agent**；**同时在跑 ≤ 2 个**（第 3 个必须先说明理由）；已有子 Agent 在 `running` ⇒ 不许再开；**结束即 `close_agent`**（不许挂着已完成的）；**失联就主动 close**（不许干等）；重活**不上 host**（仍走铁律二上服务器）——正文 `rules.md §十·7` |
+| 三 | **禁未来函数** | `Ref(x,N)`：N>0 看过去 / N<0 看未来；官方特征只用 N≥0、标签用 N<0；**要查的是自研表达式 / filter_pipe / P / PRef** |
+| 四 | **事实实时入档** | 结论变 / 口径变 / 缺陷定性 / 交付件变 / 旧数字作废 / 要交接 / 工程结构变 ⇒ **当轮**回写 memory；🔴 **四层同步**（本文件 + `memory_compact.md` + `memory.md` + `rules.md`）—— **只改主档不算改完** |
+| 五 | **memory 四层实时同步 + 自动闸门** | 🔴 **新鲜度链路 = 主档 → 速览卡 → 精简档同轮更新**（下游 mtime 不得早于上游）；改 `rules.md` ⇒ 行数标注同步；改 memory ⇒ 跑 `manu/tools/check_memory_tables.py`（退出码 0）**和** `manu/tools/sync_slim_memory.py --check`（退出码 0） |
+| 六 | **禁编数字** | 缺字段渲染「—」，**不许反推、不许编**；邮件/报告里的每个数字都要能指到产物 |
+| 七 | **版本库只放「源」** | 日志 / 运行产物 / 缓存 / 一次性备份一律 `.gitignore`；输入真值必须显式 un-ignore |
+| 八 | **日历门 fail-closed** | 拿不到交易日历 ⇒ 报错退出，**不许默认当成交易日**；W（成分股权重）**只读 + TTL 冷却**，严禁日爬 |
+| 九 | **按需分析是唯一交付形态** | **不部署 cron、不默认发信**；每轮报告必须披露触发来源、数据日期与口径 |
+| 十六 | **落点双根化 ＋ 痕迹清零 ＋ 默认不回传 host**（2026-11-10 用户亲定并同日修订） | 服务器上本项目一切文件**只许落双根**：🔴 **数据集根 `<DATASET_ROOT>`** = `/mnt/data/siping/datasets/manu/etf_rotation/`（env `ETF_ROTATION_OUTPUT_ROOT` 可覆盖，输入侧）＋ 🆕 **结果根 `<RESULTS_ROOT>`** = `/mnt/data/siping/runs/etf_rotation_results/`（env `ETF_ROTATION_RESULTS_ROOT` 可覆盖，输出侧）；🔴 禁 `/mnt/data` 根的 `_etf_daily_*`、禁 `siping/datasets/` 顶层本项目目录、禁 `siping/runs/` 下建第二个本项目目录（🔴 **共享目录**：只许删自己的，**不许碰别人的** `nogmc_*` / `npu20ms_*` / `ashare_topk` / `CANDIDATES` / `_ms6` / `_ms7`）；**跑完 ⇒ 痕迹清零**（散落的旧位置不再有本项目文件）＋ 🔴 **默认不回传 host**（结果留在服务器 `<RESULTS_ROOT>`，用户原话「低效率」）——**「拷回 host」已被取代**，确需回传时**先拷后删**（铁律 `rules.md §十六`） |
+
+---
+
+## 1. 当前状态快照（2026-11-05）
+
+### 1.1 三条研究线
+
+| 线 | 状态 | 一句话结论 |
+|:--|:--|:--|
+| **A. A 股截面 Top-K 选股** | ✅ 已跑通 | Alpha158 + LightGBM，全市场打分 **374,793 行 / 69 打分日**，test RankIC **0.038116**（t=**6.665**）；**含成本年化超额仅 +0.35%** ⇒ 成本吃掉几乎全部 alpha |
+| **A'. 降换手 sweep** | ✅ 已跑通 | 14 组 arm，**选参只看 valid**；test 含成本年化超额 **+1.15% ~ +11.83%**（换手 41.1× → 5~20×）。推荐口径三选一：**稳** → `C3_top50_rebal10`（净 +7.15%、IR 0.837、MDD -11.47%）／**收益** → `B3_rebal20`（净 **+11.83%**、IR **1.138**、MDD -10.12%）／**最低换手** → `A3_ndrop1_hold5`（换手 8.4×、净 +6.72%） |
+| **B. ETF 轮动（人工低频）** | ✅ 已跑通，🔴 风险未解 | 全市场个股打分 → **E=W×S** → ETF 排名（**不破坏 qlib 基本假设**：分析所有个股，用矩阵映射得到 ETF 排名）⇒ 月频年化 **19.4627%** vs 基准 **12.1061%**（超额 **+6.5622%**，MDD **-32.29%**）；🔴 **MDD -32.29%、期末距峰值 -23.47%、H1/H2 超额符号相反 ⇒ 样本内结论，不可直接实盘** |
+
+### 1.2 现行交付形态：按需分析（2026-11-05 用户改口）
+
+- ❌ **服务器 cron 定时**（用户 crontab 里那 5 条已全部卸载，只剩系统默认两行）
+- ❌ **默认发邮件**（保留为显式 `--send-email` 的 opt-in；授权码在服务器 `/mnt/data/siping/secrets/smtp.env`，0600）
+- ✅ **按需分析**：用户在窗口喊「分析」→ 服务器跑流程 → **Markdown 报告直接回窗口**
+- ✅ **报告归档**：`<RESULTS_ROOT>/reports/report_<YYYYMMDD>.md`（🔴 文件名**不再带模式**，模式 A/B 已废除）＋ **stdout 直出**（主 agent 直接贴回窗口）
+- 🔴 **报告落点（2026-11-10 新口径）**：流水线在**服务器**跑 ⇒ 报告落在**服务器** **结果根 `<RESULTS_ROOT>/reports/`**（`daily_config.REPORT_DIR`）；
+  🔴 **默认不回传 host**（用户 2026-11-10：「低效率」）⇒ 确需回传时才**手动**跑 `bash manu/tools/pull_reports.sh` 拉回 host（md5 双侧比对）
+- 🟢 **🔴 已作废（2026-11-10，模式 A/B 已废除）：双模式端到端跑通（2026-11-05 17:11~17:38）**：**模式 B 第三轮六阶段全绿**（17:11:01→17:29:02，**1081.5 秒**）＋ **模式 A 第二轮**（17:35:08→17:37:42，**153.3 秒**）⇒ **两份报告都已拉回 host `manu/report/`**（md5 **4/4** 一致）；代码同步 **119 文件 md5 一致**
+- 🔴 **🔴 已作废（2026-11-10，模式 A 已废除）｜模式 A 实测**：512800 收盘 **0.8710** > MA20 **0.8696**（站上）> MA60 **0.8422** ⇒ 安全垫 **+3.43% / 222.14 元** ⇒ **趋势完好，守纪律躺平**、**零指令**；🔴 账户口径 **7.70 元不自洽已披露**（用户现价 0.865 vs 市值 6,668.20）⇒ 取可对账口径（反推现价 **0.866**、浮盈 **+324.17 / +5.11%**），**未抹平**
+- 🔴 **🔴 已作废（2026-11-10，模式 B 已废除）｜模式 B 实测（演练口径，2026-11-05 不是信号日）**：打分日 **2026-11-03** ≠ 信号日 **2026-11-05**（上游日历滞后 ⇒ 只能打到数据集末日）⇒ S 层 **5575 只**、退化检查**通过**、1 日前瞻 RankIC **0.0481**（ICIR 0.447）；执行卡 **2 条**：买 **563020 +5000 @1.2000 = 6,000.00 元**、卖 **512800 −900 @0.8710 = 783.90 元**（→ 6,800 股）；**3 只货基不可建仓**（一手 > 单席 6,000 元）；调仓后 512800 **19.72%** + 563020 **19.98%**、期末现金 **18,139.81**、缺口 **0.00**
+- 🆕 **2026-11-09 生产基线整链重建（授权重建轮）**：报告 / context / 决策 / 计划**同代同源**（sha1 链两环全通）。
+  **本轮 LLM 裁决 = 清仓 159929/513330/513770/512690、512800 减至 15%、其余不买 ⇒ 现金 85%**（signal=Underweight，1525 秒）。
+  **分歧项 3 → 4**（`159547/512010/512800/515650`）⇒ 组合矩阵 **8 → 16 情景**。
+  重建命令 `bash manu/etf_rotation/rebuild_baseline.sh`；指纹表重生成 `python3 manu/tools/regen_fingerprint_table.py`。
+  🔴 **独立复核（critic）补修轮**：判 **FAIL** ⇒ **2 BLOCKING + 8 IMPORTANT + 6 NIT 全部闭环**：
+  ① memory 四层新鲜度闸门实测为红 ⇒ 重刷 AUTO 块（`sync_slim_memory.py` + `--check` rc=0）；
+  ② `rebuild_baseline.sh` 的 `--out-dir` **没透传**给内层编排器 ⇒ 备份与重建可能落在两个目录 ⇒ 透传 + 前置断言；
+  ③ **破单席口径五处分叉** ⇒ 统一为「**落地持仓金额** > 单席上限、**宇宙 = 落地持仓**」（`target_shares > 0`）；
+  ④ 探针写死金额阈值（5,970.934 / 15,518.87 / 100）⇒ 改从 `account.py` + `final_rebalance_plan.LOT` 动态取；
+  ⑤ 解析器 docstring 与判据不一致 ⇒ 如实改文档；⑥ 生成器失败不传递退出码 ⇒ 编排器失败优先；
+  ⑦ `AGENTS.md` 行数标注 ⇒ 去掉写死行数；⑧ 指纹表覆盖边界 ⇒ 落进 `rules.md §十四.92 第 8 条`
+  ⇒ **断言条数一条未增未删（511 口径）**。；**复核后全量闸门复跑（v6）= 22 阶段全 0 · 511 条断言全 PASS · FAIL 0 · 退出码 0**（`probe_llm_parser` 76/76 · `probe_node_scenarios` 13/13 · `probe_node_reprice` 19/19 · `verify_artifacts` 24/24）
+- 🔴 **「打分日 ≠ 信号日」的语义边界（`rules.md §十五.1-5`）**：① 报告 notes 必须披露错配；② **节点日重算只重算股数与金额，不产生新信号** ⇒ 执行卡**不是**「按新信号」的清单；③ **顺序不能反**：先刷新数据集到信号日之后、**再**重跑阶段 2 ⇒ 单靠重跑阶段 2 **推不动**打分日
+
+---
+
+## 2. 🔴 环境与路径速查（唯一真值）
+
+| 项 | 值 |
+|:--|:--|
+| 本地工程根（**唯一可写**） | `/media/manu/1TB-Volume/workspace/qlib/` |
+| 服务器工程根 | `/tmp/pycharm_project_658d3fc4`（根盘 ext4；⚠️ `systemd-tmpfiles` 10 天未访问会清 `/tmp`） |
+| 服务器 ssh | `ssh -F /dev/null -p 32222 huangzhe@192.168.99.40`（**必须 `-F /dev/null`**） |
+| 服务器 conda env | `ql`（Python **3.12.16**，量化）· `ak`（Python 3.12.16，**akshare 绝不能装进 ql**）· `llm`（Python 3.11.16，TradingAgents） |
+| 服务器持久盘 | `/mnt/data`（7.4T）⇒ **重活产物落这里，别落 `/tmp`** |
+| 🔴 **数据集根 `<DATASET_ROOT>`** | `/mnt/data/siping/datasets/manu/etf_rotation/`（env `ETF_ROTATION_OUTPUT_ROOT` 可覆盖）⇒ **输入侧**（原始数据 / 派生数据集 / 增量工作区 / 临时工作目录）**只许落这里** |
+| 🔴 **结果根 `<RESULTS_ROOT>`** | `/mnt/data/siping/runs/etf_rotation_results/`（env `ETF_ROTATION_RESULTS_ROOT` 可覆盖）⇒ **输出侧**（本项目跑出来的结果）**只许落这里**；🔴 `siping/runs/` 是**共享目录** ⇒ 本项目专属目录**只此一个**，**只许删自己的** |
+| 🔴 **痕迹清零 ＋ 不回传 host** | 跑完**痕迹清零**（散落的旧位置不再有本项目文件；2026-11-10 已归位 `datasets/etf` / `datasets/qlib/*` / `runs/etf_rotation`，已删 `_etf_daily_*` 与三个旧 `runs/` 目录）＋ 🔴 **默认不回传 host**（结果留在服务器 `<RESULTS_ROOT>`）——**「拷回 host」已被取代**，确需回传时**先拷后删** |
+| SSHFS 只读镜像 | `/home/manu/mnt/pycharm_project_658d3fc4`（**只读**，不是推送通道；推送走 rsync） |
+| 服务器关键依赖 | numpy **2.5.4** / pandas **2.3.3** / lightgbm 4.7.0 / mlflow 3.12.0 / gym 0.26.2 |
+| 未装（optional） | `torch` / `xgboost` ⇒ `TorchModel`/`XGBModel` 不可用；**别装 `rl` extra**（会把 numpy 降到 1.x） |
+| qlib 数据集 | 🔴 **新口径**：`<DATASET_ROOT>/datasets/qlib/cn_data`（6501 交易日 / 6174 标的）；旧落点 `/mnt/data/siping/datasets/qlib/cn_data`（**上游基座输入**，非本项目产物）——**2026-11-10 已归位** |
+| 数据集滚动源 | `chenditc/investment_data@latest` → `qlib_bin.tar.gz`（570MB，服务器 ~114s）；下载器 `manu/tools/fetch_qlib_dataset.py` |
+| ETF 数据 | 🔴 **新口径**：`<DATASET_ROOT>/datasets/etf/{etf_prices.csv, etf_universe.csv, etf_holdings.csv}`；旧落点 `/mnt/data/siping/datasets/etf/` —— **2026-11-10 已归位** |
+| 研究产物根 | 🔴 **新口径**：`<RESULTS_ROOT>/`（canonical ＋ `snapshots/` ＋ `daily/` ＋ `logs/` ＋ `reports/`，**权威产物只在这**）；旧落点 `/mnt/data/siping/runs/etf_rotation/` —— **2026-11-10 已归位** |
+| 每日流水线产物 | 🔴 **新口径**：`<RESULTS_ROOT>/daily/<YYYYMMDD>/`；旧落点 `/mnt/data/siping/runs/etf_rotation/daily/<YYYYMMDD>/` |
+| 每次跑的不可变快照 | 🔴 **新口径**：`<RESULTS_ROOT>/snapshots/<YYYYMMDD_HHMMSS>/`；旧落点 `/mnt/data/siping/runs/etf_rotation/snapshots/` |
+| 上游版本 | microsoft/qlib **v0.9.8** / commit `54355232` |
+
+---
+
+## 3. 🔴 实盘账户真值（用户 2026-11-05 口径）
+
+| 项 | 值 |
+|:--|:--|
+| 账户 | 平安证券普通户，资金账号 `3275****0163` |
+| 总资产 | **30,035.57 元** |
+| 可用现金 | **23,367.37 元**（**77.80%**，主动防守态） |
+| ETF 持仓市值 | **6,668.20 元**（22.20%） |
+| 唯一在保底仓 | **512800 银行ETF华宝**，**7,700 股**（可用 7,700），成本 **0.8239**，现价 **0.865**（浮盈 +4.99% / +316.32 元） |
+| 已清仓归零 | 159929 医药ETF · 512690 酒ETF · 513330 恒生互联网ETF · 513770 港股互联网ETF |
+| 🔴 口径不自洽 | 现价 0.865 × 7,700 = 6,660.50，与市值 6,668.20 **差 7.70 元**；本流水线取**可对账口径**（反推现价 0.866、浮盈 **+324.17 元 / +5.11%**），**差额未抹平、显式披露** |
+| 组合约束 | 等权 **5 份**（单只 ≤ **6,000 元**）· 股数**向下取整到 100 股** · 保留 **200~300 元**现金缓冲 · 场内货基（511660/511880/511990，一手 ≈ 10,000 元 > 6,000 上限）**不可建仓 ⇒ 归现金躺平** |
+
+---
+
+## 4. 🔴 ETF 轮动策略口径（研究链主结果）
+
+| 项 | 值 |
+|:--|:--|
+| 架构 | qlib 全市场个股打分 → **E = W × S**（腾讯持仓权重）→ + ETF 自身动量（α 合成）→ 三道过滤网 → `mom120 > 0` → **Top-5 等权** |
+| 🔴 **统一流水线 ＋ 快照制**（2026-11-09 架构瘦身；**2026-11-10 收口**） | **Mode A/B/C 全部废除** ⇒ 单一入口 `main.py --asof <date> [--full] [--live-trade]`（**无模式键**：`describe_day()` 只给 `date` / `is_silent_defense` / `is_signal_date` / `execution_date` / `reason`）；每次运行落**不可变快照** `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/` = **契约 16 件 ＋ `snapshot_manifest.json` ＋ 若干过程件**（**逐阶段披露** + 跳过项登记 `skipped`）｜**副作用只有 `--live-trade`**（缺省 = 观察态：执行卡挂单禁用、不发信）｜🔴 **观察态不是零副作用**：仍会换共享 qlib 库 / 追加增量台账 / 写 `<RESULTS_ROOT>/reports/` 副本｜**不写根目录全局文件**（canonical 只作一次性只读种子，S 层底座链式）｜规则层在快照内现跑 ⇒ 与交付层**同源**｜🔴 **非交付件一律留 canonical 根**（指纹表 `_ms5_md5.txt` / 自检日志 / 备份 ⇒ **不许写进快照**）｜架构正本 `manu/docs/snapshot_architecture.md`｜铁律 `rules.md §十五.6`（**12 条**）|
+| 🔴 穿透分时间平滑（2026-11-09 新增） | 排序改用 **EWMA 平滑分**（窗口 **5 个交易日** / `α=**0.20**`（🔴 2026-11-11 由 0.35 对齐文档 §二.2）/ 预热 **30 个交易日**；**单一事实源 = `manu/etf_rotation/config.py`**）⇒ 🔴 **只影响排序**（原始分 `alpha_score` 永远保留，实际排序分 = `alpha_score_used`）｜🔴 **半衰期实算 ≈3.106 个交易日**（`α=0.20` ⇒ 落在需求文档「3~5 个交易日」区间内）｜🔴 **窗口按交易日算**（打分栅格每 10 个交易日一个点）｜🔴 **交易日轴由数据派生**（`canonical_trading_axis`，**不用日历**）｜🔴 **引擎是平滑的唯一所有者**（`build_alpha_override`）｜🔴 **W 只有单日快照 ⇒ 历史 E 带成分股前视偏差**｜🔴 **未 commit / 未 push**｜**生产基线未重建**｜**回测链未开平滑**（模块 `manu/etf_rotation/score_smoothing.py`，铁律 `rules.md §十四.97`） |
+| 评估窗 | 2024-01-11 ~ 2026-11-04（**679 天 / 34 期**）；基准 **510300 年化 12.1061%** |
+| 主结果（现役口径） | 年化 **19.4627%**｜超额 **+6.5622%**｜**MDD -32.29%**（基准 -20.15%）｜期末回撤 **-23.47%**（峰值日 2026-06-22 = 2.1181×）｜换手 **16.57×** |
+| 🔴 已作废数字 | 23.53%/+10.06%/-39.31%（v1）｜**21.4929%/+8.3732%/-28.19%（v2 老并查集口径）** |
+| 消融（关键） | 纯动量(α=0) **-0.98%**｜纯 E(α=1) **-9.08%** ⇒ **E 是暴露分，必须与动量互补**（α=0.5 最优） |
+| 调仓频率 | 双周(10日) -3.02%｜**月频(20日) 最优**｜季频(60日) -7.06% ⇒ **不是越低越好** |
+| 候选池体检 | 池 **31 只** = 银行 4 + 红利族 9 + **无 E 16（货币 4 + 黄金 12）** + 凑席 2；回测 175 个持仓里 **32 个（18.3%）无 E** ⇒ 披露为「兜底席」 |
+| 🔴 三个死穴 | ① 回撤 -32%（人工实盘心理崩溃）② H1 超额 -13.16% vs H2 +32.82%（**符号相反**⇒ 单阶段拉高均值）③ `mom120>0` 刹车**在急跌中一次都没触发**（周期太长） |
+| 下个节点 | **信号日 2026-12-01（收盘出信号）⇒ 执行日 2026-12-02（开盘执行）**；2026-11-06~11-30 **静默防守**，严禁生成任何买入指令 |
+| LLM 第二意见 | TradingAgents **Underweight**（679.4s 那轮；首次成功 929.1s；模型 MiniMax-M3.1-Flash / effort=max / max_tokens=32768）⇒ 512800 降至约 12%、563020 设 0%、511880 只买 1 手 |
+| 回归自检 | `/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/verify_artifacts.py --run-root /mnt/data/siping/runs/etf_rotation_results` ⇒ **24/24 PASS** |
+| 探针总集 | 🔴 **已作废（2026-11-10）：461 项 / 22 阶段**（2026-11-06 09:2x 全量实跑全绿，退出码 0；新增第 20 阶段「自建增量日」20 项）｜🔴 **新口径（本地实测）**：`run_gates.sh` 现有 **26 个 `run_stage` 阶段 ＋ 1 个 repro 段**，断言对象 = `ARTIFACT_ROOT`（缺省 = **最新完整快照**）｜本地 `pytest manu -q` = **220 passed / 0 failed**｜🔴 本地跑不了全量闸门（`/mnt/data` 在服务器）⇒ PASS 行数只能引上一次服务器实跑（**590**）|
+
+---
+
+## 5. 🔴 每日流水线（按需分析；`manu/etf_rotation/daily/`）
+
+### 5.1 六阶段全流程（🔴 2026-11-10：模式 A/B 已废除 ⇒ 单一入口跑同一条链）
+
+```
+[阶段1 AkShare 盘后数据管道] → [阶段2 Qlib S层全市场Alpha(LightGBM+Alpha158)] → [阶段3 E=W×S穿透+MA20/MA60过滤]
+  → [阶段4 TradingAgents多智能体辩论与情景裁决] → [阶段5 规则层约束对账(等权/整手/货基/滑点)] → [阶段6 执行卡+报告]
+```
+
+| 阶段 | 核心程序 | 关键产出 |
+|:--|:--|:--|
+| 1 数据定型 | `fetch_data.py` + `stage1_dataset.py` + `stage1_rolling_increment.py` | ETF 日线增量；**W 只读快照**；qlib 数据集**滚动快照换库**（日历前缀不一致 ⇒ fail-closed 拒绝换）；🔴 **换库失败不整轮失败** ⇒ 降级用旧数据集继续 ＋ notes 显著披露；🔴 **无新增交易日 ⇒ 不换库**（上游日历会滞后，实测仍停在 2026-11-03 ⇒ 换库收益为零 ⇒ 不碰现役生产数据集）；🆕 **自建增量日兜底**：基座覆盖不到信号日 ⇒ 用全市场快照补 ⇒ **只写派生目录 `cn_data_live`**（🔴 **2026-11-10 新口径**：单一入口默认真落盘，`--increment-dry-run` 可只看计划）⇒ **S 层能打到信号日**（`score_grid_dates` 的**末日例外**）；✅ **2026-11-05/06 实机构建 + 四项验收全过**（基座 2026-11-03 ⇒ 派生 2026-11-05；`D.features` qlib 真读得到 11-05；栅格末位 = 11-05 ⇒ `--end 11-05` 会打到该日）；🟢 历史缺口走**搜狐 `hisHq` 批量通道**（8 只/请求、覆盖整段区间 ⇒ 全市场 ≈698 请求）⇒ **当周/当月增量口径可落地**；✅ **2026-11-06 09:1x S 层实证**：独立目录重打分 ⇒ 新增 11-04/11-05 两个打分日（**5569/5568 只**）⇒ manifest `qlib_dataset_max_date=2026-11-05`、`end_capped_by_dataset=False` ⇒ **「打分日 ≠ 信号日」在实机上已消除**（IC 因标签窗超出末日而**不可计算**，属预期；**canonical 未合并**）|
+| 2 S 层 | `qlib_scores.py --mode infer --end <信号日>`（≈27min）+ `export_qlib_prices.py` | `stock_scores.csv`（S 矩阵）；**整体覆盖不增量 ⇒ 跑临时目录 + 备份 + 按 (date,instrument) 合并**；🔴 **栅格口径同源（2026-11-06 修）**：相位取模的 `i` 是**传入列表下标** ⇒ **切片起点决定相位** ⇒ 每日链必须与研究链**同起点**（`SCORE_START_TIME`）⇒ 否则「缺分数」全错、每轮误触发全量重打分 |
+| 3 穿透 | `analyze.py` | `E=W×S`；**MA60 准入 / MA60 止损**（🔴 2026-11-11 按文档 §二.2 由 MA20 改 MA60）；Top-5 候选 |
+| 4 辩论 | `llm/build_ta_context.py` + `llm/run_tradingagents.py`（**超时 5400 s 可配；LLM 单次调用 max 185 s / high 116 s / medium 91 s**） | `tradingagents_decision.md`（🔴 **json 的 `status` 才是权威**）；🔴 **账户口径必须由流水线注入**（`--account-json`），不许用研究链那份 5 只持仓的旧 csv |
+| 5 对账 | `final_rebalance_plan.py` + `reprice_node_day.py` | 等权/整手/货基过滤/200~300 缓冲 |
+| 6 执行卡 | `build_execution_card` + `report.py` | `execution_card_<日期>.json`（**快照内**）＋ `<RESULTS_ROOT>/reports/` 副本（🔴 文件名**不再带模式**）|
+
+### 5.2 🔴 模式 A / B / C（**已作废**，2026-11-10）
+
+| 维度 | 模式 A（日常巡检） | 模式 B（信号日全流程） | 🆕 **Mode C（影子推演）** |
+|:--|:--|:--|:--|
+| 目标 | 监控 512800 是否跌破 MA60 | 全市场重排 → 下月买卖清单 | **观察**当日 Alpha / ETF 排序演化 |
+| S 层 / LLM | ❌ 都不跑（**构造性保证**：路径内没有打分/选股/LLM 调用） | ✅ 都跑 | ✅ 都跑（同生产链路） |
+| 耗时 | **< 1 分钟** | **35~45 分钟** | 同模式 B（**按需**，不设 cron） |
+| 产物落点 | daily 根 | daily 根 | 🔴 **沙盒** `runs/etf_rotation/shadow/<YYYYMMDD>/`（🔴 **旧落点，已作废**；现口径：落点只许在 `<RESULTS_ROOT>` 之下） |
+| 输出 | 一句话状态卡 | 完整执行卡 + 挂单清单 | 🔴 **观察卡**（水印 + 禁用）＋**观察清单** |
+| 可否下单 | ❌ 无指令 | ✅（节点日才出清单） | 🔴 **结构性不可下单** |
+| 可否发信 | ❌ 默认不发 | opt-in `--send-email` | 🔴 **结构上禁止发信** |
+
+🔴 **上表整表已作废（2026-11-10）**：Mode A / B / C **全部废除** ⇒ 只剩**一条**流水线。**现行口径**：
+
+| 维度 | **现行口径（2026-11-10）** |
+|:--|:--|
+| 入口 | `manu/etf_rotation/daily/main.py --asof <date> [--full] [--live-trade]`（**无模式分支**；`--mode` 仍传 ⇒ **退出码 2** ＋ 迁移提示）|
+| 模式 | **没有模式**：`describe_day()` 只给 `date` / `is_silent_defense` / `is_signal_date` / `execution_date` / `reason`（**无 `mode` 键**）|
+| 产物落点 | **唯一输出根 = 快照根** `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/`（**契约 16 件 ＋ `snapshot_manifest.json` ＋ 若干过程件**，manifest **逐阶段披露** ＋ 跳过项登记 `skipped`）＋ `<RESULTS_ROOT>/reports/` 副本（**快照才是真值**）|
+| 可否下单 | 缺省 = 观察态：执行卡**结构性挂单禁用**、**不发信**、**不下单**；`--live-trade` **只**门控**挂单 ＋ 发信** |
+| 🔴 观察态仍会做的事 | 换共享 qlib 库 / 追加增量台账（派生目录 `cn_data_live`）/ 写 `<RESULTS_ROOT>/reports/` 副本 ⇒ **不许写成「观察态零副作用」** |
+| 全流程开关 | `--full` = 强制全流程（覆盖增量开关，被覆盖项登记进 `skipped`）；`--send-only` 与 `--full` **互斥**（同现 ⇒ **退出码 2**）；`--send-only` 改为「先快照根（倒序取最新含草稿的快照）→ 回落旧按日目录」|
+
+### 5.3 数据管道分层与防封
+
+| 层 | 标的 | 周期 | 更新规则 | 防封 |
+|:--|:--|:--|:--|:--|
+| W（成分股权重） | 候选池 ~250 ETF | 季报/半年报 | **45~60 天 TTL 冷却**，命中缓存 0 网络请求 | 单标的 sleep 1.2~2.5s；每 25 只熔断 5~8s；退避 3→6→12s |
+| ETF 日线 | 候选池 ~250 ETF | 每交易日盘后 | 增量追加，只拉缺失切片 | 批量接口 30~60s |
+| 个股 Qlib 底座 | 全市场 ~5000 A 股 | 每交易日盘后 | **滚动快照换库**（上游滞后时用**自建增量日**补，只写派生目录 `cn_data_live`）| 本地离线维护，**不做高频爬虫**；🔴 快照接口**只能补当天** ⇒ 缺口 >1 天 ⇒ **fail-closed** |
+
+### 5.2b 🔴 阶段 4 的两个坑（2026-11-05 实测）
+
+1. **超时**：MiniMax `MiniMax-M3.1-Flash` 单次调用 **max 185 s / high 116 s / medium 91 s**（最小请求 2.5 s）
+   ⇒ 多智能体图调十几次 ⇒ **1800 s 不够** ⇒ 超时默认改 **5400 s**（`--llm-timeout` 可覆盖）；
+   `--reasoning-effort` 可按轮覆盖（**不动** `TradingAgents/.env` 的现役 `max`）；
+   ⚠️ `--offline-tools` 默认已开 ⇒ **不是** Yahoo 限流空转；
+2. **账户口径**：阶段 4 原先读**研究链** `data/account_snapshot.csv`（**5 只持仓**、现金 15,518.87）
+   ⇒ Portfolio Manager 在推理**用户没持有的组合** ⇒ 修法：流水线把**每日账户口径**导出成 JSON，
+   用 `--account-json` 传进去（真实口径：唯一底仓 512800 / 7,700 股 / 现金 23,367.37 / 总资产 30,035.57）。
+
+### 5.2c 🔴 历史归档：Mode C · 影子推演（Shadow Sandbox，2026-11-06；**2026-11-09 随架构瘦身废除**）
+
+🔴 **本节只留历史事实，不代表现行口径**（现行口径见 §5.2 的「现行口径」表 ＋ §10）。
+
+**当年是什么**：每日流水线的**第三条链路** —— 与生产**同代码、同数据底座**，但**只落沙盒**
+（`/mnt/data/siping/runs/etf_rotation/shadow/<YYYYMMDD>/` —— 🔴 **旧落点，已作废**；2026-11-10 起本项目落点只许在 `<RESULTS_ROOT>` 之下）。**为什么值得慢**：见 `manu/docs/mode_c_shadow_arena.md`。
+
+```bash
+# 影子推演（按需；不发信；报告落沙盒）
+... manu/etf_rotation/daily/main.py --asof 2026-11-06 --mode C
+```
+
+**🔴 九条硬边界（铁律 `rules.md §十五.3`；后 3 条 = 2026-11-09 独立审计后补）**：
+1. **产物物理隔离**：分数只落沙盒（`stock_scores_temp.csv`，**不合并 canonical**）｜决策件改名 `shadow_decision.*`
+   （**根目录金标 `tradingagents_decision.md` 不被覆盖**）｜**报告与失败报告都落沙盒** ⇒ 交付目录 `manu/report/` **零污染**；
+2. **结构性不可下单**：执行卡是**观察卡**（水印 + `disabled` + 订单级禁用）｜🔴 **报告正文也不许出现
+   「挂单清单 / 手工挂单 / 券商 App」** ⇒ 渲染成「观察清单（不可下单）」＋ 每行「🔴 禁用」；
+3. **结构上禁止发邮件**：`--send-email` 与 `--mode C` 同现 ⇒ 入口**退出码 2**（成功路径 + 失败路径都禁）；
+4. **取数只落沙盒**（canonical 只读）｜🔴 **不许跳过取数**（跳过 ⇒ 影子永远滞后一天 ⇒ 推演结论失真）；
+5. **节点日重算失败 ⇒ 影子显式降级**（继续出报告但**不给节点日股数/金额**、显著披露）；**生产仍整轮崩**；
+6. **沙盒件命名可审计**：`_failed_mode` 必须认 "C"（否则落成 `mode?_failed.md` 且**落错目录**）；
+   🔴 **个股日线 `stock_prices.csv` 也落沙盒**（缺省会写进**生产**产物根 ⇒ 跨链路污染）；
+7. **永不换生产 qlib 库**：`--mode C --update-qlib-bin` ⇒ **入口退出码 2**（否则影子能换掉生产基准库）；
+8. **副作用面归零**：`--send-only`（补发）**也禁**（否则能绕过禁发信闸门）｜**非交易日心跳落沙盒**
+   （不覆盖生产链「跑过了」的证据）｜失败文件名**不再出现 "?"**（未知模式 ⇒ `modeauto_failed.md`）；
+9. **与生产同口径可比**：影子 S 层以 canonical `stock_scores.csv` **只读拷贝**为底座 ⇒ **增量重算**
+   （否则每轮全量重算 + **打分窗口比生产短** ⇒ **影子排序与生产不可比**）；降级卡**参考价/价日也置 None**。
+
+**实测（2026-11-06 服务器）**：全量取数轮 **199.3 秒**跑通六阶段｜`--skip-fetch` 轮 **45.7 秒**跑通（沙盒用自己的增量自洽）
+｜失败轮（行情滞后）⇒ 失败报告落**沙盒**、`manu/report/` 零新增｜影子报告里 `grep 挂单清单|手工挂单|券商 App` ⇒ **无命中**。
+**闸门**：隔离探针 **C1~C18 共 52 条断言，服务器实跑 PASS 52 / FAIL 0**（含 12/12 变异测试全被抓到 + C18「stdout 断链不判失败」）。
+**🔴 边界**：观察卡**不可下单**；影子结论**不是**实盘信号；本轮**未跑** S 层重算与 LLM。
+10. **交付基线三环同代同源**：报告 / context / 决策必须同一次 `run_pipeline.sh` 产出 ⇒ `--skip-ta` 的产出**不得当基线**；
+    产物根处于半更新态 ⇒ 按 `rebuild_baseline.sh` 整链向前重建（先备份 → 重生成 → 只许改值不许增删），**不许**只补其中一件。
+11. **计划件是双层的**：`actions[].target_shares` = **规则层**；`llm_final_decision.targets` = **LLM 层** ⇒
+    派生产物的「选项 A / 选项 B」必须锚定到明确字段，读错层 ⇒ A、B 同值 ⇒ 整张矩阵成废纸。
+12. **派生件与探针不许写死标的集合与个数**：分歧项个数 N、标的集合、期望情景数 2^N、「全 A」标签、负例标的
+    ⇒ 一律从产物 payload 动态取；**取不到 ⇒ 显式 FAIL（fail-closed）**，不许退回写死常量，也不许退化成「跳过断言」。
+13. **解析层：方向与权重同源**：ZERO 方向（清仓 / 不买）**不许**把「金额」折成「目标权重」；
+    方向判定里否定长前缀（不作为 / 不作）与「部分卖出」优先于长词；**既成事实（已触发 / 已经）不许当条件句**。
+14. **闸门负例必须自带夹具**：不许拿生产数据「恰好长成某个形态」当前提；夹具没造出来 ⇒ 文案写「覆盖 = 0，不是守卫结论」；
+    金标口径变更**只许改值**（旧值留注释），**不许增删断言**。
+
+15. **qlib provider 是**单一事实源**：研究链与每日链**不许各写一份**「挑哪个数据集」的规则
+    ⇒ 统一走 `manu/etf_rotation/qlib_provider.py`（`select_provider` / `base_dir` / `live_dir`），
+    每日链只**委托**；路径字面量由 `daily_config.cross_check_provider_paths()` **逐条对账**。
+    研究链入口 `run_pipeline.sh --provider-uri DIR`（env `ETF_ROTATION_QLIB_PROVIDER_URI`）**默认空 ＝ 基座 ⇒ 零回归**，
+    显式指定时**披露数据集覆盖末日**、末日 < asof ⇒ **告警**。
+    **闸门**：`probe_qlib_provider` **22 条断言**（含 AST 委托检查 ＋ 运行时逐字等价 ＋ **两条变异反证**）＝ `run_gates.sh` **第 22 个探针阶段**；
+    全量闸门实跑（🔴 **已作废（2026-11-10）：当时口径 = 535 条断言**：**535 全 PASS / STAGE 24 条全 0 / 失败阶段 0 / 退出码 0**）｜🔴 **新口径**：**26 阶段**、断言 **PASS 行数 590**（见 §10）
+    （v8 日志 `_ms5/_gates_v8_c18.log`；v7 = 533，+2 ＝ 新增 C18/C18b）。
+
+16. 🔴 **历史归档（Mode C 已废除）｜Mode C 报告的落点与「假失败」**：Mode C 的报告**一律落沙盒**（`--report-md` 在 Mode C 下被**忽略**）⇒
+    要把影子报告放进 `manu/report/`，**只能在跑完后按影子路径手工回拉**（并保留水印与 `modeC` 文件名），
+    **不许**改 Mode C 的落点逻辑（那是隔离不变量 C3）。
+    🔴 **判据是「报告已落盘」**：stdout 断链（ssh 断链 / 管道被 `head` 截断）⇒ `BrokenPipeError`
+    ⇒ **只告警**，**不得**判成阶段失败（否则会多出一份**假失败**报告 + 非 0 退出码）。
+    **闸门**：`probe_mode_c_shadow` **C18**（不抛、返回 False）+ **C18b 变异反证**（旧实现必须抛）⇒ 探针 **52 条**。
+
+### 5.4 命令
+
+```bash
+# 按需分析（默认：不发邮件；产物落【快照】<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/ ＋ <RESULTS_ROOT>/reports/ 副本，并打印到 stdout）
+# 🔴 2026-11-10：入口已无模式 ⇒ 不再传 --mode（仍传 ⇒ 退出码 2）；--full = 强制走完全部环节
+# 🔴 阶段 2 的 S 层刷新**必须带 --end <信号日>**（否则被 SCORE_END_TIME 静默截断到旧日期）
+# 🔴 S 层刷新后**必须重导个股日线**（export_qlib_prices.py），否则多日 RankIC 口径错配
+ssh -F /dev/null -p 32222 huangzhe@192.168.99.40 \
+  'cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python \
+   manu/etf_rotation/daily/main.py --asof 2026-11-05 --full'
+
+# 🔴 报告默认【不回传 host】（结果留在服务器 <RESULTS_ROOT>/reports/）；确需回传时【手动】跑：
+bash manu/tools/pull_reports.sh                 # 拉全部报告 + md5 双侧比对（手动）
+bash manu/tools/pull_reports.sh --check         # 只比对 md5
+bash manu/tools/pull_reports.sh --list          # 只列服务器上有什么
+
+# 只发已持久化的邮件草稿（不重跑分析）—— 🔴 需 --live-trade；与 --full 互斥（同现 ⇒ 退出码 2）
+... main.py --asof 2026-12-01 --send-only --live-trade --wait-seconds 1800
+```
+
+---
+
+## 6. 🔴 四个实测坑（每次都会撞）
+
+1. **`ssh` 必须 `-F /dev/null`** —— 否则 `Bad owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf`。
+2. **服务器 sshd 在 32222**，22 端口关闭。
+3. **服务器目录无 `.git`** ⇒ 装/重装 qlib 要 `SETUPTOOLS_SCM_PRETEND_VERSION=0.9.8`。
+4. **服务器未装 `torch`/`xgboost`** ⇒ `TorchModel`/`XGBModel` 静默跳过；**别装 `rl` extra**（会把 numpy 2.5.4 降到 1.x）。
+5. **126 邮箱只认「客户端授权码」**，网页登录密码必得 `535 authentication failed`。
+6. **`qlib_scores.py` 是整体覆盖不是增量** ⇒ 直接跑会把历史打分日全抹掉。
+
+---
+
+## 7. 关键命令速查
+
+```bash
+# 同步到服务器（rsync + md5 双侧比对；--delete 会删掉服务器上多出来的文件）
+cd /media/manu/1TB-Volume/workspace/qlib
+bash manu/tools/sync_to_server.sh [--delete] [paths...]
+
+# 上服务器干活
+ssh -F /dev/null -p 32222 huangzhe@192.168.99.40
+cd /tmp/pycharm_project_658d3fc4
+
+# 研究链一键跑通
+bash manu/etf_rotation/run_pipeline.sh --asof 2026-11-03
+
+# 回归自检（24 项断言）
+/home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/verify_artifacts.py \
+  --run-root /mnt/data/siping/runs/etf_rotation_results
+
+# 全量闸门（🔴 2026-11-10 现口径：26 阶段；--skip-repro 跳过最重的 repro 段）
+bash manu/etf_rotation/run_gates.sh
+bash manu/etf_rotation/run_gates.sh --skip-repro
+
+# memory 结构闸门 + 精简档新鲜度闸门
+python3 manu/tools/check_memory_tables.py
+python3 manu/tools/sync_slim_memory.py --check
+```
+
+---
+
+## 8. 章节导航表（要历史全文时跳这里）
+
+| 想看什么 | 去哪 |
+|:--|:--|
+| 全量事实与变更记录 | `manu/memory/memory.md` |
+| 5 分钟速览（事实 + 数字 + 当前在做） | `manu/memory/memory_compact.md` |
+| 规约正文（铁律） | `manu/memory/rules.md`（§十四 = 通用铁律（含 **§十四.94 自建增量日**：派生目录 + copy-on-write + 基准守卫）/ §十五 = 每日流水线铁律 8 条 ＋ **§十五.3 = 统一流水线 / 快照制 9 条** ＋ **§十五.6 = 单一无状态入口 / 不可变快照 / 唯一副作用开关 / 交付件表块结构 / 指纹表与自检日志留在 canonical / `--full` 硬保证 / 降级事实进交付面（14 条，2026-11-10）** ＋ **§十四.97 = 穿透分时间平滑（只影响排序，交易轴 / 生产口 / 参数三处唯一）**） |
+| A 股 Top-K 选股专题 | `manu/memory/ashare_topk_20261104.md` |
+| ETF 轮动专题（最全） | `manu/memory/etf_rotation_20261104.md` |
+| 🆕 **穿透分时间平滑（EWMA / 滚动均值，2026-11-09）** | 模块 `manu/etf_rotation/score_smoothing.py`｜参数单一事实源 `manu/etf_rotation/config.py`（`ENABLE_SCORE_SMOOTHING` / `SMOOTHING_METHOD` / `SMOOTHING_WINDOW` / `SMOOTHING_ALPHA` / `SMOOTHING_HISTORY_SPAN_DAYS`）｜探针 `manu/etf_rotation/probes/probe_score_smoothing.py`（**27 条**，挂进 `run_gates.sh` **第 23 个探针阶段**）｜铁律 `manu/memory/rules.md §十四.97`｜事实 `manu/memory/memory.md`「2026-11-09 · 穿透分时间平滑」 |
+| 环境搭建专题 | `manu/memory/env_setup_20261104.md` |
+| qlib API 踩坑 | `manu/memory/qlib_api_findings_20261104.md` |
+| 交接记录 | `manu/memory/handoff_20261104_qlib.md` · `manu/etf_rotation/HANDOFF_20261105.md` |
+| 历史归档 | `manu/memory/archive/` |
+| SOP（怎么做） | `manu/skills/`（`REGISTRY.md` 登记；`qlib-smtp-mail` = 发邮件探针） |
+| 🆕 **2026-11-11 第八轮（Beta 避险 / TA 陪审团 / 链 v13·v14 / 验收 17-17）** | `manu/memory/memory.md`「2026-11-11 · 真机跑批第八轮」§①~§⑦ ＋ `memory_compact.md`「当前在做」＋ 本文件 §11 |
+| 🆕 **快照架构正本** | `manu/docs/snapshot_architecture.md`（单一入口 + 不可变快照 + `--live-trade` 副作用开关） |
+
+---
+
+## 9. 2026-11-09 收口补记（现状，供新会话第一眼）
+
+- **每日链形态已变**：Mode A/B/C **全部废除** ⇒ **单一一流水线**（`daily/main.py`）＋ **不可变快照**（`daily/snapshot.py`）＋ **唯一副作用开关 `--live-trade`**（缺省 = 观察态：执行卡挂单禁用 / 不发信 / 不下单）。
+- **当前状态（🔴 2026-11-10 已更新，见 §10）**：本地 `pytest manu` **125 passed** ⇒ 现口径 **220 passed**；服务器同步 **130/130 md5 一致**；全量闸门 **24 阶段 23 绿 1 红** ⇒ 现口径 **26 阶段**（红 = `probe_lookahead` 金标 vs canonical 基线不同源，**金标对、基线旧**，修法见 `rules.md §十五.4`）。
+- **长活在服务器**：host 18:00 关机 ⇒ 剩余 4 步已用 `setsid nohup` 搬服务器自跑（`manu/tools/overnight_snapshot_run.sh`）⇒ 结果看 `/mnt/data/siping/runs/etf_rotation_results/_overnight_20261109/summary.md`。
+- 🔴 **未 commit / 未 push**（HEAD `c03f2618`）。
+- **正本 §三 的落地口径**在 `manu/docs/snapshot_architecture.md §12`；其中「重构测试闸门」的**剩余项** = 下一轮新增「直接断言本轮快照（结构 + 无未来函数）」的探针阶段（需真实快照当夹具 ⇒ 通宵自跑产出后再落地）。
+- **新闸门**：快照结构 + 无未来函数（`probe_snapshot_lookahead`，第 24 阶段，断言对象 = 本轮快照；真实快照上 9/9）。
+- **两个真实缺陷已修**：① `manifest.asof`＝业务日 ≠ 报告 `meta.asof`＝分析日（不变式 = 报告内部一致 + 分析日 ≤ 业务日，见 `rules.md §十五.5`）；② manifest 原本只有 `pipeline=ok` ⇒ 降级静默 ⇒ 已逐阶段披露。
+
+---
+
+## 10. 2026-11-10 · 架构收口落地 ＋ 真缺陷修复（3 ＋ 3 两类三处）＋ 验证现状（新会话第一眼）
+
+- **形态（唯一现行口径）**：**单一无状态入口**（`manu/etf_rotation/daily/main.py --asof <date> [--full] [--live-trade]`）＋ **每次运行一个不可变快照**（`manu/etf_rotation/daily/snapshot.py`；快照根 `/mnt/data/siping/runs/etf_rotation_results/snapshots/<YYYYMMDD_HHMMSS>/` = **契约 16 件 ＋ `snapshot_manifest.json` ＋ 若干过程件**）＋ **唯一副作用开关 `--live-trade`**（缺省 = 观察态：执行卡挂单禁用 / 不发信 / 不下单）。
+- **无模式键**：`daily/mode_router.py` 已删 `route()` / `_calendar_days()` / `MODE_A` / `MODE_B`（现在**只管路径**：`normalize_date` / `build_run_dir` / `log_path` / `draft_path`）；`daily/calendar_gate.py` 已删 `resolve_mode()` / `describe_mode()` ⇒ 改为**无模式**的 `describe_day()`（键**只有** `date` / `is_silent_defense` / `is_signal_date` / `execution_date` / `reason`）。
+- **开关口径**：`--full` 覆盖增量开关（`--no-increment` / `--increment-dry-run`）并登记 `skipped`；`--send-only` 与 `--full` **互斥**（同现 ⇒ **退出码 2**）；`--send-only` 改为「先快照根（**倒序**取最新含草稿的快照）→ 回落旧按日目录」；**失败也封存 manifest**（`_finalize_failed_snapshot()`）；manifest **逐阶段披露**（`calendar_gate` / `fetch_data` / **`w_holdings`** / `stage1_dataset` / **`stage1_increment`** / `s_layer` / `analyze` / `recommend` / `ta_context` / `tradingagents` / `final_plan` / `node_reprice` / `execution_card` / `pipeline`），**跳过的阶段也登记进 `skipped`**。
+- 🔴 **副作用矩阵（写实）**：观察态**也会**换共享 qlib 库 / 追加增量台账 / 写 `<RESULTS_ROOT>/reports/` 副本 ⇒ **不许写成「观察态零副作用」**；`--live-trade` **只**门控**挂单 ＋ 发信**。
+- **本轮修的 3 个真缺陷**（昨夜全量闸门 **26 阶段**红 **3** 个 ⇒ 今早定位根因并修好）：① `llm_final.py` ＋ `final_rebalance_plan.py`：LLM 原文「512800 减持约 2,600 份」被当「卖 + 0%」（清仓）⇒ 规则②扩词 ＋ 规则④负向前瞻 ＋ 零判定改 `(?:^|[^减])卖`；② `make_node_scenarios.py`：情景聚合件补 `positions`（落地持仓全集）⇒ P8 才能独立重算；③ `llm/run_tradingagents.py` 的 `_tail()`：表间**结构分隔块不许整块丢** ＋ **每张表前后各补一个空行**（旧 md **638 行** → 新 md **649 行**，diff 纯增量；表块 **7 块（1 块粘连）→ 8 块（7/7 分离）**；紧跟散文行的表数 **3 → 0**；解析结果逐字段完全相同）。
+- **配套单测** `manu/etf_rotation/tests/test_render_table_blocks.py`（**4 条**，自带夹具 ＋ 变异反证）｜🔴 **闸门判据澄清**：粘连形状下 **P6 抓不到、只有 P7 抓得到**；**D2 / D4 负例在粘连形状下「构造不出来」**（报 `ValueError` ⇒ 判 FAIL）。
+- **架构迁移暴露的副作用（本轮续修，两类三处）**：① **找错地方** —— 指纹表 `_ms5_md5.txt` 是 **canonical 根**的代码状态登记表（**不在**快照契约 16 件清单里）⇒ 闸门 P2 改为**回落解析**到 canonical（或 `--fingerprint-table` 显式），否则在快照里必然找不到 ⇒ **P2 误红**；② **往快照里写东西** —— `verify_artifacts.py` 的自检日志改落 **canonical 根**（`verify_artifacts_<快照名>.log`）或 `--log-path`，**绝不写进已冻结快照**（否则破了「跑完即冻结」）；③ **往快照里写东西** —— `manu/tools/regen_fingerprint_table.py` 两道守卫（指纹表落点在快照 / `--artifact-root` 是快照 ⇒ 中文 `[FAIL]` ＋ **退出码 2**）＋ 备份落点改到**表旁边**（🔴 拿快照当基准会把 canonical 登记表**静默改写成这一份快照的哈希** ⇒ 口径错位）。
+- **配套单测 ②** `manu/etf_rotation/tests/test_snapshot_side_effects.py`（**新建，21 条**，含 **7 条变异反证**：改坏源码**副本**里的关键判定 ⇒ 同一条不变量必须翻红；**不碰真源码**）｜**本地实测** `pytest manu -q` = **192 passed / 0 failed**（该轮实测 1.2 s；🔴 现口径 **220 passed**）｜`ruff`（base env `~/anaconda3/bin/ruff` **0.15.1**；**uav 环境没有 ruff**）跑新增文件 = **All checks passed!**｜🔴 已知遗留：`verify_artifacts.py` 的 `is_first_of_month` 未使用（`ruff F841`；**HEAD 版第 291 行就有** ⇒ 本轮未动，与本轮修复无关）。
+- **验证（服务器侧）**：服务器统一流水线真实跑（`--full`，观察态 ＋ LLM）**退出码 0**（**17:49:53 → 20:52:22**，约 **3 小时**）；全量闸门 `run_gates.sh --skip-repro` **退出码 1**、红 **3** 阶段（`probe_llm_parser` / `probe_llm_stage_repro` / `probe_node_scenarios`）、断言 **PASS 行数 590**、失败阶段数 **3**。🔴 本地**跑不了**全量闸门（`/mnt/data` 产物在服务器）⇒ 阶段数与 PASS 行数只能引**上一次服务器实跑**。
+- 🔴 **未 commit / 未 push / 未建分支**（HEAD 仍 `c03f2618`）｜🔴 **已知遗留（不是本轮范围）**：`final_rebalance_plan.py` 的 `_decision_view()` 用 `"\n".join(table_lines)` 拼表 ⇒ 丢掉空行 ⇒ plan md 的「冲突表的数据来源」永远渲染成一张大表（读的是 json ⇒ 不受本轮修法影响）。
+- **正本**：`manu/docs/snapshot_architecture.md`｜**铁律**：`rules.md §十五.6`（**12 条**）｜**主档**：`manu/memory/memory.md`「2026-11-10 · 架构收口落地」一节（含 §⑦ 迁移副作用 ＋ §⑧ 本轮补修）。
+
+### 10.1 🔴 2026-11-10 本轮补修：降级披露 ＋ `--full` 硬保证 ＋ `--dry-run` 语义碰撞消除
+
+> 🔴 **审计挖出的 4 个问题全是「静默降级 / 暗门 / 假象」类，没有一个是崩溃类** —— 崩溃会自己喊，静默降级不会。
+> ⇒ 铁律 `rules.md §十五.6` **10 → 12 条**（新增第 ⑪ / ⑫ 条）；完整事实表见主档 `memory.md` 该节 **§⑧**。
+
+- **发现 ①（W 陈旧度只进日志 ⇒「实时拉了数据」是假象）**：W 来自**只读缓存**（铁律：**绝不重爬** —— 重爬成分股会触发 IP 封禁）⇒ 现在 `w_holdings` 阶段（`stale`/`ok` ＋ `max_fetch_date`/`stale_days`/`mixed`/`n_codes`）**进 manifest**，陈旧 ⇒ **报告 notes 追加 🔴**（含「W 快照日 = YYYY-MM-DD（滞后 N 天）」）。
+- **发现 ②（「自建增量日」兜底失败被吞进 notes）**：⇒ 整轮**悄悄沿用旧 qlib 库、照样出执行卡**（静默降级）⇒ 现在 `stage1_increment` 阶段（`ok`/`failed` ＋ `days`/`live_dir`/`error`）**进 manifest**，失败 ⇒ **报告 notes 追加 🔴**；另加 `stage1_dataset` 的 detail（`calendar_max_before`/`calendar_max_after`/`new_days`/`swapped`/`downloaded`）⇒「上游没推进 ⇒ 换库零收益跳过」一眼看出。
+- **发现 ③（`--full` 没有硬保证）**：manifest 写着 `failed` 却照样退出 0、照样出执行卡 ⇒ `_record_pipeline_stages()` 现在**返回失败阶段清单**；`--full` 下 `tradingagents` 状态 ≠ `ok` 也算失败；🔴 **`node_reprice` 不计入硬失败集**（**设计内降级**：观察态退化成「只有方向、无数值」的观察卡 ＋ 报告披露；实盘态直接崩）⇒ **五处披露**：**退出码 1** ＋ **不发信** ＋ manifest `pipeline=degraded`（带 `failed_stages`）＋ heartbeat `degraded` ＋ **报告 notes 追加 🔴**；非 `--full` 仍返回 **0**（cron 语义不变）但三处披露照样写。
+- **发现 ⑥（服务器实跑挖出：解析器被 LLM 自己的小标题截断 ⇒ 最终裁决 0 个代码 ⇒ 基线重建整轮崩）**：
+  LLM 这轮在「六、最终交易决定」章节里**自己写了同级 H2**（`## Executive Summary` / `## Investment Thesis`）
+  ⇒ 解析器「遇到同级标题就截断」⇒ 章节正文只剩 `**Rating**: Underweight` 一行 ⇒ **0 个 LLM 目标**
+  ⇒ 冲突表为空 ⇒ `divergences` 为空 ⇒ `make_decision_scenarios.py` 抛 RuntimeError ⇒ **基线重建整轮失败**。
+  ⇒ 现在 `llm_final.extract_section`：**编号章节**（如「六、…」）的**同级且无编号**标题一律视为 LLM 内嵌小标题 ⇒ 继续吃；
+  只有「编号同级标题」或「更高级标题（`#`）」才是下一节；**起始标题本身无编号时保持旧口径** ⇒ 旧夹具行为零变化。
+- **发现 ⑤（独立终审挖出：「不发信」只限 `--full` ⇒ 实盘链路的真实口子）**：发信条件原写成
+  `args.send_email and failed_stages and flags.get("full")` ⇒ **非 `--full`**（cron 口径）
+  ＋ `--live-trade --send-email` ＋ 阶段失败 ⇒ **照样带着 degraded 交付件发出实盘通知**
+  ⇒ 现在「**有环节失败 ⇒ 一律不发信**（fail-closed，任何模式）」；**退出码口径不变**（非 `--full` 仍返回 0）。
+- **发现 ④（`--dry-run` 语义碰撞 = 暗门）**：CLI 的 `--dry-run`（显式声明观察态）vs 内部的 `run_pipeline(dry_run=True)`（前置判定：不取数/不写产物/不调 LLM）**同名不同义** ⇒ 内部改名 **`preflight_only`**（结果 dict 的键也改）；CLI 语义不变，help 文案补「观察态本来就是缺省 ⇒ 本开关不改变任何行为」。
+- **口径统一**：`--full` = **5 个语义开关全开**（取数 / S 层刷新 / qlib 换库 / 增量补齐 / LLM 辩论）⇒ **覆盖 6 个 CLI 开关**（`--skip-fetch` / `--no-refresh-scores` / `--no-update-qlib-bin` / `--no-increment` / `--increment-dry-run` / `--skip-llm`）；旧的「四段全开」（README）与「五者全开」（正本）**两说已作废**；「16 交付件」统一改成「**契约 16 件 ＋ manifest ＋ 若干过程件**」（过程件 = `etf_prices_effective_<日期>.csv` / `account_snapshot.csv` / `account_context.json` / `stock_scores.csv.bak-<时间戳>`）。
+- 🔴 **已知遗留（本轮没修）**：`verify_artifacts.py` 的 `is_first_of_month` 未使用（`ruff F841`；**HEAD 版第 291 行就有**）｜**全量 26 阶段闸门本地跑不了**（`/mnt/data` 产物在服务器）⇒ PASS 行数只能引上一次服务器实跑｜**非交易日整轮提前退出** ⇒ `--full` 在非交易日是**空跑**（manifest `skipped[all_stages]` ＋ heartbeat `skipped_non_trading_day`，**有披露**）｜🔴 **canonical `etf_prices.csv` 永不刷新、只靠 15 天窗口增量补** ⇒ **长期停跑会留永久空洞**（`load_effective_prices` 不检测中间断档）⇒ 属**研究链刷新节奏**问题，**靠执行卡的「价格日」列人工发现**。
+
+- 🔴 **本轮（2026-11-10 上午）服务器实跑挖出的真缺陷 ＋ 独立审查/巡查的整改**（主档 `memory.md`「2026-11-10」一节 **§⑨** 有完整事实表；铁律 `rules.md §十五.6` **12 → 14 条**）：
+  ① **真缺陷（白跑 43 分钟的元凶）**：`fetch_data.drop_unfinalized_bars` 用**墙钟**判「当日 bar 未定型」＋ 掩码锚 **asof**
+     ⇒ **补跑/回溯时把「早已收盘」的 asof bar 当盘中数据丢掉** ⇒ 行情底座永远比信号日差一天
+     ⇒ 下游 `analyze._data_freshness_guard` **按设计 fail-closed** 拒绝出报告 ⇒ 整轮白跑
+     （实测：asof=2026-11-09、墙钟 2026-11-10 10:37 ⇒ 底座只到 11-06；akshare 侧**本来就有** 11-09 的数据，是管道自己扔的）。
+     ⇒ 修法：**掩码锚 today** ＋ **时钟锚市场时区**（`DC.MARKET_TZ` = 东八区，**不是**机器本地时区）。
+  ② **独立审查 3 条 IMPORTANT ＋ 3 条 NIT 已全部修**：时区锚定（`datetime.now().astimezone()` ⇒ UTC 机器在 15:00 CST 后仍判「未收盘」）／
+     「asof 在未来」时今日盘中 bar 漏放（掩码锚 today 后自动堵住）／`str(asof)[:10]` 是截断不是解析／docstring 自相矛盾／
+     空转用例（旧实现下也通过）／缺「asof 在未来」边界用例。🔴 另修 `calendar_gate.today_str()` ＋ `main._today_str()` **也锚市场时区**。
+  ③ **独立巡查挖出 H1（高危，同一条后果链）**：`snapshot.latest_snapshot` 只按**目录名**（＝**墙钟**创建序，**不含 asof**）取「最新」
+     ⇒ **服务器实测**：快照根里 `20261109_173133`/`_173357`/`_174953`/`20261110_093241` 的 asof 都是 **11-05**，
+     只有 `20261110_103640` 是 **11-09** ⇒ **目录序 ≠ asof 序**
+     ⇒ 补跑会拿**别的信号日**的快照当底座 ⇒ ① 底座分数含 asof 之后的行 ⇒ 快照藏未来行 ⇒ A9 门禁**误红**（自己的产物把自己的门禁打红）；
+     ② `--skip-llm` 复用别个信号日的 LLM 决策件（sha1 链**查不出来**）。
+     ⇒ 修法：`latest_snapshot(..., asof=)` **优先**挑 manifest 里 asof 相同的那份；`resolve_scores_base(..., asof=)` 同理；**不一致必须在 notes 披露**。
+  ④ **NIT-4 修**：「今日 bar 未定型 ⇒ 丢弃了盘中数据」原来**只进日志** ⇒ 按铁律「降级事实必须同时进 manifest ＋ 报告 notes」
+     ⇒ 现在 `fetch_unfinalized_bar` 阶段（`degraded` ＋ note）**进 manifest**，并**追加报告 notes**（只进日志 = 用户看不到 = 静默降级 = 违规）。
+  ⑤ **编排层配套**：新增 `manu/tools/server_full_pipeline_run.sh`（步骤 2 **只跑 `--full`**，**不许**降级到 `--skip-fetch`
+     —— 行情缺口是**根因类失败**，降级只会拿**同一份缺行情的底座**再撞一次 fail-closed ⇒ 纯烧 CPU）。
+  ⑥ **本轮验证**：本地 `pytest manu/etf_rotation -q` = **232 passed / 0 failed**；`ruff check` **全绿**；
+     服务器 **149 文件 md5 双侧一致**；**服务器实跑取证**：修复后抓到的末日 **== 2026-11-09**（修复前只到 11-06）。
+
+## 11. 2026-11-11 · 第八轮：🔴 Beta 避险落地 ＋ TA 合规陪审团授权 ＋ 链 v13/v14 全绿 ＋ 验收 17/17 ＋ 痕迹清零（新会话第一眼）
+
+- **本轮主题**：按「Qlib 算 / TA 审 / 规则层锁」三层架构文档再优化 ⇒ 用户三项诉求 = **① 留 20% 现金 ② TradingAgents 做筛选（重复/高度重合 ETF 等）③ 按文档再优化**。
+- 🔴 **补上的真缺口 = Beta 避险（文档 §三.3）**：原 `_EQUITY_CAP` **写死 0.8**、TA 喊的权益上限只进 `llm_conflicts` 披露 ⇒ **部署 79.29% 与 TA 36% 直接矛盾**。
+  修法：`llm_final.py` 新增 `post_trade.equity_target_pct` ＋ `equity_target_pct_evidence`（**只认目标动词**「降至/定为/控制在」；「约 X%」是陈述句**不算建议**）⇒ `final_rebalance_plan.py` 新增 `_resolve_ta_equity_cap()`（reason ∈ `no_ta_advice` / `not_a_target` / `out_of_range` / `at_or_above_base_cap` / `accepted`）⇒
+  **`effective_cap = min(0.80, ta_cap)`**（**只许压降不许抬高**；解析不出 ⇒ **完全保持原行为**）＋
+  **席位等比缩放必须在 TA 筛选之前**（否则顺延补位继承未缩放权重 ⇒ 权益自相矛盾）＋「维持」行权重不动且先扣席位预算 ＋
+  **披露 `equity_cap` 恒 0.80**（验收脚本依赖）＋ `equity_cap_effective` / `equity_cap_ta_recommendation` / `equity_cap_scale` ＋ md「Beta 避险」段。
+- ✅ **TA 合规陪审团授权（文档 §三.2）**：`llm/build_ta_context.py` 3.5 节标题「供审查参考」→「**一票否决依据**」＋ 引言改为明确授权（含否决的确定性后果）＋ 新增 7.1「你的身份与权力（合规陪审团，不是操盘手）」。
+- ✅ **交付件（快照 `20261111_122825`，观察态·挂单禁用）**：生效上限 **0.36**（TA 建议 36%）、缩放系数 **0.45**、**5 席各 0.072**、**Σtarget_weight = 0.360000**（`512170 +6,200`｜`512800 −5,300`｜`515450 +1,400`｜`515650 +1,900`｜`516620 +2,100`）、
+  期末现金 **19,593.83 元**、计划现金权重 **0.64**、落地权益 **35.22%**、`equity_cap_breach = 0.0`、`rejected = ['159207','563020','511990']`（顺延 `516620 ← 159207`）。
+  🔴 **派生层就地重生成 2 次**（带 `--accept-render-change` 一次 → **不带开关再跑一次自验证通过，17547 字符逐字节相等**）⇒ **分析层字节未动 ⇒ sha1 链不断**。
+- ✅ **验证**：**链 v13**（13:40:54→13:45:55）`BASELINE_RC=0` / `FINGERPRINT_RC=0` / **`GATES_H_RC=0`**；**链 v14**（13:49:01→13:53:07）**`GATES_H_RC=0`** ⇒ 两链断言 **PASS 694 / FAIL 0**、失败阶段 **0**（**两链独立复现**）；**host 验收 17 PASS / 0 FAIL / 0 SKIP**（主 agent 亲自复跑，快照三次哈希一致 ⇒ 真只读）；本地 pytest **448 passed**；探针 `probe_ta_screening` **34 / 0**（F 组新增 8 条）。
+- ✅ **服务器痕迹清零**（铁律 §十六）：`_cleanup_20261111.py`（`shutil.rmtree`/`os.unlink`，**不用 `rm -rf`**）删 **233/233** 条本项目 `/tmp` 痕迹（≈3.5 MB）⇒ **别的 session 的文件一个没动**（`chain_cold.sh` / `chain_sync.sh` / `day4_adaptive.sh` / `watch_full.sh` / `fp_regen.py{,2,3}` / `decision_sweep_chain*.log` / `regen_*.log` ×20 **实测仍在**）；**禁区仍在**（`npu20ms_offcal` / `pycharm_project_10ae9e2e` / `nogmc_t3` / `npu20ms_seed` / `CANDIDATES` / `ashare_topk`）⇒ **三条断言复核全绿**。
+- 🔴 **2026-11-11：6 项口径差异已处理 5 项**——EWMA alpha **0.35 ⇒ 0.20**｜入选闸门 **MA20 ⇒ MA60**｜单只上限 **40% ⇒ 20%**（`config.MAX_SINGLE_WEIGHT`）｜现金缓冲绝对下限 **200/300 ⇒ 400 元**｜**拥挤度已实现**（放量倍数 + 池内分位，3.5b 节）｜**舆情/宏观仍打桩**（`DATA_UNAVAILABLE`，需联网 + API key + 配额 ⇒ 需用户授权）。
+  🔴 改前四项**已改** ⇒ 分析层字节变 ⇒ **交付链已按新口径重建**（金标同步换值）；拥挤度**已实现**（用行情内可得的**成交额放量倍数**代替资金流口径，并在 3.5b 表**如实披露口径**）；舆情**仍打桩**（需授权）。
+- ⚠️ **canonical 根的 `tradingagents_decision.md` 是旧决策件**（sha1 `cc26cc87`，「降至约 10%」、否决 15 只）⇒ canonical 根 plan = `effective_cap=0.1 / Σtw=0.025`（**对新代码自洽**，属**既有状态**，非本轮引入）⇒ 🔴 **对外一律报快照口径**。
+- 🔴 **未 commit / 未 push**（本工程 HEAD 未动）。
+
+- 🔴 **2026-11-11 14:0x · 独立审查 ⇒ 2 个 🔴 必须修已修**（交付后另起一轮独立只读审查，**逐条读代码 ＋ 实测复现**）：
+  ① **`equity_target_pct` 误判预测句**：它复用了宽松正则 `_PORTFOLIO_PCT_RE`（动词表末尾是**裸** `降|到|至`）
+  ⇒ 「**回升至 56%**」「**回到 56%**」这类**预测/陈述句**被当成**目标** ⇒ 规则层把权益从 80% **静默砍到 56%**
+  （**24pp 仓位被动转现金**）⇒ **修法**：新增**严格目标动词表** `_PORTFOLIO_TARGET_PCT_RE`
+  （成词动作：降至/下调至/调整为/压缩至/压降至/压降到/降到/定为/设为/控制在/限定在/不超过/不高于/上限为/最高）
+  ⇒ **裸「到/至」不算目标**；🔴 **反向动词一律不算目标**（「提高到/上调至/回升至/回到」是加仓或预测 ⇒ **宁可不压降**）；
+  🔴 **`equity_pct`（宽松口径）一个字未动**（既有金标不变）。
+  ② **告警比较对象写错**：「🔴 权益超配」用**硬上限 0.8** 作比较对象，而 `equity_cap_breach` 是对**生效上限**算的
+  ⇒ TA 压降生效时文案自相矛盾（「超出 80.0% 达 44.00%」会被读成权益到 124%）⇒ 改用 `equity_cap_effective`。
+  另修：**单位护栏**（输入 = 百分点；小数形式 `0.36` ⇒ `out_of_range`，不静默压降 100 倍）＋
+  **「不超过/上限为」能抽到** ＋ **`not_a_target` 进披露**（用户能看见「TA 提了数字但不是目标口径 ⇒ 未压降」）。
+  🔴 **审查同时指出最关键一条约束没钉子**：「缩放必须在 TA 筛选之前」⇒ 顺延补位者必须拿到**缩放后**权重
+  ⇒ 原有用例**一条都不会转红**（断言没牙）⇒ **补钉 +11 条**（实测：缩放后置 ⇒ 补位者**直接消失**，
+  因权益会顶到 0.8 > 上限 0.36 ⇒ 被上限闸门挡下 ⇒ 断言按真实行为写）。
+  ✅ **交付件字节未变**：`regen_snapshot_derived.py` **不带** `--accept-render-change` **自验证通过**
+  （**17547 字符逐字节相等**）⇒ 快照 sha1 `e4182d91` / `5971f1d0` **修复前后完全一致**；
+  **链 v15**（14:02:26→14:06:07）`GATES_H_RC=0`、断言 **PASS 694 / FAIL 0**；pytest **448 → 458 passed**；
+  探针 **34/0**；host 验收 **17 PASS / 0 FAIL / 0 SKIP**（修复后复跑）。
+  ⚠️ **3 项建议刻意未做（待拍板）**：3.5 节行情源与规则层**不同源**（要改管线接口）/ 7.1 悬空引用 /
+  日报把内部枚举印进正文（**改它会断 sha1 链** ⇒ 只登记）。
+
+
+---
+
+## 12. 维护规则（四层同步）
+
+1. **本文件只放「现在是什么样」**：当前状态、真值、导航、维护规则。**历史全文不进本文件**。
+2. 🔴 **四层同步义务**（铁律 `rules.md §十四.93` 第 2 条第 ⑤ 款 + §十五 第 7 条）：
+   ① 改 `rules.md` 铁律 ⇒ **本文件 §0 铁律速览** + `memory_compact.md`「铁律九条」+ `memory.md §0` 同步，**并刷新行数标注**；
+   ② 事实变 ⇒ `memory.md`（主档）+ `memory_compact.md`（速览卡）+ **本文件**（精简档）口径一致；
+   ③ 🔴 **实时更新的硬判据 = 新鲜度链路**：**主档 → 速览卡 → 精简档**按序**同轮**更新，**下游 mtime 不得早于上游**
+      ⇒ **速览卡（compact）同样必须实时更新**（用户 2026-11-05 明确要求）—— 只改主档 ⇒ 速览卡停在昨天 ⇒ 新会话第一眼读到的是**过期事实**;
+   ④ 改完 memory ⇒ 跑 `check_memory_tables.py`（退出码 0）**和** `sync_slim_memory.py --check`（**退出码 0 = 四层新鲜**）；
+   ⑤ 🔴 **不许手写 AUTO 块里的行数标注**：写块会改变本文件自身行数 ⇒ 该脚本用**不动点迭代**收敛（写 → 重算 → 再写）。
+3. **「有必要的时候更新 memory」不是口号** —— 触发器清单见 `rules.md §十四.93` 第 1 条（结论变 / 口径变 / 缺陷定性 / 交付件变 / 旧数字作废 / 要交接 / 工程结构变 ⇒ **当轮**回写）。
+4. **反向也成立**：什么都没变就不要为了刷存在感重写 memory（memory 是事实源，噪声稀释真值）。
+5. **旧数字不许静默删除**：口径变了 ⇒ 显式标注「🔴 已作废」并写清新口径。
+
+
+---
+
+## 13. 2026-11-11 · 第九轮后半段：🔴 修 TA「一票否决」误伤 4 处 ＋ 探针 A20⑥ 假红（新会话第一眼）
+
+- 🔴 **症状**：TA **明确要买/要减**的标的被当成一票否决 ⇒ 席位顺延给**更弱**的标的（canonical：515450 **+0.8672** 被误否决 ⇒ 顺延位给了 563020 **−0.4683**）。
+- 🔴 **4 处根因/修法**（全在 `manu/etf_rotation/llm_final.py`）：**F1 让步/假设句**（「即使否决 X…」）⇒ `_HYPOTHETICAL_MARKERS` / `_HYPOTHETICAL_GAP_RE` / `_hypothetical_verb_positions()` ⇒ **必须紧邻才豁免**｜**F2 跨子句继承** ⇒ `_codes_with_own_action()` / `_OWN_DECISION_WORDS` / `_has_own_decision()` ⇒ **自带裁决的代码不被继承成否决主体**｜**F3 否定护栏缺「不作」** ⇒ `_REJECT_NEGATION_RE` 补 `不作|不做`｜**F4「避免与 X 重复」** ⇒ `_MD_REF_AVOID_RE` 接入 `_reference_codes()`。
+  🔴 另修**探针 A20⑥ 假红**（裸「卖出」把「卖出超配部分、保留16%核心」判成清仓）⇒ `_md_clause_zero_word()` 加 `_MD_KEEP_TOKENS` ＋ `_MD_SELL_PARTIAL_RE` ⇒ **清仓分支不受影响、断言未放松**。
+- ✅ **验收**：新增 `tests/test_llm_final_veto_scope_round3.py`（**16 条**，含 5 条变异反证）＋ 全量 pytest 实测 **498 passed**（✅ 全量最终 **499 passed**；**498→499 = 本轮自己新增的 1 条钉死测试** ⇒ 482+16+1=499；⚠️ 交办单的「495」复现不出来，按实测记）；真实件 A/B：canonical **13 ⇒ 12**（只去掉 **515450**）、daily **16 ⇒ 14**（去掉 **512800/515450**）⇒ **无新增否决**。
+- ✅ **修复后交付**：每日链 `512800 卖出 7700→5400（16%）`、`515450 买入 0→3200`、`512170 买入 0→13800`、权益 **48%**／现金 **52%**、`lot_rounding_gap = +177.47`（P4 绿）、**无维持席位**（P6/P7 绿）、`rejected` **14**；研究链 canonical `512800 卖出 7700→3300（10%）`、`515450 买入 0→2000`、权益 **20%**／现金 **80%**、**权益上限口径不变**（`0.8 → effective 0.3`）⇒ 负分替补 563020（−0.4683）换成正分 515450（+0.8672）⇒ **严格改善**。
+  ⚠️ 修复前快照 **`20261111_142244` 是污染版**（512800 维持 22.2%、无 515450）⇒ **只作事故证据，不可作交付**。
+- ⚠️ **残留缺口**：舆情/宏观仍打桩（**需用户单独授权**）｜**回测链仍不走 EWMA**（已登记基线是 MA20 闸门口径 ⇒ 与现役 MA60+EWMA 不一致 ⇒ 数字仅作历史参考，本轮刻意不重跑，重跑断 sha1 链）｜「维持席位」权重可能 **> 20% 上限**（机制仍在，本轮消失）。
+- 🔴 **未 commit / 未 push**（HEAD `b1be18ac`）；服务器脚本收尾 `os.unlink` / `shutil.rmtree`（**不许 `rm -rf`**）、**别的 session 的 `/tmp` 一个不动**；ℹ️ **交付快照号与验收数字待主 agent 补写**。
+
+- 🔴 **收尾阶段另修 2 处**：**① `run_gates.sh` repro 段写死入场 MA20**（本轮闸门已 MA60）⇒ **闸门假红** ⇒ 改从 `config` 读 ＋ 新增钉死测试 `test_run_gates_does_not_hardcode_ma_windows`；**② 验收脚本 A2 保护集是上一轮决策件的硬编码 3 只** ⇒ 本轮 515650 权威节判**否决**、多头段说**买**（决策件自相矛盾）⇒ 旧断言把正确行为判成误伤 ⇒ A2 改为**从本轮决策件权威节动态推导**（本轮保护集 `512010/512170/512800/515450`）。✅ 两代快照各 **17 PASS**；G-TA1 按权威层级比 ⇒ 515650 **不判误伤**（真实件直跑 pass）。
+
+## 14. 2026-11-11 · 第九轮收尾：🔴 否决归属层 4 处真缺陷 ＋ 交付链 3 处 ＋ 审计 P1 假绿（新会话第一眼）
+
+- **交付**：快照 **`20261111_163156`**（asof 2026-11-09）｜验收 **17 PASS / 0 FAIL / 0 SKIP**｜服务器闸门 **694 断言 PASS / 0 FAIL / 0 N/A / 退出码 0**（Pass15 = 最终代码基线）。
+- **方案**：权益 **19.2%**／现金 **80.8%**（TA 上限 32% ⇒ 缩放 0.4）｜`512800` 卖 7700→2100、`515450` 买 0→1300、`512170` 买 0→5500｜`rejected` 7 只（无 512800/515450）｜sha1 链闭合。
+- **本轮修的真缺陷**：`llm_final.py` 否决归属层 4 处（假护栏「一票否决」/ 第三方立场元指代 / 点名裁决不生效 / 弱化限定词＋否定式否决）；交付链 3 处（跨快照复用 ⇒ sha1 链断裂 ⇒ 只搬 context md + 逐字等价校验）。
+- **审计 P1**：① **假绿**（`na` 被验收脚本记成 PASS）⇒ 根因「复合方向格」修复（**只放开非买侧**）＋ A2 改 `status != "pass"` ⇒ SKIP；② **fail-open**（context 缺失 ⇒ 直接搬来源）⇒ 改 fail-closed；③ `run_gates.sh` 的 `ANALYZE_TOP_N` 读取移到 `cd "$REPO_ROOT"` 之后。
+- ⚠️ 事故快照（不可交付）：`20261111_142244` / `20261111_152132` / `20261111_161126` / `20261111_162423`。⚠️ 残留：舆情/宏观打桩（**需授权**）、回测链仍 MA20、「维持席位」>20% 机制仍在。
+## 15. 2026-11-11 · 全量跑（asof=2026-11-11，含今日收盘）（新会话第一眼）
+
+- 快照 **`20261111_172340`**（`daily/main.py --asof 2026-11-11 --full`，**观察态**：挂单禁用/不发信）。
+- **今日 bar 已进底座**：ETF 日线增量 3552 行，其中 **11-11 当日 296 行**（补齐 11-10）⇒ 今日收盘信息进得了分析；⚠️ W 权重快照仍 2026-11-04（滞后 7 天，只披露不拦）。
+- ⚠️ **静默防守窗 11-06~11-30 生效但未强制**（`is_silent_defense` 只在 `calendar_gate.py` 里被算出来、无下游消费者）⇒ 报告里的买入动作**仅供观察、不可执行**；⚠️ 舆情/宏观仍打桩（需授权）。
+- 服务器自跑 ＋ `etf_autofinish.sh` 自动出摘要（`<RESULTS_ROOT>/reports/full_run_20261111_summary.md`）并清驱动脚本痕迹（`os.unlink`）。
+
+## 16. 2026-11-12 · 收尾：⑮ 假警报 ＋ 池外代码/名称垃圾 **已修** ＋ 交付件重生成 ＋ 验收 17/0/0（新会话第一眼）
+
+- **交付**：快照 **`20261111_172340`**（asof=2026-11-11）**派生层已用修复后代码重生成**（`manu/tools/regen_snapshot_derived.py`，自验证逐字节相等 ＋ 幂等复跑通过）⇒ host 验收 **17 PASS / 0 FAIL / 0 SKIP**（A2 由 **SKIP**(na) → **PASS**）。
+- **修的三个真缺陷**：① **池外垃圾代码** `566620`（LLM 把 `516620` 笔误）⇒ 池内白名单剔除 ＋ `rejected_out_of_universe` **如实披露** ＋ 计划 md/交付报告各一行 ⚠️ ⇒ `rejected` 6 只 → **5 只**（`516620/159207/563020/512890/159547`），**白名单不可用 ⇒ fail-closed 不剔除**；② **名称官方优先** ⇒ `159547` 由垃圾词「重叠」→ **红利低波ETF华夏**；③ **阶段 1「未换库/数据滞后」假警报** ⇒ 校验对象改为**下游真正会用的那一份**（增量派生库 `cn_data_live`）＋ `try_increment` 回传 `derived_covers_asof` ＋ **真降级告警保留**。
+- **「重建少一个动作」之谜＝环境差异不是 bug**：顺延要核验冲突对 ⇒ 需 W 权重表 `etf_holdings.csv`（host 缺 ⇒ `overlap_ready=False` ⇒ 宁缺毋滥不补位）；补上（与服务器 md5 一致）⇒ 重建与交付件**逐字段一致**。
+- **回归**：host `pytest manu/etf_rotation -q` ⇒ **568 passed / 0 failed**（基线 547 ＋ 新增 21，含 19 例钉死测试 ＋ 变异反证）。
+- **服务器收尾**：`_work/_etf_daily_20261109` ＋ `_work/_etf_daily_20261111` 两个 scratch 已 `shutil.rmtree` 删除（**不碰 `rm -rf`**）⇒ `data/` 下**无** `_etf_daily_*`。
+- ⚠️ **残留缺口**：**静默防守窗 11-06~11-30 仍无下游消费者** ⇒ 本轮 3 笔买入**仅供观察、不可执行**；舆情/宏观仍 `DATA_UNAVAILABLE`（**需授权**）；W 权重快照仍 2026-11-04；「维持席位」>20% 机制仍在；回测链仍 MA20。
+- 🔴 **不 commit / 不 push**（HEAD `a727de53`）；M：`final_rebalance_plan.py` / `daily/stage1_dataset.py` / `daily/report.py` / `daily/tests/test_report.py` ＋ 新增 `tests/test_pool_whitelist.py`、`daily/tests/test_stage1_dataset_validation.py`。
+
+## 17. 2026-11-12 · 全量跑批**服务器自治**（host 18:00 关机 ⇒ 已脱离 SSH）（新会话第一眼）
+
+- **作业**：服务器 `setsid nohup bash /tmp/etf_full_20261112.sh` ⇒ `ASOF_PIPE=2026-11-12` ＋ `--full` ＋ **观察态**（挂单禁用/不发信）。
+- 🟢 **关机安全已验证**：`SID=1439763`（自成一组）＋ **TTY=`?`**（无控制终端）＋ `stat=Ss` ⇒ SSH 断开/关机都带不走。
+- **跑完自动**：① `reports/full_run_20261112_summary.md` ② 快照路径+产物清单＋`verify_artifacts.py` ③ **痕迹清零**（`shutil.rmtree`/`os.unlink`，不碰 `rm -rf`）。
+- **明早看**：服务器 `reports/full_run_20261112_summary.md` ＋ `reports/NEXT_STEPS_20261112.md`；**必查**：qlib 末日=11-12、S 层打分日=11-12、排序仍 EWMA、`rejected` 无池外代码。
+
+## 18. 2026-11-13 · 全量跑批（asof=2026-11-12）收口：🔴 否决归属第三类真缺陷 ＋ **闸门全绿（rc=0）**（新会话第一眼）
+
+- **产物**：服务器 `/mnt/data/siping/runs/etf_rotation_results/snapshots/20261113_092926/`｜闸门日志 `_gates_full_20261113g.log`（最终一轮；`d`/`e`/`f` 亦全绿）
+  ⇒ **退出码 0 / 失败阶段 0 / 断言 PASS 694 / 跳过 1（--skip-repro）**。
+- 🔴 **G-TA1 红灯＝真 bug**：研究经理「我**拒绝熊方对 515650 的否决**」被读成「否决 515650」
+  ⇒ 修：`_REFUSED_VETO_RE`（驳回否决）、`_REJECT_NOUN_RE`（否决的名词用法）、
+  `_META_VETO_RE`（第三方立场+对 CODE 的否决）、**否决出处取「最高权威层级」的那一段**。
+  ⇒ 否决名单**一只没少**、**方案不变**、**闸门判据一字未动**（变异负例仍 PASS）。
+- 🛡 探针真空假红 6 项：I4 重放原文；P0b 空表⇒断言级 N/A；N1/N2/N4/N5 迁自建夹具（期望仍「要 FAIL」）；P3 比原始金额。
+- 📈 方案（观察态）：买 `515450` 3300股 ＋ `512170` 14000股（顺延补位）；卖 `512800` 减超配｜现金 15815.01、权益 47.91%。
+- 📊 排序仍 EWMA（α=0.2、5 日）｜host **684 passed**｜指纹表 35 条一致｜规则见 `rules.md §十四.102`。
+- 🔁 **canonical 根已用修后代码重建**（`rebuild_baseline.sh --asof 2026-11-03 --reuse-decision`，不重跑 LLM）
+  ⇒ 重建前后**决策层零漂移**（否决 5 只一只没少、`actions`/`cash_flow`/`llm_*` 全等）｜只修正否决「出处章节」列
+  ⇒ 重建后**重生成指纹表 + 重跑全量闸门**｜规则见 `rules.md §十四.102` 第 7 条。
+
+## 19. 2026-11-13 · 下午 · asof=2026-11-13 全量跑批：**东财限流 ⇒ 停止**（无新交付件）
+
+- 🚦 15:45 `--asof 2026-11-13 --full`（观察态、LLM 开）｜交易日门通过｜快照 `20261113_154532`。
+- 🔴 **取数被东财 IP 限流打挂**：ETF 日线**单一源** ⇒ 15:52「296 只全挂」→ 16:03 退避重试**仍全挂**（限流窗口 > 10 分钟）。
+- 🛑 **用户口径「限流就结束」** ⇒ 16:20 停我们自己的进程组（残留 0）｜他人 worker（111+2）未受影响。
+- ⚠️ **本轮无新交付件**：最新完整快照仍是 `20261113_092926`（asof=11-12）｜闸门 `_gates_full_20261113g.log` 仍全绿。
+- 🛠 编排器新增 `SKIP_BASELINE` / `INITIAL_WAIT_SECONDS` / `RETRY_MAX_ATTEMPTS`｜规则见 `rules.md §十五` 第 9 条。
+
+## 2026-11-13 · 傍晚 · 方案一：最小调仓门槛拆三档
+- 清仓止损 **0** / 新开仓 **3800** / 存量微调 **2800**（单一 5000 会死锁：标准席只有 4805）。
+- 单一事实源 `min_trade_gate.py`；阶段 5 + 阶段 6 共用；被拦行留存、现金自洽；内置死锁检测。
+- 15 条测试全 PASS；服务器代码 md5 已对齐；canonical 根已用新代码重建通过。
+
+## 2026-11-13 · 傍晚 · 方案一真实产物核验（canonical 11-03 基线）
+- ✅ 全生效：`considered=6 skipped=1`（515450 新开仓 1466元<3800 ⇒ 拦，bp 34.1，省 5.00元）｜`deadlock_risk=true`
+  ｜被拦行仍在 actions（金额/费用归零、目标权重归现金）｜`cash_flow` 自洽（buy_amount=0、cash_end=28190.13、权益 5.33pct）
+  ｜4 笔清仓止损 0 元全放行、512800 存量微调 5192 元放行。
+- 🔴 **真实新开仓只有 1466 元**（目标权重 5.33pct）≠ 文档假设 4805 元（16pct）⇒ 3800 门槛会拦死新开仓
+  ⇒ 报告须写明并给三条出路（降到 1400 以下 / 提权重到 16pct / 防守窗 `--no-min-amount-gate` 对照）。
+
+## 2026-11-13 夜 → 2026-11-16 · full mode 交付 + 回灌
+- ✅ asof=2026-11-13 full mode 跑通（`20261113i`，4846s，rc=0）｜快照 `20261113_202504`｜报告 `reports/report_20261113.md`
+  ｜闸门 PASS 706 / rc=0（断言对象=真快照，此前几轮「全绿」是假象）。
+- ✅ 方案一验收通过（阶段 5+6 同门槛；被拦 515450 584.4 元 / 85.6 bp；deadlock_risk=true；现金自洽）。
+- 🔴 修真 bug：`weight_to_cash` 截断 ⇒ 恒等式崩 ⇒ FATAL exit 1。
+- 🔴 东财 IP 封禁 ⇒ 建兜底取数通道（腾讯/新浪/搜狐）⇒ 296/296。
+- 🔴 待拍板：3,800 新开仓门槛 vs 真实新开仓 584.4 元 ⇒ 必然拦死；三条出路 (a)(b)(c)。
+- ✅ 12 文件回灌本地（md5 一致）｜本地 510 passed｜披露句幂等追加已修（已交付报告不重跑）。

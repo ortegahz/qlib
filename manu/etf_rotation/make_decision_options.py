@@ -835,7 +835,9 @@ def render_markdown(payload: dict) -> str:
         add("")
         add(f"- 目标权重 {rule['target_weight_pct']:.2f}%（计划）→ "
             f"**落地 {rule['target_weight_effective_pct']:.2f}%**"
-            f"（整手买不起则权重归现金 {rule['weight_to_cash_pct']:.2f}%）")
+            #: 🔴 2026-11-13：`weight_to_cash_pct` 是**有符号**差额
+            #:    （超配没减仓 ⇒ 负）⇒ 文案分两支，不许写成「权重归现金 −2.70%」。
+            f"（{('整手买不起则权重归现金 %.2f%%' % rule['weight_to_cash_pct']) if rule['weight_to_cash_pct'] >= 0 else ('超配 %.2f%% 留在场内（现金相应少 %.2f%%）' % (-rule['weight_to_cash_pct'], -rule['weight_to_cash_pct']))})")
         add(f"- 目标股数 **{fmt_shares(rule['target_shares'])} 股**"
             f"（当前 {fmt_shares(rule['current_shares'])} 股，Δ {rule['delta_shares']:+d}）"
             f"｜目标金额 {fmt_amount(rule['target_amount'])} 元"
