@@ -26,6 +26,21 @@ if str(DAILY_DIR) not in sys.path:
 import report  # noqa: E402
 
 
+def test_报告模块必须是daily那个_不许被别链同名模块抢占() -> None:
+    """🔴 2026-11-18 续四：**同名模块遮蔽**的常驻守卫。
+
+    🔴 事故形态（真跑抓到）：``manu/etf_rotation/v2/report.py`` 与 ``daily/report.py``
+       **同名**；v2 的测试目录把 ``v2/`` 插到 ``sys.path[0]``
+       ⇒ 裸 ``import report`` 命中 **V2 那个** ⇒ 本文件会去测**另一个模块**
+       ⇒ 全量 pytest 里 19~25 条**假红**，而**单跑本文件全绿**（顺序依赖）。
+    ⇒ 修复在 ``daily/tests/conftest.py``：把 daily 的 report **占成**
+       ``sys.modules["report"]`` ⇒ 本条把它钉死。
+    """
+    assert Path(report.__file__).resolve() == (DAILY_DIR / "report.py").resolve(), (
+        f"报告模块被同名模块抢占了：{report.__file__}"
+    )
+
+
 # =============================================================================
 # 合成数据
 # =============================================================================

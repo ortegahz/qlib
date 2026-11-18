@@ -362,6 +362,15 @@ _CODE_RE = re.compile(r"(?<![\d.])([1-9]\d{5})(?!\d)")
 #: 清仓类动作词（照抄解析器 `llm_final._ACTION_RULES` 第 ① 档）
 _ZERO_CLEAR_WORDS = ("全部卖出", "卖出全部", "清仓", "清掉", "清零")
 
+#: 「裸卖出」档的动作词（照抄解析器 `llm_final._ACTION_RULES` 第 ④ 档）
+#:
+#: 🔴 2026-11-17（真机 `snapshots/20261117_190638` · A20⑥ 假红实证）：
+#:    解析器把裸「卖出」当**默认推断**（被同句的「减仓 / 部分卖出」证据压住），
+#:    探针却把**每一处**裸「卖出」都算成零方向指令 ⇒ 口径漂移 ⇒ 假红。
+#:    ⇒ 「裸卖出」= **只是默认推断** ⇒ 可被「减仓 / 部分卖出」证据压住（见
+#:      `_md_zero_direction_codes`）；**明写**「清仓 / 全部卖出 / 不买」的不受此影响。
+_MD_BARE_SELL_WORDS = ("卖出", "卖掉")
+
 #: 「不买」类动作词（照抄解析器 `llm_final._ACTION_RULES`）
 _ZERO_NOBUY_WORDS = ("不建仓", "不买入", "不买")
 
@@ -986,7 +995,7 @@ def _md_clause_zero_word(clause: str) -> str | None:
         return clear
     if any(w in text for w in _PARTIAL_WORDS) or _SELL_QTY_RE.search(text):
         return None
-    sell = _md_first_unnegated(text, ("卖出", "卖掉"))
+    sell = _md_first_unnegated(text, _MD_BARE_SELL_WORDS)
     if sell:
         # 🔴 2026-11-11（真误伤 · 每日链快照 `20261111_142244`）：
         #    「…**`512800`卖出超配部分、保留16%核心」
@@ -1195,6 +1204,17 @@ def _md_zero_direction_codes(md_text: str) -> tuple[set[str], str]:
         子句里没有动作词 ⇒ 顺带提到的代码不算（理由句里的代码**不算**）。
       · 🔴 **部分卖出不算零方向**（见 `_md_clause_zero_word`）。
 
+    🔴 **裸「卖出」只是默认推断**（2026-11-17 真机 `snapshots/20261117_190638` 假红实证）：
+       真机最终裁决章里写「对 `512800` 执行**部分卖出、保留条件性核心仓**」，
+       而**投研论证段**另有一句「卖出 `512800` 后换入这些产品，只是同质替换…」
+       ⇒ 旧口径把**每一处**裸「卖出」都算成零方向指令 ⇒ 512800 被判「清仓」
+       ⇒ 而计划里 512800 是「减（目标未定）」⇒ A20⑥ **假红**。
+       ⇒ 现在：**章级**「减仓 / 部分卖出」证据（`_md_sentence_partial_sell_codes`）
+         命中的代码 ⇒ 裸「卖出」**不生效**（照抄解析器 `llm_final` 2026-11-11 的
+         同一口径「裸卖出只是默认推断」，只是作用域从**句**扩到**章**）。
+       ⚠️ **明写「清仓 / 全部卖出 / 不买 / 不建仓」的不受此豁免** ⇒ 真清仓照旧判零方向
+         （不许把探针改废 ⇒ 见 `tests/test_probe_llm_parser_cond_neg_guard.py`）。
+
     ⇒ 能抓住的缺陷：把「卖出/清仓」当成带非零目标 / 把清仓方向配上非零权重 /
       把零方向代码整条漏抽（掉进 `unparsed_codes`）/ 把「卖出约 N 份」误判成清仓。
     """
@@ -1205,7 +1225,10 @@ def _md_zero_direction_codes(md_text: str) -> tuple[set[str], str]:
     if not section:
         return set(), "未能定位最终裁决章节（llm_final.extract_section 返回空）"
     from_table: set[str] = set()
-    from_prose: set[str] = set()
+    #: 散文里**明写**的零方向（清仓 / 全部卖出 / 不买 / 不建仓）⇒ **永远**判零方向
+    from_clear: set[str] = set()
+    #: 散文里**裸「卖出」**（= 只是**默认推断** ⇒ 可被下面「章级减仓证据」压住）
+    from_bare: set[str] = set()
     for block in _md_table_blocks(section):
         header = _md_cells(block[0])
         dir_idx = next((i for i, h in enumerate(header)
@@ -1228,21 +1251,21 @@ def _md_zero_direction_codes(md_text: str) -> tuple[set[str], str]:
                 continue
             if _md_zero_dir_word(cells[idx]) or _md_zero_dir_word(cells[code_idx]):
                 from_table.add(code)
+    #: 🔴 **章级**「减仓 / 部分卖出」证据（= 原文在**最终裁决章**内明确说过这些代码
+    #:    是「减仓 / 部分卖出」）⇒ 裸「卖出」不生效（照抄解析器口径）
+    _section_partial: set[str] = set()
+    for _sentence in _md_sentences(section):
+        if _md_is_conditional(_sentence):
+            continue
+        _section_partial |= _md_sentence_partial_sell_codes(_sentence)
     for sentence in _md_sentences(section):
         if _md_is_conditional(sentence):
             continue
-        #: 句级「部分卖出」护栏（见 `_md_sentence_partial_sell_codes`）
-        #: 🔴 子句级规则看不见「，但属于减仓而非清仓」这类**句尾限定语** ⇒ 必须句级兜底
-        _partial = _md_sentence_partial_sell_codes(sentence)
         for clause in _md_clauses(sentence):
             _zw = _md_clause_zero_word(clause)
             if not _zw:
                 continue
             _codes = _md_clause_codes(clause)
-            if (_zw in ("卖出", "卖掉") and _codes
-                    and all(c in _partial for c in _codes)):
-                # 句级护栏：这是「减仓」不是「清仓」⇒ 不进零方向集合
-                continue
             # 🔴 2026-11-13 实测事故（A20⑥ 假红）：子句里的零方向词**对象可能不是**
             #    那只代码（「卖出**四只持仓**」+「将 512800 **降至** 12–16%」）
             #    ⇒ 被「降至/减至」**直接绑定**的代码是**减仓**（目标权重另给）
@@ -1252,10 +1275,46 @@ def _md_zero_direction_codes(md_text: str) -> tuple[set[str], str]:
             _direct = _md_clause_zero_direct_code(clause, _zw)
             _reduced = _md_clause_reduced_codes(clause)
             _codes = [c for c in _codes if c == _direct or c not in _reduced]
-            from_prose.update(_codes)
+            if _zw in _MD_BARE_SELL_WORDS:
+                from_bare.update(_codes)      # 裸「卖出」＝**默认推断**（下面统一豁免）
+            else:
+                from_clear.update(_codes)     # 明写零方向（清仓 / 全部卖出 / 不买 / 不建仓）
+    #: 🔴 裸「卖出」**只是默认推断** ⇒ 被**章级**「减仓 / 部分卖出」证据命中的代码
+    #:    **不生效**（⚠️ 明写「清仓 / 全部卖出 / 不买 / 不建仓」的**不受**此豁免
+    #:    ⇒ 真清仓照样判零方向 ⇒ 不许把探针改废）
+    _bare_exempt = from_bare & _section_partial
+    from_prose = from_clear | (from_bare - _bare_exempt)
     codes = from_table | from_prose
     return codes, (f"最终裁决章节：表格方向列 {len(from_table)} 个代码"
-                   f"｜散文子句 {len(from_prose)} 个代码｜合计 {len(codes)} 个")
+                   f"｜散文子句 {len(from_prose)} 个代码"
+                   f"｜裸卖出被「减仓/部分卖出」证据豁免 {len(_bare_exempt)} 个"
+                   f"｜合计 {len(codes)} 个")
+
+
+def _md_partial_sell_direction_violations(section: str, tgt_map: dict) -> list[str]:
+    """「原文写的是**部分卖出**」⇒ 计划方向必须是「减」的违例列表。
+
+    🔴 这是 A20⑥ 的**另一半**（与「零方向 ⇒ 计划必须 0%」互为对偶）：
+       裸「卖出」被**章级**「减仓 / 部分卖出」证据豁免时（见 `_md_zero_direction_codes`），
+       **本条**仍把那只代码钉住 ⇒ 计划方向不是「减」⇒ 照样红
+       ⇒ **豁免 ≠ 放过**（2026-11-13 真机 `snapshots/20261113_092926` 实证：
+       计划把「执行部分卖出而非清仓」写成「卖 / 0%」⇒ 本条抓红）。
+    """
+    bad: list[str] = []
+    for sentence in _md_sentences(section):
+        if _md_is_conditional(sentence):
+            continue
+        for clause in _md_clauses(sentence):
+            if not _md_has_partial_action(clause):
+                continue
+            for code in _md_clause_codes(clause):
+                tgt = tgt_map.get(code)
+                direction = str((tgt or {}).get("direction") or "")
+                if direction != "减":
+                    bad.append(
+                        f"{code}: 原文写的是**部分卖出**（{clause[:30]}），"
+                        f"但计划方向={direction!r}（必须是「减」，**不是**清仓）")
+    return bad
 
 def _synthetic(decision_md: Path, body: str, total_assets: float | None = None) -> dict:
     """把合成正文写成一份决策 md（带同目录 json 占位），返回解析视图。
@@ -2116,20 +2175,8 @@ def main() -> int:
                     _zero_bad.append(
                         f"{_c}: 原文写明零方向，但计划方向={_t.get('direction')!r}"
                         f"（必须 ∈ {list(_ZERO_DIRS)}）")
-            _partial_bad: list[str] = []
-            for _sentence in _md_sentences(_sec):
-                if _md_is_conditional(_sentence):
-                    continue
-                for _clause in _md_clauses(_sentence):
-                    if not _md_has_partial_action(_clause):
-                        continue
-                    for _c in _md_clause_codes(_clause):
-                        _t = _tgt_map.get(_c)
-                        _dir = str((_t or {}).get("direction") or "")
-                        if _dir != "减":
-                            _partial_bad.append(
-                                f"{_c}: 原文写的是**部分卖出**（{_clause[:30]}），"
-                                f"但计划方向={_dir!r}（必须是「减」，**不是**清仓）")
+            #: 「原文写的是**部分卖出**」⇒ 计划方向必须是「减」（A20⑥ 的另一半）
+            _partial_bad = _md_partial_sell_direction_violations(_sec, _tgt_map)
             _syn6 = ("## 六、最终交易决定\n\n**Executive Summary**: "
                      "全部卖出 900003 回收资金；对 900004 卖出约 1,234 份，保留约 5,678 份。\n")
             _r6 = LF.extract_final_decision(_syn6)
@@ -2221,6 +2268,54 @@ def main() -> int:
                   and ("## 二之二、" in _plan_md),
                   f"含最终裁决章节={'最终裁决' in _plan_md}｜含二之二={'## 二之二、' in _plan_md}"
                   f"｜含二之三={'## 二之三、' in _plan_md}")
+        # ---- A21（2026-11-17 新增）：🔴 真机交付件 `snapshots/20261117_162113` 实证 · 两个真缺陷 ----
+        #    【真机原文（多头表 512800 行 · 理由列，原样截取）】
+        #        「多头核心，但不追涨。**当前权重22.54%**，高于机械目标16%；……」
+        #    ① **幽灵目标**：`_backward_segment` 的「锚点截断」只保留锚点**之后**的文本
+        #       ⇒「当前权重」被截成「」⇒ 语境守卫**看不见「当前」**
+        #       ⇒ 理由列里的**账户现状权重 22.54%** 被当成**说话人的目标权重**
+        #       ⇒ 交付件出现「LLM 目标 22.54%」这个**幽灵数字**（LLM 从未这么说过）
+        #       ⇒ 方向-权重语义守卫按「减 ⇒ 目标 22.54% ≥ 当前 22.20%」判 ⇒ **假红灯**。
+        #    ② **规则层的数被安到说话人头上**：「高于机械目标16%」里的 16% 是**规则模板**
+        #       给的数（表头口径早有先例：A14「机械目标」列不是说话人的目标）
+        #       ⇒ 方向「减」+ 目标 16% 在**当前权重降到 16% 以下**时必然触发**假冲突**
+        #       （本轮 512800 卖到 7.00% 后，下一轮就会踩中）。
+        #    ⇒ 守卫：① 现状权重**不得**成为目标；② 机械目标**不得**成为说话人的目标；
+        #      ③ 说话人**自己**写出的落点照常取（修法不许过头）。
+        body21 = (
+            "# 合成决策21\n\n## 多头\n\n"
+            "| 标的 | 方向 | 理由 |\n|---|---|---|\n"
+            "| `512800` | **减** | 多头核心，但不追涨。当前权重22.54%，高于机械目标16%；"
+            "减仓是恢复风险预算，不是看空清仓。 |\n"
+            "| `159929` | **减** | 当前权重9.11%，目标减至4%。 |\n"
+        )
+        v21 = _synthetic(tmp, body21)
+        _t21 = ((v21.get("512800") or [{}])[0]).get("target_pct")
+        check("A21① 理由列里的**现状权重**（「当前权重22.54%」）不得被当成目标权重",
+              _t21 != 22.54,
+              f"512800 target_pct={_t21!r}（必须 ≠ 22.54：那是**账户现状**，不是目标）")
+        _t21b = ((v21.get("512800") or [{}])[0]).get("target_pct")
+        check("A21② 理由列里的**规则层机械目标**（「高于机械目标16%」）不得成为说话人的目标",
+              _t21b != 16.0,
+              f"512800 target_pct={_t21b!r}（必须 ≠ 16.0：那是**规则模板**的数）")
+        _t21c = ((v21.get("159929") or [{}])[0]).get("target_pct")
+        check("A21③ 说话人**自己**写出的落点照常取（修法不许过头）",
+              _t21c == 4.0,
+              f"159929 target_pct={_t21c!r}（必须 = 4.0：现状 9.11% 不算目标，自身落点 4% 算数）")
+        # 变异反证：把两处护栏同时回退 ⇒ 幽灵目标 22.54% 必须复活
+        _old_cs_re = F._CURRENT_STATE_PHRASE_RE
+        _old_rl_labels = F._RULE_LAYER_NUM_LABELS
+        try:
+            F._CURRENT_STATE_PHRASE_RE = re.compile(r"(?!x)x")
+            F._RULE_LAYER_NUM_LABELS = ()
+            v21_old = _synthetic(tmp, body21)
+            _old21 = ((v21_old.get("512800") or [{}])[0]).get("target_pct")
+            check("A21④ 变异反证：回退两处护栏 ⇒ 幽灵目标 22.54% 必须复活（证明本用例有牙）",
+                  _old21 == 22.54,
+                  f"变异后 512800 target_pct={_old21!r}（必须 = 22.54 ⇒ 证明护栏在起作用）")
+        finally:
+            F._CURRENT_STATE_PHRASE_RE = _old_cs_re
+            F._RULE_LAYER_NUM_LABELS = _old_rl_labels
         # ---- A10~A12：F5 失败判定加固 ----
         empty_md = SCRATCH / "_probe_llm_empty.md"
         fail_md = SCRATCH / "_probe_llm_failed.md"

@@ -176,7 +176,9 @@ def compute_turnover_series(weight_df: pd.DataFrame) -> pd.Series:
         raise ValueError("weight_df 为空，无法计算换手率")
     weights = weight_df.sort_index().astype(float).fillna(0.0)
     prev = weights.shift(1).fillna(0.0)
-    turnover = 0.5 * (weights - prev).abs().sum(axis=1)
+    # 🔴 2026-11-18 续四：系数**不许写死字面量** ⇒ 走本线 config 的唯一定义
+    #    （守卫规则⑫：换手语境里手写 ``* 0.5`` ⇒ 单边换算出现第二份实现）。
+    turnover = C.ONE_WAY_TURNOVER_FACTOR * (weights - prev).abs().sum(axis=1)
     turnover.iloc[0] = np.nan
     turnover.name = "turnover_single_side"
     return turnover

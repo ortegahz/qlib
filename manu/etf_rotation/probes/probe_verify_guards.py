@@ -697,16 +697,82 @@ def _pick_buy_side_code(plan: dict, excluded: list[str]) -> str | None:
     return None
 
 
-def _inject_buy_side_target(plan: dict, code: str) -> dict:
-    """给交付件副本的 `llm_targets` 塞一条**买侧**方向（变异反证的兜底夹具）。"""
+def _inject_buy_side_target(plan: dict, code: str, who: str = "research") -> dict:
+    """给交付件副本的 `llm_targets` 塞一条**买侧**方向（变异反证的兜底夹具）。
+
+    🔴 2026-11-17：新增 `who` 形参 —— G-TA1c 要造一条**观点层**（`who="bull"` ⇒
+    权威层级 0）的买侧证据，用来证明「观点层的买不构成误伤」这条口径。
+    """
     out = json.loads(json.dumps(plan, ensure_ascii=False))
     targets = out.get("llm_targets") or {}
     targets[code] = {
         "direction": "买", "current_pct": 0.0, "target_pct": 10.0,
-        "reason": "（变异反证：自造的买侧夹具）", "who": "research", "pnl_pcts": [],
+        "reason": "（变异反证：自造的买侧夹具）", "who": who, "pnl_pcts": [],
     }
     out["llm_targets"] = targets
     return out
+
+
+#: 🔴 2026-11-17（G-TA1b 负例空转修复）自足夹具用的**合成代码**：
+#:   · `_FIXTURE_MIS_HIT_CODE` —— 权威层（Trader 最终裁决）买侧 ⇒ 闸门必须 FAIL；
+#:   · `_FIXTURE_OPINION_CODE` —— 观点层（bull）买侧 ⇒ 闸门必须 PASS（层级 0 不构成证据）。
+_FIXTURE_MIS_HIT_CODE = "599999"
+_FIXTURE_OPINION_CODE = "599998"
+
+#: 合成 LLM 原文（**非真实产物**）：`## 六、最终交易决定（原始输出）` 段（层级 40）
+#:   下一行表格行明写「买」⇒ 权威层买侧证据 ⇒ 与计划件自带的最终裁决互相印证。
+_FIXTURE_MIS_HIT_MD = """# 合成决策（零误伤闸门变异夹具 · **非真实产物**）
+
+## 六、最终交易决定（原始输出）
+
+| 标的 | 方向 | 目标权重 | 说明 |
+|:--|:--:|--:|:--|
+| 599999 | **买** | 10% | 夹具行：TA 最终裁决明确要买 |
+"""
+
+
+def _fixture_authoritative_buy_mis_hit(plan: dict) -> tuple[dict, str]:
+    """自足夹具：一条**权威层买侧**证据 + 一条否决名单行 ⇒ 闸门必须 FAIL。
+
+    🔴 2026-11-17：G-TA1b 旧实现依赖**本轮真实产物**里有没有「买侧」代码
+    ⇒ 本轮只有 `who=bull`（层级 0 = 观点层）的买侧证据
+    ⇒ 闸门按设计不认 ⇒ 负例空转 ⇒ 探针假红。
+    ⇒ 修法：夹具**自建**（不依赖任何真实产物）：
+
+      · `llm_final_decision.targets[599999]` = 买（**层级 40** = Trader 最终裁决）
+        ⇒ `plan.llm_final_decision.targets` 这条证据在计划件里就成立；
+      · 合成 md 的「六、最终交易决定」表格行同样写「买」（**层级 40**）⇒ 两条证据齐备；
+      · `ta_screening.rejected` 里塞一行 599999（否决出处「辩论裁决」= 层级 20）
+        ⇒ 买侧层级 40 ≥ 否决层级 20 ⇒ **闸门必须 FAIL**（误伤成立）。
+
+    ⚠️ 期望是「FAIL」——**不许**改成「PASS」（那是把断言改弱）。
+    """
+    out = json.loads(json.dumps(plan, ensure_ascii=False))
+    final = out.get("llm_final_decision")
+    if not isinstance(final, dict):
+        final = {}
+        out["llm_final_decision"] = final
+    targets = final.get("targets")
+    if not isinstance(targets, dict):
+        targets = {}
+        final["targets"] = targets
+    targets[_FIXTURE_MIS_HIT_CODE] = {
+        "direction": "买", "target_pct": 10.0,
+        "reason": "（变异反证夹具：TA 最终裁决明确要买）",
+    }
+    screening = out.get("ta_screening")
+    if not isinstance(screening, dict):
+        screening = {}
+        out["ta_screening"] = screening
+    rows = list(screening.get("rejected") or [])
+    rows.append({
+        "code": _FIXTURE_MIS_HIT_CODE, "name": "夹具ETF",
+        "reason": "（变异反证：人为塞进否决名单）",
+        "source_section": "辩论裁决",
+    })
+    screening["rejected"] = rows
+    screening.setdefault("enabled", True)
+    return out, _FIXTURE_MIS_HIT_MD
 
 
 #: 🔴 2026-11-13（探针真空假红 · 负例**自建夹具**）：N1/N2/N4/N5 这四条负例原本
@@ -1178,22 +1244,41 @@ def main() -> int:
         "⇒ 零误伤闸门必须 PASS（闸门不许把合法否决也判红）",
     )
 
-    # ---- G-TA1b 变异负例：把一个买侧代码塞回否决名单 ⇒ 闸门必须 FAIL（闸门有牙）----
-    _probe_buy_code = _pick_buy_side_code(_clean_plan, [])
-    _mut_plan = _clean_plan
-    if _probe_buy_code is None:
-        # 兜底夹具：交付件里**一个买侧代码都没有** ⇒ 自造一条
-        # （🔴 不许因为「无从构造」就把这条负例空转过去 ⇒ 闸门必须永远有牙）。
-        _probe_buy_code = "599999"
-        _mut_plan = _inject_buy_side_target(_mut_plan, _probe_buy_code)
-    _mut_plan = _inject_rejected_code(_mut_plan, _probe_buy_code)
-    _mut_verdict = find_ta_reject_mis_hits(_mut_plan, _decision_md_text)
+    # ---- G-TA1b 变异负例：**自足夹具** ⇒ 闸门必须 FAIL（闸门永远有牙）----
+    # 🔴 2026-11-17（真机跑批 `snapshots/20261117_210415` 实测 · **负例空转**）：
+    #    旧实现从**本轮真实产物**的 `llm_targets` 里挑一个买侧代码（`_pick_buy_side_code`）
+    #    ⇒ 本轮挑到 `515450`（`who=**bull**` ⇒ 权威层级 **0** = 观点层）
+    #    ⇒ 而闸门**按设计**不把「观点层的买」当成「TA 明确要买」（层级 0 ⇒ 不构成证据，
+    #      见 `find_ta_reject_mis_hits` 里 `if buy_rank <= 0: continue`）
+    #    ⇒ 变异后闸门仍然 PASS ⇒ **期望的 FAIL 没发生** ⇒ 负例自己先红（假红）。
+    #    ⇒ 修法：负例改用**自足夹具**（`_fixture_authoritative_buy_mis_hit`）：
+    #      合成一条**权威层买侧**证据（Trader 最终裁决 = 层级 40）+ 一条否决名单行
+    #      ⇒ **不依赖本轮真实产物** ⇒ 任何一轮都能真的转红（闸门一直有牙）。
+    #    ⚠️ 期望**不许**从「期望 FAIL」改成「期望 PASS」（那是把断言改弱）。
+    _mut_plan, _mut_md = _fixture_authoritative_buy_mis_hit(_clean_plan)
+    _mut_verdict = find_ta_reject_mis_hits(_mut_plan, _mut_md)
     _record(
         _mut_verdict.get("status") == "fail",
-        "G-TA1b 变异负例：把一个 llm_targets 买侧代码塞进 ta_screening.rejected"
-        " ⇒ 零误伤闸门必须 FAIL（否则闸门没牙）",
-        f"变异代码={_probe_buy_code}｜变异后判定={_mut_verdict.get('status')}（期望 fail）"
-        f"｜{_mut_verdict.get('detail', '')}",
+        "G-TA1b 变异负例（**自足夹具** · 不依赖本轮真实产物）：把一个**权威层买侧**代码"
+        "塞进 ta_screening.rejected ⇒ 零误伤闸门必须 FAIL（否则闸门没牙）",
+        f"变异代码={_FIXTURE_MIS_HIT_CODE}｜变异后判定={_mut_verdict.get('status')}"
+        f"（期望 fail）｜{_mut_verdict.get('detail', '')}",
+    )
+
+    # ---- G-TA1c 阳性对照：**观点层**（bull/多头，层级 0）的「买」**不构成**误伤 ----
+    # 🔴 2026-11-17（同上）：把 G-TA1b 的旧口径**正面钉死** ——
+    #    闸门只认「TA 明确要买」（层级 ≥ 否决层级），**观点层没有要买的约束力**
+    #    ⇒ 观点层买侧证据 + 否决名单 ⇒ 闸门必须 PASS（不许把「多层观点」误判成误伤）。
+    #    ⇒ 这条同时**防止**有人为了让 G-TA1b 转红而把层级 0 也算成证据（那会制造假红）。
+    _opin_plan = _inject_buy_side_target(_clean_plan, _FIXTURE_OPINION_CODE, who="bull")
+    _opin_plan = _inject_rejected_code(_opin_plan, _FIXTURE_OPINION_CODE)
+    _opin_verdict = find_ta_reject_mis_hits(_opin_plan, _decision_md_text)
+    _record(
+        _opin_verdict.get("status") == "pass",
+        "G-TA1c 阳性对照：**观点层**（bull，层级 0）的「买」不构成误伤"
+        " ⇒ 零误伤闸门必须 PASS（闸门不许把观点层误判成误伤）",
+        f"观点层代码={_FIXTURE_OPINION_CODE}｜判定={_opin_verdict.get('status')}"
+        f"（期望 pass）｜{_opin_verdict.get('detail', '')}",
     )
     # 还原计划件（后面的 N1~N6 会各自写自己的变异体）
     plan_path.write_text(json.dumps(baseline_plan, ensure_ascii=False, indent=2), encoding="utf-8")

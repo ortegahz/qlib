@@ -160,7 +160,12 @@ def _premium_stats(
         dates = sorted({str(d) for d in sub["数据日期"].dropna().unique()})
         out["spot_snapshot_date"] = dates[0] if len(dates) == 1 else dates
     field = sub["基金折价率"].to_numpy(dtype=float)
-    equity_mask = np.array([c not in money_market for c in sub["代码"]])
+    # 🔴 2026-11-18 续四：**dtype 必须钉成 bool**。
+    #    事故形态（实跑抓到的真崩）：候选池为空时 ``np.array([])`` 的 dtype 是 **float64**
+    #    ⇒ ``~equity_mask`` 抛 ``TypeError: ufunc 'invert' not supported``
+    #    ⇒ **急跌刹车日每日链直接崩**（候选池被刹车剔空 ⇒ 这里空数组 ⇒ 崩）。
+    #    ⇒ 空数组也必须是**布尔**数组 ⇒ ``~`` 才成立。
+    equity_mask = np.array([c not in money_market for c in sub["代码"]], dtype=bool)
     out["all"] = _stats(field)
     out["equity_only"] = _stats(field[equity_mask]) if equity_mask.any() else None
     out["money_market_only"] = _stats(field[~equity_mask]) if (~equity_mask).any() else None

@@ -485,6 +485,14 @@ def _recompute(
     #: ⇒ 两个阶段**共用** `min_trade_gate`（同一套阈值/分类/披露口径）。
     #:    判定金额口径 = **节点日价**（阶段 5 用的是信号日价）⇒ 两阶段可能不同
     #:    （价格跨过门槛）⇒ 各阶段各自如实披露，不互相覆盖。
+    #: 🔴 2026-11-17（真机 P12 红灯修）：阶段 6 的门槛**同样**受「生效权益上限」约束
+    #:    （上限从计划件的 `ta_screening.equity_cap_effective` 读 ⇒ 阶段 5/6 同一口径）。
+    _node_cap: float | None = None
+    try:
+        _scr = (plan or {}).get("ta_screening") or {}
+        _node_cap = float(_scr.get("equity_cap_effective") or _scr.get("equity_cap") or 0.0)
+    except (TypeError, ValueError):
+        _node_cap = None
     min_amount_gate = gate_mod.apply_min_trade_threshold(
         actions,
         total_assets=total_assets,
@@ -492,6 +500,7 @@ def _recompute(
         thresholds=min_amount_thresholds,
         enabled=min_amount_enabled,
         price_basis=f"{node_date} 收盘价（节点日价）",
+        equity_cap=_node_cap,
     )
 
     # ---- 🔴 2026-11-13 夜实测修（方案一 · 门槛后**重算**破单席标记）----
@@ -889,6 +898,19 @@ def _render_md(payload: dict) -> str:
             add("")
             add("🔴 **门槛与账户规模不匹配（数学死锁）**：本轮**所有**新开仓都被门槛拦下"
                 " ⇒ 以后**再也买不进任何新 ETF** ⇒ 必须下调「新开仓」门槛或提高账户规模。")
+        _ovr = _gate.get("risk_overrides") or []
+        if _ovr:
+            add("")
+            add(f"🔴 **风险硬约束优先于最低佣金门槛**：本轮有 **{len(_ovr)}** 笔减仓"
+                "因「拦下会破生效权益上限」而**未被门槛拦下**（照常执行）：")
+            add("")
+            for _o in _ovr:
+                add(f"- `{_o.get('code')}` {_o.get('name')}｜金额 "
+                    f"{float(_o.get('amount') or 0):.2f} 元 < 门槛 "
+                    f"{float(_o.get('threshold') or 0):.0f} 元｜执行后权益权重 "
+                    f"{float(_o.get('equity_weight_if_executed') or 0) * 100:.2f}%｜"
+                    f"拦下后 {float(_o.get('equity_weight_if_blocked') or 0) * 100:.2f}% "
+                    f"> 生效上限 {float(_o.get('equity_cap') or 0) * 100:.2f}%")
         _sk = _gate.get("skipped") or []
         if _sk:
             add("")

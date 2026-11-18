@@ -3410,3 +3410,831 @@ cd /tmp/pycharm_project_658d3fc4
 📏 规则：`rules.md §十四.106`（部分卖出）、`§十四.107`（闸门不许依赖 LLM 输出形状）、
 **`§十四.108`（执行层不许改写研究链股数决策 / 金额上限只约束建仓侧）**。
 
+
+## 2026-11-18 · 🔴 V2 优化收口：cadence 锁死 20 ＋ 换手惩罚封顶 ＋ 2019–2023 五折滚动前推选参 ＋ 日频防守接线 ＋ 旧 val 搜索离线重排（**未 commit**）
+
+> **触发**：用户 2026-11-18 目标文档「V2 这种按月（20 个交易日）对齐的训练方式明显更好，
+> 是绝对正确的演进方向……V2 亏钱的『锅』完全不在『按月训练』上，
+> 而在于下游 ETF 层把调仓周期拧成了『每 4 个半月才动一次』」。
+> 📏 铁律：`rules.md §十四.109`（本轮新增 ＋ §十四.110）。
+> 🗂 专题纪要：`manu/memory/etf_rotation_v2_walkforward_20261118.md`。
+
+【一、根因定位（病根在 **ETF 层**，不在「按月训练」；**不许退回 V1**）】
+- **S 层底座是强的**（20 日 RankIC **0.1271** / ICIR **1.105** / t=**9.04**）⇒ V2 路线保留。
+- 2026-11-17 夜班那次**冻结产物** = `cadence=90`（每 4 个半月才动一次）＋ `entry_ma=120`
+  ＋ `exit_ma=80` ＋ `hold_buffer=0` ⇒ 单盲组合 **−12.93% / 回撤 −54.93%**。
+- **为什么会选出 cadence=90**（本轮用离线重排**实测**确认，见【五】）：
+  ① **换手闸门「全超标」兜底**：240 个 trial **没有一个**换手 ≤ 4×（最低 5.305×）
+     ⇒ 触发旧兜底口径 `"min_turnover"` ⇒ **直接选换手最低者**（= cadence=90，
+     而该档 val 段只剩 **6 次调仓 < 门槛 12**，文件自带「样本不足」告警**仍被采用**）；
+  ② **目标函数惩罚无上限**：`score = 超额 − 0.05 × max(0, 换手 − 4)` ⇒ cadence=20
+     （实测换手 ≈ 12~15×）时惩罚恒 ≈ **0.42~0.55**，**完全压倒超额**（差异量级仅 0.05~0.20）
+     ⇒ 目标函数退化成「**最小化换手**」⇒ 独立地把 score 极值也推向 cadence=90。
+  ⇒ 两个**互相独立**的机制同时指向 cadence=90。
+- **为什么选参口径也错**：验证窗口只有 **2022–2023 两年（484 个交易日 ⇒ 月频仅 ~24 个调仓点）**
+  且是**单边熊市** ⇒「少动装死」天然占优 ⇒ 网格搜索必然选出蜗牛参数。
+
+【二、本轮落地的口径变更（**代码只改 host ⇒ `sync_to_server.sh` ⇒ md5 双侧比对**）】
+1. **cadence 锁死 = 20（严格月频）**：`config_v2.REBALANCE_CADENCE_GRID = (20,)`
+   （历史网格留档 `REBALANCE_CADENCE_GRID_LEGACY = (20,40,60,90)`）
+   ＋ `run_v2.assert_cadence_locked()`（冻结前**硬断言**，越界直接 raise ⇒ fail-closed）。
+2. **换手惩罚封顶**：`config_v2.turnover_penalty()` = `min(TURNOVER_PENALTY_CAP=0.02,
+   RATE×max(0, turn−4))` ⇒ **唯一实现**（`run_v2.py` 与滚动前推探针共用，不许另写一份）
+   ⇒ 惩罚回到「超额接近时的 tie-breaker」，**不再买断 alpha**（用户原话「时效性 > 换手率」）。
+3. **换手闸门兜底换口径**：`TURNOVER_GATE_ON_MISS = "best_score"`（按主目标挑），
+   旧口径 `"min_turnover"` 保留可切回**仅供审计对表**。
+4. **选参权威迁到 OOS**：5 折 expanding window（折 1 训练 2016~2018→验证 2019 … 折 5 → 2023），
+   `cadence=20` / `top_k=5` 焊死，只留**一维**自由度 `hold_buffer ∈ {2,3,5}`。
+5. **ETF 层行情面板口径**：封存面板起点 = 2020-01-02 ⇒ **折 1（2019）无行情 ⇒ 该折作废**
+   ⇒ 用**同口径（qfq）扩展段**把起点前推到 2018-01-02
+   （`manu/tools/fetch_etf_prices_ext.py --adjust qfq` ＋ 新增 `manu/tools/merge_etf_price_panels.py`）
+   ⇒ 拼接前**逐只比价**：重叠区 **73 只中位比值恰为 1.0**（零离散）⇒ 口径一致才准拼。
+   🔴 **踩坑留档**：早先一版扩展面板用 `adjust=""`（**不复权**）⇒ 296 只里 **84 只**与封存面板
+   中位比值 ≠ 1（0.309 / 0.358 / 3.0 / 5.0 / 6.0 = 分红 / 份额折算因子）⇒ **不可混用**。
+6. **新增冻结工具** `manu/tools/v2_freeze_from_walkforward.py`
+   ⇒ 产出 `frozen_params_wf.json`（0444 只读），**拒写**封存的 `frozen_params.json`
+   （它是一次性单盲登记 / 归因探针的指纹）。
+7. **ETF 层空面板守卫**：`etf_layer.py` 在 `px.loc[px.index <= day]` 后加 `if hist.empty: continue`
+   （面板起点之前的信号日整日跳过 ⇒ 不再 `IndexError`）。
+8. **新增离线重排工具** `manu/tools/v2_rerank_val_objective.py`（见【五】）。
+
+【三、日频防守归口（用户目标文档：「S 层管月频进攻，TA + 规则层管日频防守」）】
+| 机制 | 文档要求 | 审计前现状 | 本轮处置 |
+| --- | --- | --- | --- |
+| 急跌刹车 | 规则层能真触发 | 🔴 **每日链里不可达**：研究链有（`config.DRAWDOWN_BRAKE_THRESHOLD` → `analyze.py` / `recommend.py` 收 `--nav`/`--nav-peak` → `engine/portfolio.py` 的 `brake_mode` ⇒ 整个组合切防守资产），但**每日链从不传这两个参数** ⇒ `nav_state` 恒 `None` ⇒ `in_brake` 恒 `False` | ✅ 新增 `daily/nav_state.py`（净值 = 现金 + 持仓按 asof 收盘价重估；**峰值跨日持久化**）+ 每日链**真的传** `--nav`/`--nav-peak`；新增 `daily_config.DRAWDOWN_BRAKE_THRESHOLD=0.15` / `DRAWDOWN_BRAKE_ENABLED` / `NAV_STATE_FILE`；**跨链一致性断言**（研究链 `config.py` 直接 assert 两边同值） |
+| 宏观降仓 | 压到 **25%~35% 权益上限** | ⚠️ 机制在（`_EQUITY_CAP=0.80`，生效上限 = `min(0.80, TA_pct/100)`），但**区间不存在** ⇒ 生效值完全由当轮 LLM 说了算 | ✅ 新增 `config.MACRO_DERISK_EQUITY_CAP_MIN=0.25` / `MAX=0.35` / `MACRO_DERISK_BAND_ENABLED` ＋ `final_rebalance_plan._apply_macro_derisk_band()`：有 TA 压降建议 ⇒ 生效上限 = `min(base, ta_pct, 0.35)`（TA=36%⇒**0.35**、TA=50%⇒**0.35**、TA=20%⇒**0.20** 保留更严值、TA≥80%⇒**0.80** 带不参与）；披露块补 `macro_band_*` 五键 |
+| 均线破位止损 | 规则层执行 | ✅ **已落实**（非缺口）：**研究链计划层** `final_rebalance_plan.py:2969`（「已跌破 MA60 ⇒ 持仓强制退出（不看排名）」）＋ **引擎层** `engine/portfolio.py:255`（`exit_codes` ⇒ 本期无条件卖出）**两处都真的执行**；每日链那条 `_check_holding_discipline` 只是**观察态下的独立诊断环节**，按设计只披露 + 告警 + 人工确认（实盘副作用闸门 `--live-trade`），**不是**规则层止损的缺口 | 本轮**未改**（按设计；README 局限里已写明） |
+
+- 🔴 **口径提醒（如实披露，不美化）**：本账户**现金占比 77.8%** ⇒ **账户级**回撤会被现金摊薄
+  ⇒ 账户回撤 −15% 大致对应**权益仓位腰斩** ⇒ 刹车阈值沿用研究链的**账户级**语义
+  （`dd = nav/peak − 1`，**不改研究链口径**），权益口径回撤**另行披露**。
+- 🔴 **V2 ↔ 每日链仍无 seam**：`daily/` 里搜不到 `v2` / `frozen_params`
+  ⇒ 唯一接口是 S 层 CSV（`daily_config.STOCK_SCORES_CSV`）⇒ V2 仍是**研究/回测侧**产物。
+
+【四、5 折滚动前推实测（服务器 `<RESULTS_ROOT>/v2/_walkforward/`，日志 `_walkforward_ext.log`）】
+- **实际 OOS = 2019-01-01~2023-12-31，5/5 折评分，0 折作废，1209 个 OOS 交易日**。
+- **冠军 = `pure_E_native` + `hold_buffer=2` + 负分闸门 `off`**
+  （纯 E：alpha 权重 1.0 / 动量 0；臂 B 原生慢变量；**无 MA**；**同族上限关**）：
+
+| 指标 | 冠军（5 折 OOS） | 旧 V2 现状基线（`v2_frozen_ma120_80` b=2） |
+| --- | --- | --- |
+| 年化收益 | **+13.51%** | +5.87% |
+| 最大回撤 | **−32.29%** | −46.60% |
+| Sharpe | **0.641** | — |
+| 扣费后年化超额 | **+7.39%** | +0.16% |
+| 年化单边换手 | **14.10×** | 12.73× |
+| 成本拖累 | 4.43% | — |
+| ETF 层 20 日 RankIC | **0.0488**（ICIR 0.108 / t=0.795 / 54 截面） | 0.0293 |
+
+- 分折（年化 / 回撤 / 年化换手 / 调仓次数）：
+  2019 **+39.02%** / −14.84% / 6.10× / 24；2020 **+65.31%** / −16.90% / 13.67× / 25；
+  2021 **−8.14%** / −28.55% / 12.81× / 24；2022 +11.09% / −18.64% / 18.21× / 24；
+  2023 **−19.87%** / −22.86% / 19.73× / 24。
+- **三条对照结论（同一 24 组网格）**：
+  ① **现状参数（MA120/80 + A15 + 同族上限开）几乎没有超额（+0.16%）且回撤深一截（−46.60%）**
+     ⇒ 强印证「病根在 **ETF 层**，不在 S 层」；
+  ② **同族上限**吃掉超额：同参数开上限 +5.23% vs 关上限 +7.39% ⇒ 约 **2.2pp**；
+  ③ **动量权重有害**（`E_mom_native` 全线超额 ≤ +1.79%，最差 −2.41%）、
+     **负分空仓闸门一律变差**（同方案同缓冲带 +3.21% vs +7.39%）⇒ 本轮全关。
+- **Rank Buffer 降换手有效但有代价**：`hold_buffer` 2→3→5 ⇒ 换手 14.10→13.20→11.92×，
+  但超额 7.39→5.51→5.41%、回撤 −32.29%→−35.78%→−38.32% ⇒ **缓冲带换超额** ⇒ 本轮取 **2**。
+- ✅ **探针自证**：折 4 训练段与原 2016~2021 逐日相同 ⇒ S 层分数 **max|Δscore| = 0.0**
+  （116,537 行**逐位一致**）＋ 用冻结参数重建的**目标权重与封存 `blind_diagnostics.csv`
+  3 个调仓日逐日一致** ⇒ ✅；跑前跑后**已封存产物 md5 全部未变**
+  （封存 `frozen_params.json` mtime 仍 2026-11-18 00:58、`blind_diagnostics.csv` 00:59）。
+- ✅ **新冻结件** `<RESULTS_ROOT>/v2/frozen_params_wf.json`（md5 `e4b6db07e8e62b744cbd16a80655126c`，
+  **0444 只读**，冻结时间 11:05:53）⇒ 冠军 = `pure_E_native` / `hold_buffer=2` /
+  **cadence=20**（stride 2）/ `top_k=5`；`best_score = 0.053861 = 超额 0.073861 − 惩罚 0.02`
+  ⇒ **反向证明封顶惩罚确实生效**。
+  🔴 **封存的 `frozen_params.json` 未动**（工具层**拒写**该文件名）。
+  🔴 **2024–2026 单盲已消耗** ⇒ 本冻结件**不得**回头用它验收，只能作为下一轮（2027 起）候选。
+
+【五、🔴 离线重排：旧 val 搜索 240 trials 的根因实证 ＋ **一处处方修正**】
+工具：`manu/tools/v2_rerank_val_objective.py`（**只读**，不写结果目录、不碰封存件）；
+产物：`<RESULTS_ROOT>/v2/_rerank_val_objective/rerank_rootcause_val_search.json`
+（+ `rerank_cadence20_search.json`）。
+方法：用 trials 的**原始** `excess_vs_benchmark` / `annualized_turnover`（两者与目标函数无关）
+**离线重排**；**自证**：旧公式复算的 score 与落盘 score **逐条相等** ✅（口径没漂移）。
+- **根因文件 = `v2/val_search.json`**（2026-11-18 00:52 落盘，cadence 网格 {20,40,60,90}，240 trials）：
+  | 口径 | 胜者 | 超额 | 换手 | 惩罚 | score |
+  | --- | --- | --- | --- | --- | --- |
+  | 旧（惩罚无上限） | **cadence=90** | −1.15% | 5.40× | 0.0700 | −0.0815 |
+  | 新（惩罚封顶 0.02） | **cadence=40** | +7.88% | 9.52× | 0.0200 | +0.0588 |
+  ⇒ ✅ **佐证「无上限惩罚把目标函数推向最小换手」**（旧口径 score 极值 = cadence=90）。
+  ⇒ 🔴 **重要修正**：在这个 2 年单边熊市窗口上，**仅把惩罚封顶并不会选出 cadence=20**
+  （而是 cadence=40）⇒ **cadence=20 必须是先验硬约束**（`REBALANCE_CADENCE_GRID=(20,)` ＋
+  `assert_cadence_locked()`），**不是**指望目标函数自己搜出来。
+  ⇒ 另一条独立佐证：该窗口 cadence=20 的**最佳超额仅 +0.49%**（中位 **−2.95%**），
+  而 cadence=40 最佳 +7.88% ⇒ **单边熊市窗口本来就压不出月频的价值** ⇒ 处方第 2 部分
+  （换 2019–2023 滚动前推窗口）**是必需的，不是可选项**。
+- **对照文件 = `v2/_search_v2_candidate/val_search.json`**（2026-11-18 10:49 落盘，
+  cadence **已锁 20** 的重跑，240 trials）：新口径胜者 = **cadence=20 / `hold_buffer=2` /
+  `arm=A_half_life_20` / `top_k=5`**（超额 +3.14% / 换手 15.97×）
+  ⇒ 🔴 **两窗口独立收敛**：这个选择与滚动前推 OOS 冠军的 `hold_buffer=2` / `top_k=5`
+  **完全一致** ⇒ `hold_buffer=2` 这一维在两个互不重叠的窗口上同向。
+- ⚠️ **口径诚实披露**：两处**旧口径**落盘文件里 `objective` 字样仍写「− 0.05 × max(0, 换手 − 4.0)」
+  未标「封顶」；**封顶是 2026-11-18 代码层改的** ⇒ 老产物的字样**照实保留**（不许回改历史产物）。
+
+【六、验收（全绿，**服务器实跑**，主 agent 独立复核）】
+- `pytest manu/etf_rotation/tests -q` ⇒ **625 passed / 7 skipped**
+- `pytest manu/etf_rotation/daily/tests -q` ⇒ **224 passed**
+- `pytest manu/etf_rotation/v2/tests -q` ⇒ **379 passed**
+- ⇒ 合计 **1228 条测试全绿**（新增：cadence 锁死 / 惩罚封顶 / 宏观降仓带 / 急跌刹车净值状态
+  / 面板拼接比价 等专项）。
+- 资源纪律：host 只做编辑与轻量脚本；回测/探针**全部在服务器**（`OMP_NUM_THREADS=4`）；
+  起跑前读 `free -m` / `uptime` / `nproc` / `iostat` / `nvidia-smi`（服务器 load ≈ 13/80 核、
+  available ≈ 84GB ⇒ 🟢）；未 kill 任何他人进程、未改他人产物目录。
+- host 侧：`available ≈ 1.7 GB < 3 GB` ⇒ 按 `rules.md §十·7` **本轮不开子 agent**（全部主 agent 自做）。
+
+【七、🔴 遗留 / 缺口（如实披露，不掩盖）】
+1. **2024–2026 单盲已消耗** ⇒ 新候选**不能**回头用它验收（需新盲测窗口或用户显式授权解封）。
+2. **换手 14.10× 远超 4× 目标**：**结构性不可达**（cadence=20 下最低换手 ≈ 12.32×，
+   val 段 240 trial 最低 5.305× 出现在 **cadence=90**）⇒ 若坚持 4× 红线只能靠**拉长调仓周期**
+   —— 而那正是单盲亏钱的直接原因 ⇒ **不建议**，建议改口径为「月频下把换手当并列披露」。
+3. **ETF 层 RankIC 仅 0.0488（t=0.795，54 截面）** ⇒ ETF 层排序信号**统计上不显著**
+   ⇒ 超额更多来自「纯 E + 等权 + 月频」的**组合结构**，而非个股强信号的直接兑现。
+4. **V2 ↔ 每日链仍无 seam** ⇒ V2 仍是研究/回测侧产物（唯一接口 = S 层 CSV）。
+5. **涨跌停 / 停牌标记只覆盖 2020+** ⇒ 2018–2019 两年回测**没有**流动性约束 ⇒ 偏乐观。
+6. **拼接 OOS 年化按（净值点数−1）/250 计** ⇒ 5 年窗口记为约 4.84 年 ⇒ 年化略被高估；
+   **每折从空仓起算**（不跨折结转持仓）⇒ 折边界有轻微跳空。
+7. **本轮 V2 全部代码仍未 commit**（`manu/etf_rotation/v2/`、`manu/tools/v2_*.py` 均未跟踪；
+   `git status` 变更项众多）⇒ 按纪律**未擅自 commit / push**。
+8. **冻结件 `frozen_params_wf.json` 的 `selection.objective` 字样未标「封顶」**
+   （但同文件 `turnover_penalty_cap: 0.02` 与 `best_score` 可反证封顶生效）⇒ 未回改该产物。
+
+【八、产物清单（服务器 `<RESULTS_ROOT>/v2/`）】
+| 文件 | 说明 |
+| --- | --- |
+| `frozen_params_wf.json` | 🔴 新冻结件（0444；md5 `e4b6db07…`）＝ 下一轮候选 |
+| `frozen_params.json` | 🔴 封存件（单盲登记指纹；**未动**） |
+| `_walkforward/` | 5 折探针产物（`walkforward_summary.json` / `oos_grid.csv` / `per_fold.csv` / 5 折模型与分数） |
+| `_rerank_val_objective/` | 🔴 本轮新增：旧 val 搜索离线重排 JSON × 2 |
+| `_search_v2_candidate/` | 今日 cadence 已锁 20 的 val 重跑（240 trials） |
+| `V2_WALKFORWARD_REPORT_20261118.md` / `V2_CANDIDATE_PARAMS_20261118.json` | 验收报告 + 候选参数清单（含「未验收」声明） |
+| `V2_ATTRIBUTION_20261118.md` | 归因三步手术（上游） |
+
+## 2026-11-18 续 · 🔴 换手口径改版（单/双边并列披露 ＋ 废除 ≤4× 硬拦截）＋ V2 → 每日实盘链 seam 落地（**未 commit**）
+
+【一、🔴 换手口径的根子：代码一直是「双边」，全仓库却标成「单边」】
+- **发现**：V2 代码 `annualized_turnover` = `Σ|w_target − w_drifted|` = **总成交额 / 组合净值**
+  ⇒ 这是**双边**口径；而本仓库 Top-K 线的约定（`manu/memory/ashare_topk_20261104.md`
+  「单边换手定义」行 = `0.5 × Σ|Δw|`）说明 **Σ|Δw| 本身就是双边**。
+- ⇒ 🔴 **旧代码 / 旧报告 / 旧 memory 全部把「双边」标成了「单边」** ⇒ 数字被低估 2 倍。
+- ⇒ **换算**：五折 OOS 冠军年化 **双边 14.10×** ⇒ **单边 7.05×/年**；
+  按单边 6.5bp（佣金 1.5bp + 滑点 5bp）⇒ 年化成本拖累 **0.915%**
+  （= 14.10 × 6.5bp；与文档里的 0.92% 算术一致）。
+- ⇒ **代码落地**（`manu/etf_rotation/v2/`）：
+  | 符号 | 值 | 说明 |
+  | --- | --- | --- |
+  | `TURNOVER_CONVENTION` | `"two_way_sum_abs_dw"` | 口径自述 |
+  | `TURNOVER_ONE_WAY_FACTOR` | `0.5` | 双边 → 单边 |
+  | `one_way_turnover()` | 0.5× | **唯一实现**（非法输入 ⇒ 0.0，不编数字） |
+  | `TURNOVER_TARGET_MODE` | `"disclosure"` | 新默认口径 |
+  | `metrics.summarize()` | 新增 2 键 | `annualized_turnover_one_way` / `annualized_cost_drag` |
+
+【二、🔴 口径改版：废除月频策略的「≤ 4.0× 换手」硬拦截】
+- **用户拍板口径**（2026-11-18）：**`cadence = 20` 先验硬锁 ＋ `hold_buffer = 2`
+  ＋ 报告并列披露单/双边换手率**（不再用换手筛参数）。
+- **为什么这么改**（两条依据，都是实测不是拍脑袋）：
+  ① **4× 在月频下结构性不可达**：cadence=20 的 val 段 240 trial 最低换手 5.305×
+     （且出现在 cadence=90）⇒ 守 4× 只能靠**拉长调仓周期** ⇒ 那正是单盲亏钱的直接原因；
+  ② **成本可承受**：单边 7.05× ⇒ 年化成本拖累 **0.915%** ⇒ 相对 +7.39% 年化超额可忽略
+     ⇒ **为省 0.3% 手续费丢掉 7% 超额 = 本末倒置**。
+- **代码落地**：`check_turnover_target(mode=)` 新增 `"gate"` / `"disclosure"` 两模式；
+  `apply_turnover_gate(result, target, *, mode=)`；**函数默认仍是 `gate`**（既有调用方逐字不变，
+  仅供审计对表），**生产调用点显式传 `mode = C.TURNOVER_TARGET_MODE`** ⇒ 不许靠默认值吃口径。
+- 🔴 **披露 ≠ 达标**：`disclosure` 模式下 `ok` 仍**如实**反映是否达标，只是**不拦截**；
+  换手算不出来（缺失 / NaN）⇒ `ok = False`，**不许**当成达标；`blocking = False` 显式回传。
+- ⚠️ **行为变更披露**：`run_v2.py:1015` 走 disclosure ⇒ **下次**跑 val 段搜索时，
+  选出的 winner **可能与历史产物不同**（不再被换手过滤）；**历史产物一律不回改**。
+
+【三、🔴 V2 → 每日实盘链 seam：冻结件真的接进去了】
+- **新建 `manu/etf_rotation/daily/v2_frozen_params.py`**（287 行）：`FrozenV2Params` +
+  `parse_frozen_params()`（口径校验）＋ `load_frozen_params(required=)`（**fail-closed**）+
+  `etf_layer_args()`（CLI 翻译）＋ `disclosure()`（披露块）。
+  **口径校验会直接报错的五种情形**：冠军臂是 A 臂（半衰期不可复现）｜`neg_score_gate = True`
+  ｜`cadence ≠ 20`｜权重全 0｜字段缺失 ⇒ **不许降级回 V1**。
+- **接线**：`daily/daily_config.py` 新增 `V2_FROZEN_PARAMS_FILE`（默认
+  `<RESULTS_ROOT>/v2/frozen_params_wf.json`，env `ETF_ROTATION_V2_FROZEN_PARAMS`）、
+  `V2_FROZEN_PARAMS_ENABLED`、`V2_FROZEN_PARAMS_REQUIRED`（默认 1 = fail-closed）；
+  `daily/agents_rebalance.py` 的 analyze / recommend **共用同一组** `etf_args`，
+  并把冻结件披露写进 `run_path/v2_frozen_params.json` ＋ notes。
+- **镜像文件补参数**（🔴 成对改，两侧 md5 必须一致）：
+  `analyze.py` / `recommend.py` 加 `--target-n-holdings` / `--max-per-theme` /
+  `--alpha-weight` / `--momentum-weight` / `--hold-buffer`；
+  `engine/portfolio.py` 的 `build_portfolio()` 加 `n_target` / `max_per_theme`
+  （`max_per_theme = 0` ⇒ 不限；`THEME_CAP_UNLIMITED = 10**6`）。
+- **接缝实测**（服务器实跑，快照 `20261117_221846`，asof 2026-11-17）：
+  | 项 | A（V1 口径） | B（V2 冻结件口径） |
+  | --- | --- | --- |
+  | 排序依据 | EWMA 平滑分（α=0.2，窗口 5） | **瞬态分（平滑已关闭）** |
+  | alpha / momentum | 0.5 / 0.5 | **1.0 / 0.0** |
+  | hold_buffer / MA入 / MA出 | 2 / 60 / 60 | **2 / 0 / 0** |
+  | max_per_theme（生效值） | 1 | **0（不限）** |
+  | 分析层买入 | 159207, 159263, 515450, 515650 | **159263, 159307, 515180, 515450, 563020** |
+  | 分析层卖出 | 512800 | 512800 |
+  | 规则层目标（5 只，各 0.16） | 159207, 159263, **515020**, 515450, 515650 | **159263, 159307, 515180, 515450, 563020** |
+  | `nav_state` | nav 30.03557 / peak 30.03557 / in_brake false | 同左 |
+  ⇒ **接缝真的切过去了**（两档决策不同）；两档都是 5 只 × 0.16 = 80% 权益；
+  ⇒ `nav_state` 两档都非空 ⇒ 急跌刹车**可触发**（不再形同虚设）。
+- **一致性校验 13/13 全绿**（`v2_seam_e2e_probe.py` 落盘 JSON 的「生效参数」逐项 == 冻结件期望值）：
+  alpha / momentum / hold_buffer / target_n_holdings / entry_ma / exit_ma / max_per_theme /
+  smoothing_enabled / 规则层目标只数(=top_k) / nav_state 非空 / 阶段 5 rc / 阶段 5 权重口径 /
+  TA 降仓带生效上限 ⇒ 探针 **rc = 0**。
+- **阶段 5 联调（新增，2026-11-18 续）**：探针把每日链**阶段 5**（`final_rebalance_plan.py` ＝ 规则层对账 ＋ **TA 宏观降仓带** ＋ 权益上限带）也拉进来跑，
+  两档 `rc=0`：
+  | 项 | A(V1 口径) | B(V2 冻结件口径) |
+  | --- | --- | --- |
+  | 阶段 5 `meta.weights_used` | alpha 0.5 / momentum 0.5 | **alpha 1.0 / momentum 0.0** |
+  | 权益上限 base → TA → 生效 | 0.8 → 0.25 → **0.25** | 0.8 → 0.25 → **0.25** |
+  | 权益上限带硬顶（`MACRO_DERISK_EQUITY_CAP_MAX`） | 0.35 | 0.35 |
+  ⇒ **V2 冻结件真的穿过阶段 3/4 到达阶段 5**（阶段 5 的权重口径就是 V2 的 alpha/momentum）；
+  ⇒ **降仓带与接缝正交**（两档生效上限完全相同 ⇒ 接缝不污染防守层）。
+- 🔴 **阶段 5 的口径边界（必须如实披露，不许夸大）**：阶段 5 的**最终名单 =
+  规则层候选池 × TradingAgents 决策件**；本探针复用的是**快照里 2026-11-17 那份既有决策件**
+  （它是在 V1 口径下生成的）⇒ **阶段 5 的名单不是干净的 V2 端到端**
+  （实测 B 档 563020 被 LLM 判卖 → 换成 159207）。
+  ⇒ 本探针证明的是「**冻结件口径真的穿到阶段 5**」（权重口径 / 候选池 / 降仓带）；
+  ⇒ **下一次真实调仓日**，决策件会**基于 V2 报告重新生成** ⇒ 才是真正的 V2 端到端。
+- **探针抓出并已修的两个真缺陷**（都不是「看代码看不出来」的）：
+  ① `recommend.py` 缺 `--alpha-weight / --momentum-weight / --hold-buffer` ⇒ 接缝会让**规则层 rc = 2**；
+  ② `analyze.py` 的 `params` dict 有**重复键 `max_per_theme`**（后者静默覆盖前者）
+  ⇒ 落盘值 ≠ 生效值 ⇒ 已修 ＋ 加**AST 重复键守卫**测试。
+
+【四、🔴 已知不等价（如实披露，不许当"V2 结论搬进实盘"）】
+- **同族处理不同**：V2 冠军臂**关**同族上限；每日链**保留**同族去重 / 替换
+  ⇒ 实测 A 档把 512800（银行ETF华宝）换成 **515020**（银行ETF华夏，同族），B 档则直接换成 515180 / 563020。
+- **每日链还有 V2 没有的硬约束**：TA 否决、最小交易额、现金下限、均线破位退出、实盘副作用闸门。
+- ⇒ 接缝的目标是「**让每日链用上 V2 的冠军口径**」，**不是**「把 V2 结论逐位搬进实盘」。
+
+【五、✅ 验收（服务器实跑，主 agent 独立复核）】
+- `pytest manu/etf_rotation/tests manu/etf_rotation/daily/tests manu/etf_rotation/v2/tests -q`
+  ⇒ **1264 passed / 7 skipped**（= 625 + 243 + 396；基线 1228 + seam 19 + 换手口径 17）。
+- **换手口径新测试**：`v2/tests/test_turnover_convention_and_target_mode.py`（17 条），
+  含**变异反证**（把 disclosure 分支改回旧过滤逻辑 ⇒ 高分 trial 必须重新落选，锚点唯一）。
+- **seam 新测试**：`daily/tests/test_v2_frozen_params_seam.py`（19 条），
+  含**变异反证**（改宽 `LOCKED_CADENCE` ⇒ 必须放行 90；放开 `SUPPORTED_SMOOTHING_ARMS` ⇒ 必须放过 A 臂）。
+- **md5 双侧比对**：`manu/etf_rotation/{daily,v2,engine,analyze.py,recommend.py,config.py}`
+  ＋ `manu/tools/v2_*.py` **全部一致**（`bash manu/tools/sync_to_server.sh --check` 全绿）。
+- **封存件未动**：`frozen_params.json`（md5 `1508bf0f…`）与 `frozen_params_wf.json`
+  （md5 `e4b6db07…`，0444）**均未修改**。
+- **资源纪律**：host `uptime` load 1.38 / `free -m` available 5467MB ⇒ 🟡 ⇒ 子 agent 并发上限 1；
+  服务器 available 82487MB / 128545MB、load 9.58/80 ⇒ 🟢 ⇒ 只跑 pytest 与只读探针，**未起任何训练/回测/下载**。
+
+【六、🔴 遗留 / 缺口（如实披露）】
+1. **2024–2026 单盲已消耗** ⇒ 新候选**不能**回头用它验收（需新盲测窗口或用户显式授权解封）。
+2. **ETF 层 RankIC 仅 0.0488（t = 0.795）** ⇒ ETF 层排序信号**统计上不显著**
+   ⇒ 超额更多来自「纯 E + 等权 + 月频」的**组合结构**；Top-K 截断精度 ≠ 全池 RankIC。
+3. **V2 ↔ 每日链非逐位等价**（见【四】）⇒ 不可把每日链结果当 V2 回测结果的复现。
+4. **host 的 `manu/daily/` 是未跟踪过期副本**（连 `nav_state.py` 都没有）⇒ **活链只有 `manu/etf_rotation/daily/`**。
+5. **本轮代码全部未 commit / 未 push**（用户 2026-11-18 明确「手动做」）⇒ HEAD 仍是 `1c4f28a1`。
+6. `manu/tools/v2_val_attribution_probe.py` / `v2_val_cadence_probe.py` / `gen_v2_scorecard.py`
+   仍按**各自**的旧 `TURNOVER_TARGET` 逻辑披露/过滤（不在本轮清单内）⇒ 若要统一口径是下一轮的活。
+
+## 2026-11-18 续二 · 🔴 换手口径改版的**全仓收敛**（第二份惩罚实现 ＋ objective 描述串漂移 ＋ 单边 NaN 口径）＋ **全仓口径守卫测试**（**未 commit**）
+
+【一、🔴 审计发现：上一轮的「废除硬拦截」只改了**闸门**，漏了**目标函数**】
+- **事故实例**：`manu/tools/v2_val_ma_sweep.py` 的 trial `score` 用的是**未封顶**的本地惩罚
+  （`0.05 * max(0, turn − 4.0)`）⇒ cadence=20 时惩罚恒 ≈ **0.416**，**压倒**超额（~0.1）
+  ⇒ 即便 `apply_turnover_gate` 已改成 `mode="disclosure"`（不再用换手过滤候选），
+  **winner 仍按被污染的 `score` 挑** ⇒ 硬拦截虽废，**换手仍在暗处主导选参**。
+- ⇒ 教训固化成铁律：「**闸门改成只披露 ≠ 目标函数干净**」⇒
+  **闸门（gate）× 目标函数惩罚（penalty）× 落盘披露（disclosure）三者必须一起审**。
+
+【二、✅ 本轮改动（口径全仓收敛，7 个文件）】
+| 文件 | 改了什么 | 为什么 |
+| --- | --- | --- |
+| `v2/config_v2.py` | 新增 `OBJECTIVE_DESCRIPTION`（**目标函数描述串的唯一事实源**） | 同一句 objective 历史上在 3 个文件各写一遍 ⇒ 漏改 ⇒ 产物说假话 |
+| `v2/run_v2.py` | objective 落盘加 `annualized_turnover_one_way`；描述串改引用唯一事实源 | 落盘单/双边并列披露 |
+| `v2/backtest_v2.py` | 结果 dict 加单边键；**双边 NaN ⇒ 单边也是 NaN** | 不许 NaN 与 0.0 混搭（否则读者误读成「换手为零」） |
+| `tools/v2_val_ma_sweep.py` | 未封顶本地惩罚 ⇒ 改调 `C.turnover_penalty()`；落盘加单边键 | 上面那条真缺陷 |
+| `tools/v2_walkforward_probe.py` | 4 处落盘点加单边键；描述串收敛 | 产物并列披露 |
+| `tools/v2_val_attribution_probe.py` | 5 处落盘点加单边键；`turnover_ok` 补注「**只是披露标记，不是过滤器**」 | 避免被误读成硬闸门 |
+| `tools/v2_val_cadence_probe.py` | 落盘点加单边键（CSV fallback 字段同步）；**排序/统计逻辑一字未改** | 诊断工具只加披露 |
+| `tools/gen_v2_scorecard.py` | 三臂表拆「双边/单边」两列；V1↔V2 表拆两行（V1 只记了**单边** 16.57 ⇒ 该行不适用）；加脚注；「换手目标 ≤4×」改「**换手披露基准**」 | 原来把 **V1 单边**与 **V2 双边**放同一列 ⇒ **口径错标** |
+
+【三、🛡️ 新增「全仓口径守卫测试」（11 条）——把口径纪律变成**可执行断言**】
+- 文件：`manu/etf_rotation/v2/tests/test_turnover_convention_repo_guard.py`
+- 四类规则 + 自证：
+  ① **无第二份换手惩罚实现**（AST 判 `TURNOVER_PENALTY_RATE *` / `0.05 * max(...)`）
+  ② **每个 `apply_turnover_gate(` 调用点必传 `mode=`**（默认值 = 旧硬闸门）
+  ③ **落盘方必并列单边**（**同一个 dict** 里 ⇒ 比「文件里出现过」更强）
+  ④ **报告出口必并列单双边**（`report.py` + `v2_render_walkforward_report.py`）
+  ⑤ **objective 描述串必来自唯一事实源**（任何字符串字面量 ⇒ 违规）
+  ⑥ **双边/单边口径一致**（单边 = 0.5 × 双边；**双边 NaN ⇒ 单边 NaN**；跨层一致）
+  ＋ **2 条守卫自证**（变异反证：坏代码必被抓、好代码不许误报）。
+- 🔴 守卫用 **AST** 判定（不是正则）⇒ 注释 / docstring 里引用旧公式**不算违规**。
+
+【四、🔴 守卫自己抓到的东西（证明它有牙）】
+- 起跑时守卫是**红**的，真实抓到：`v2_val_ma_sweep.py:118` 的未封顶惩罚、
+  以及 16 处「落双边却没落单边」的落盘点 ⇒ 修完转绿。
+- 🔴 一处**误报**也抓到并精修：`metrics.check_turnover_target` 的返回值是「**裁决**」
+  （`{"ok","annualized_turnover","target","message"}`）不是换手记录 ⇒ 已做**窄豁免**
+  （只豁免该函数 ⇒ `metrics.summarize()` 仍受守卫）。
+
+【五、✅ 验收（服务器实跑，主 agent 独立复核）】
+- `pytest manu/etf_rotation/tests manu/etf_rotation/daily/tests manu/etf_rotation/v2/tests -q`
+  ⇒ **1275 passed / 7 skipped**（1228 基线 → 1264（seam 19 + 口径 17）→ **1275**（守卫 11））。
+- **接缝探针重跑仍 13/13 PASS、rc=0**（口径全仓收敛**没有**影响 seam 的生效参数）。
+- md5 双侧比对：`manu/etf_rotation/v2`（53 文件）+ 5 个工具 **全部一致**。
+- **封存件未动**：`frozen_params.json` md5 `1508bf0f…`；`frozen_params_wf.json` md5 `e4b6db07…`（0444）。
+- 资源纪律：服务器 `MemAvailable 63155MB/128545MB`（49%）、`load1 22.00/80`（0.28×nproc）、
+  `iostat %util 0.00` ⇒ 🟢；`OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS=4` 全设。
+
+【六、🔴 遗留（如实披露，不掩盖）】
+1. 🔴 **历史产物仍是旧口径下的结果**：`val_ma_sweep.json` / `walkforward_summary.json` /
+   `probe_turnover_table.csv` / `probe_attribution/*` / `frozen_params*.json`
+   ⇒ 其中的 `score` 是被**无上限惩罚**污染过的值；新字段 `annualized_turnover_one_way`
+   **只在下次重跑后**才会出现在这些产物里。⇒ 本轮**未重跑**任何搜索/回测
+   （重跑会改选参结论 ⇒ 超出「改口径」范围，须用户授权）。
+2. 🔴 **`frozen_params_wf.json` 的 `selection.objective` 仍是旧措辞** ⇒ 按
+   `rules.md §十四.110 第 7 条`（**旧产物的口径字样照实保留，不回改**）**未回改该产物**；
+   修正只写进 memory 与本铁律 ⇒ 读该文件时须知：`turnover_penalty_cap: 0.02` 才是生效值。
+3. `frozen_params_wf.json` 的 `selection.oos_metrics.annualized_turnover = 14.1002`
+   = **双边**（**单边 = 7.0501**）⇒ 该文件里这个数**没有标签** ⇒ 读它必须按双边理解。
+4. `backtest_v2.run_backtest_v2` 硬性要求 **≥2 个交易日** ⇒ 它的 NaN 分支在**公开 API 不可达**
+   （纯防御分支）⇒ NaN 一致性在 `metrics.summarize` 层测（可达 ＋ 更根本）。
+5. **2024–2026 单盲已消耗**；ETF RankIC 0.0488（t=0.795）不显著；
+   **V2 ↔ 每日链非逐位等价**（同族去重差异）；host `manu/daily/` 是过期副本。
+6. **本轮仍未 commit / push**（用户手动做）⇒ HEAD 仍是 `1c4f28a1`。
+
+## 2026-11-18 续三 · 🔴 每日链**真实入口首次实跑** ＋ **两链同源**钉死 ＋ **V1 baseline 换手口径正名**（**未 commit**）
+
+【一、🔴 上一轮的唯一未闭合缺口：**每日链真实入口从未实跑**
+- 上一轮只做了「单测 + 接缝探针」⇒ **「V2 冠军参数到底进没进每日链」始终没有真实证据**。
+- 本轮实跑 `manu/etf_rotation/daily/main.py`（**观察态**：`--dry-run --skip-fetch --skip-llm
+  --no-email --no-increment --no-refresh-scores --no-update-qlib-bin`）。
+- 🔴 **第一次跑（asof=20261117）直接被 fail-closed 挡下**：`--asof` 格式必须是 `YYYY-MM-DD`
+  （`20261117` 被 `calendar_gate` 拒）；改格式后又被 `analyze.py::_data_freshness_guard` 挡下
+  （行情只到 **2026-11-10**，落后信号日 7 天 ⇒ 拒绝出报告）⇒ **真实入口的守卫真的会挡**。
+- ✅ **第二次跑（asof=2026-11-10，数据覆盖的交易日）全链跑通**（53.3 秒）：
+  快照 `snapshots/20261118_121449`；stages = calendar_gate/analyze/recommend/ta_context/
+  **final_plan**/node_reprice/execution_card **全部 ok**（tradingagents=absent，因 `--skip-llm`）。
+- 🔴 **落盘生效值核对**（不是只看「参数传进去了」）：`etf_analysis_report.json` 里
+  `alpha_weight=1.0` / `momentum_weight=0.0` / `hold_buffer=2` / `entry_ma_window=0` /
+  `exit_ma_window=0` / `max_per_theme=0` / `score_smoothing_enabled=false`
+  ⇒ **V2 冠军口径真的进了每日链**；快照里 `v2_frozen_params.json` 落着冻结件
+  md5 `e4b6db07…`（封存件本身未动）。
+
+【二、🔴 新发现的真缺陷：**分析链与规则层可能「两链分叉」**
+- 旧写法：`etf_args if etf_args is not None else <V1 老参数>` ⇒ 任何**漏传**都会**静默**回落 V1
+  ⇒ 分析链用 V2 参数、规则层用 V1 参数（历史上真出过「规则层无平滑 vs 交付层有平滑」）。
+- ⇒ 改 **fail-closed**：`agents_rebalance._resolve_rules_etf_args()`（接缝开着 + 漏传 ⇒ 抛异常）。
+- 🛡️ **两道守卫**（`daily/tests/test_v2_frozen_params_seam.py`，19 → **24** 条）：
+  ① **运行时**：真跑 `run_pipeline`，抓 `analyze.py` 与 `recommend.py` 的命令行
+  ⇒ ETF 段**逐字相同** ＋ 值 = 冻结件冠军口径（alpha 1 / momentum 0 / buffer 2 / MA 0/0 /
+  `--no-smoothing` ＋ **不许**再出现 V1 的 `--smoothing-*`）；
+  ② **AST**：`run_pipeline` 里 `etf_args` 必须来自 `_etf_layer_args()`，
+  规则层调用必须显式传 `etf_args=etf_args`。
+
+【三、🔴 独立审计（reviewer 子 agent）抓出的**口径正名**缺陷（本轮已改）**
+- 🔴 **V1 baseline 的 16.57× 是「双边」，历史上被错标成「单边」**：
+  `backtest.py` 的 `turnover = Σ|w_new − w_prev|` = **Σ|Δw| = 双边**（= 总成交额/净值；
+  本仓 Top-K 线同源约定 **单边 = 0.5 × 双边**）⇒ 它被装进键名 `annualized_one_way_turnover`
+  ⇒ **键名错标**；算术自证：16.568 × 6.5bp × 2.716 年 ≈ **2.93%** = V1 记录的成本拖累 ✓。
+  ⇒ 后果：记分卡曾显示「V2 单边 7.05× vs V1 单边 16.57×」⇒ 看起来换手降 57%，
+  **同双边口径实际只降 15%**（14.10 vs 16.57；V1 真单边 = **8.28×**）。
+- ⇒ 正名（**数值一个没改**）：`config_v2.V1_BASELINE` 用 `annualized_turnover_two_way`
+  ＋ `annualized_turnover_one_way`（走唯一实现 `one_way_turnover()`）；
+  V1 链 `cost_assumption` 同 dict 并列落双/单边（旧键保留仅为兼容）；
+  `analyze.py` / `build_ta_context.py` / `summarize_etf_grid.py` / 两个 probe 的**标签与键**同步正名。
+- 🔴 **换手不得参与选参**：`v2_val_attribution_probe.py` 的 Step 3 曾用 `turnover_ok`
+  **前置过滤** Step-2 行 ⇒ 换手仍在**暗处**参与选参 ⇒ 已改为「全部行里按超额取最大」，
+  `turnover_ok` 只留作披露标记。
+- 🔴 **表头必须带口径**：报告/工具的表格里凡「换手」列必须标**双边/单边**
+  （正文散文不算；守卫用 AST 取表格语境，不误报）。
+
+【四、✅ 落盘产物重出（口径更正，**数字未变**）】
+- `V2_WALKFORWARD_REPORT_20261118.md`：**重出**（原来把双边 14.10× 写成「单边」）
+  ⇒ 现为「年化换手（双边）14.10× /（单边）7.05×」，网格全表 9 → **10 列**（补单边列）。
+- `V2_CANDIDATE_PARAMS_20261118.json`：**重出** ⇒ `oos_metrics` 同 dict 并列
+  `annualized_turnover`（双边）+ `annualized_turnover_one_way`（7.0501）+ `turnover_convention`。
+- `v2_scorecard.md`：**重出** ⇒ V1 对照行改成「**双边** 16.57× / **单边** 8.28×」。
+- 🔴 **口径披露行的真实覆盖面（本轮更正 reviewer 指出的过度陈述）**：**两份 md**
+  （walkforward 报告 / 成绩单）补了「口径披露」行；🔴 **JSON（候选清单）当时并**没有**披露行**
+  ⇒ **续四才补上**（披露 8 → **9** 条）⇒ 「三份都补了」是**过度陈述**，此处更正。
+- 🔴 三份产物里的 `objective` 串仍是**改版前**的旧公式
+  （换手惩罚未封顶、4.0 还是硬红线）⇒ **选参 score 被旧惩罚污染**（指标数字不受影响，
+  **排序口径已变**）⇒ 重跑后才有可比的新 `score`。
+
+【五、🛡️ 守卫测试扩到 **17 条**（`v2/tests/test_turnover_convention_repo_guard.py`）
+- 新增：⑦ V1 baseline 必须按双边正名 ＋ 并列单边（单边必须 = `one_way_turnover(双边)`）
+  ｜⑧ V1 回测链 `cost_assumption` 必须同 dict 并列双/单边 ＋ **镜像文件逐字一致**
+  ｜⑨ `turnover_ok` **不许**出现在选参过滤条件里（AST 查 ListComp generator）
+  ｜⑩ `check_turnover_target` 调用点必须显式传 `mode=`（默认值 = 旧硬闸门语义）
+  ｜⑪ 换手**表头/单元格**必须标明单边或双边（AST 取表格语境；散文不误报）。
+- 🔴 **两条守卫做了变异反证**（改坏必转红）：表头去标签 ⇒ 抓到 2 处；
+  选参过滤加回 `turnover_ok` ⇒ 抓到 1 处。
+  🔴 **口径更正**：此处**当时只是一次性手工验证**（**不是常驻用例**）⇒ **续四已固化为常驻
+  pytest 用例**（⑨⑪⑫ 阳性 **15** / 阴性 **10**）。
+
+【六、✅ 验收（服务器实跑，主 agent 独立复核）】
+- **pytest**：`manu/etf_rotation/tests` + `daily/tests` + `v2/tests`
+  ⇒ **1286 passed / 7 skipped / 0 failed**（1228 → 1264 → 1275 → **1286**）。
+- **接缝探针**（`manu/tools/v2_seam_e2e_probe.py`，快照 `20261117_221846`，asof 2026-11-17）
+  ⇒ **13 PASS / 0 FAIL**（A_v1 档与 B_frozen 档都跑完阶段 3/4/5）。
+- **每日链真实入口**：`daily/main.py --asof 2026-11-10`（观察态）⇒ **58.1 秒全链 ok**
+  （🔴 **第二次重跑**；**首次跑 53.3 秒** ⇒ **两次不同的跑**，耗时不同，**非同一次**）；
+  落盘生效值核对 = `alpha 1.0 / momentum 0.0 / buffer 2 / MA 0/0 / max_per_theme 0 / 平滑关`；
+  报告里新标签落地：「年化换手（**双边** Σ|Δw|）16.57×（成本拖累 **2.92%**）」
+  ＋「年化换手（**单边** = 双边 × 0.5）**8.28×**」
+  ⇒ 🔴 **成本拖累 2.92% 与算术自证 2.93% 吻合** ⇒ 「16.57 是双边」得到**独立印证**。
+- **md5 双侧比对**：`manu/` 全量 ⇒ **两侧同名却内容不同 = 0 条**（28 条差异全是 host 独有：
+  `manu/daily/` 过期副本 + `_backup_*` + `HANDOFF`）。
+- **memory 三闸门**：`sync_slim_memory.py` / `--check` / `check_memory_tables.py` ⇒ **rc=0**
+  （主档 / 速览 / 铁律 三档行数自动标注；表块缺陷 0）。
+- **封存件未动**：`frozen_params.json` md5 `1508bf0f…`｜`frozen_params_wf.json` md5 `e4b6db07…`（0444）。
+
+【七、🔴 遗留（如实披露，不掩盖）】
+1. 🔴 **V1 报告的**标签**改动 ⇒ 报告 md 字节变 ⇒ `ta_context_meta.json` 的
+   `report_md_sha1` 与新报告不符 ⇒ **旧快照的 TA 上下文/决策件不再被复用**（设计上的 fail-closed）
+   ⇒ 下一次真实调仓日会重新生成上下文与决策件，**不影响当天决策**。
+2. 🔴 **历史产物仍是旧口径结果**：`val_ma_sweep.json` / `walkforward_summary.json` /
+   `probe_attribution/*` / `frozen_params*.json` 里的 `score` 被无上限惩罚污染
+   ⇒ 本轮**未重跑**任何搜索/回测（超出授权）⇒ 新字段只在**下次重跑**后出现。
+3. 🔴 **`v2_val_attribution_probe` 的产物（`V2_ATTRIBUTION_20261118.md`）也待重跑**
+   （选参规则已改 ⇒ 基准档位可能变 ⇒ 但重跑 = 重活，未授权）。
+4. 🔴 **`frozen_params_wf.json` 的 `selection.objective` 仍旧措辞** ⇒ 按「旧产物不回改」**未动**；
+   该文件 `annualized_turnover=14.1002` 是**双边**（单边 7.0501，**无标签**）。
+5. 🔴 **2024–2026 单盲已消耗**；ETF RankIC 0.0488（t=0.795）不显著；
+   **V2 ↔ 每日链非逐位等价**（每日链保留同族去重）；host `manu/daily/` 是过期副本。
+6. 🔴 **本轮仍未 commit / push**（用户手动做）⇒ HEAD 仍是 `1c4f28a1`。
+
+
+### 2026-11-18 续四 · 独立 reviewer 收口 ＋ **急跌刹车的链级证据** ＋ 三个真缺陷 ＋ 守卫 **25** 条（**未 commit**）
+
+【一、✅ 独立 reviewer 审计收口（2 BLOCKING ＋ 9 IMPORTANT ＋ 6 NIT —— 全部处置）】
+- **B1（测试污染生产状态文件）**：`daily/tests/test_v2_frozen_params_seam.py` 的
+  `_capture_pipeline_etf_args` 加 `monkeypatch.setattr(DC, "NAV_STATE_FILE", tmp_path / "nav_history.json")`
+  ⇒ 测试不再写生产的刹车状态文件。
+- **B2 ＋ I1/I2/I3/I4 ＋ NIT3/NIT5（口径唯一实现 ＋ NaN 语义 ＋ 假话 objective ＋ 镜像过期）**：
+  ① `v2/config_v2.py::one_way_turnover`：**非法 / 非有限 / `None`** ⇒ **返回 NaN**（原 `0.0`），
+     **有限输入逐位不变**（14.100247974306782→7.050123987153391；16.568483→8.2842415）；
+  ② `build_ta_context.py` / `probe_cluster_regression.py` / `summarize_etf_grid.py` /
+     `v2_render_walkforward_report.py`：去掉手写 `* 0.5` 与 `dict.get` **急切求值 KeyError** 坑
+     ⇒ 改**逐级判空** ＋ **唯一实现**；**缺失 ⇒ `None`**（不再当 `0.0`）；
+  ③ `analyze.py`（＋镜像 `manu/analyze.py`）派生摘要**删掉错标旧键** `annualized_one_way_turnover`；
+  ④ `v2_make_candidate_params.py`：**objective 原文一字不改**，改为**追加第 9 条披露**
+     （旧公式未封顶 / 4.0 曾是硬红线 ⇒ 与现行 `run_v2` **不同口径** ⇒ score 被污染）；
+  ⑤ `gen_v2_scorecard.py` 硬编码路径改 `ETF_ROTATION_REPO_ROOT` 优先；
+  ⑥ `v2/metrics.py:532` `float(C.TURNOVER_ONE_WAY_FACTOR) * value` ⇒ `C.one_way_turnover(value)`；
+  ⑦ `manu/probes/probe_refresh_integrity.py` 镜像同步（原来过期、含 3.10 SyntaxError 写法）；
+  ⑧ `experiments/ashare_topk_selection/turnover_analysis.py` 的 `0.5 * Σ|Δw|`（**定义式出处**）
+     改用**本线常量** `ONE_WAY_TURNOVER_FACTOR`（**不是字面量乘法** ⇒ 不触发守卫⑫）。
+
+【二、🔴 急跌刹车的两个真缺陷（C 档实跑抓出）】
+- **A：急跌日 `analyze.py` 整轮崩** —— `microstructure._premium_stats` 里 `np.array([...])`
+  空数组 **dtype=float64** ⇒ `~equity_mask` 抛 `TypeError: ufunc 'invert' not supported`
+  ⇒ 已修：`np.array([...], dtype=bool)`。
+- **B：急跌退化成「清仓 100% 现金」而非「切防守资产」** —— `POOL_MODE="e_covered"` ＋
+  `POOL_ALLOW_DEFENSIVE_BYPASS=False` 把**无 A 股穿透**的黄金/国债/货币 ETF **全剔光**
+  ⇒ 刹车过滤**无货可留** ⇒ 入选 `[]`。
+  ⇒ 已修：`engine/portfolio.py` 把 `brake_mode` **提前计算**，池过滤改成
+  `keep_mask = coverage_ok | is_defensive`（**仅在刹车档**）；`analyze.py::_rebuild_chain` 同改
+  （否则**重放不一致** ⇒ 拒绝出报告）；**正常档一字不改**。
+- 🔴 **数值影响已核实**：V1 基线产物 `etf_rotation_backtest_v4_prefer1.json` **刹车事件数 = 0**
+  ⇒ **基线数字不变**；`etf_rotation_backtest_base/stress.json`（**各 5 次刹车**）
+  **若重跑会变** ⇒ **已披露、本轮未重跑**。
+- 🛡️ **新守卫** `daily/tests/test_nav_state_brake.py`（该文件**共 13 条**，其中**刹车守卫新增 3 条**）：
+  刹车⇒**只选防守且非空**｜对照组权益照常入选｜**变异反证**（服务器上临时去掉 `or brake_mode`
+  ⇒ **实测转红**，随后恢复；🔴 **恢复后核对的是源码文件** `engine/portfolio.py`
+  md5 `c17636f4152b7d0dadf0824e9ae85a73`（`manu/engine/` 与 `manu/etf_rotation/engine/` **两份一致**）。
+
+【三、🔴 急跌刹车的链级证据（C 臂重跑 19/19 全绿）】
+- 🔴 **「接线证据」≠「链级证据」**：本轮补**目标场景档（C）＋ 对照档（B）**，成对跑完整条链。
+- **C 档断言全绿**（`seam_e2e_20261118_C2.json`）：
+  ① `brake_chain_rc` = `{'analyze_rc': 0, 'recommend_rc': 0}`（急跌日**不许崩**）
+  ② `brake_defensive_only` = 入选 `['159001','511660','511880','511990','518850']`、
+     **权益类 0 只**、**非空**
+  ③ `control_not_in_brake` = `False`（B 档同参数同峰值、**只因净值没跌** ⇒ 不刹车）
+  ④ `brake_changes_selection` = C 档 ≠ B 档（`['159263','159307','515180','515450','563020']`）
+  ⑤ 降仓带**正交**：base 0.8 → TA 0.25 → 生效 **0.25**（权益上限带硬顶 0.35）
+  ⇒ **急跌 ⇒ 不崩 ＋ 不清仓 ＋ 切防守 ＋ 与对照档行为可区分**。
+- 🔴 **口径边界（如实披露，不许夸大）**：① 阶段 5 复用的是**快照里那份既有决策件**（V1 口径生成）
+  ⇒ 证明的是「**冻结件口径真的穿到阶段 5**」，**不是**干净的 V2 端到端；
+  ② **C 档是人为把净值打到峰值一半**造出来的急跌场景（**不是真实行情**）
+  ⇒ 证明的是**因果链**（参数没变 ⇒ 行为变了 ⇒ 行为只因刹车而变），
+  **不是**「真实市场里刹车救不救得回来」。
+
+【四、🔴 同名模块遮蔽 / 镜像混装（本轮最隐蔽的两个）】
+- **C1 镜像混装**：`manu/engine/` ≡ `manu/etf_rotation/engine/`（**都无 `__init__.py`** ⇒ **命名空间包**
+  ⇒ 两根同时进 `engine.__path__`）⇒ 实跑加载哪份**取决于 `sys.path`** ⇒ **这才是「刹车修复像没生效」的真因**。
+- **C2 report 遮蔽**：`v2/report.py` ↔ `daily/report.py` **同名** ⇒ 全量 pytest **19~25 条假红**
+  （**单跑该文件全绿**）⇒ 已修：`daily/tests/conftest.py` 用**绝对路径**把 daily 的 report
+  **占成 `sys.modules["report"]`**（**必须同一模块对象**；另起副本会让 monkeypatch 打空 ⇒ 实测 4 条真失败）；
+  4 个 daily 测试文件的改动**已回退**（改用 conftest 方案）；新增守卫「报告模块必须是 daily 那个」。
+- ✅ **镜像对全表逐字一致**（4 组：`manu/`↔`manu/etf_rotation/`、`manu/engine/`、`manu/probes/`、`manu/llm/`）
+  ⇒ 新增守卫⑬（**全仓镜像对 md5 比对**）⇒ **改一边必须同步另一边**。
+
+【五、🛡️ 守卫 17 → **25 条**（`v2/tests/test_turnover_convention_repo_guard.py`）】
+- ⑨ 扩到**全树条件位置**（ListComp/DictComp/SetComp/GeneratorExp/If/IfExp/`filter` 谓词/`sorted(key=)`）
+  ｜⑪ 加 `manu/tools/v2_val_attribution_probe.py`
+  ｜**⑫ 新增**「换手语境不许手写 `* 0.5`」
+  ｜⑨⑪⑫ 的**变异反证固化为常驻用例**（**阳性 15 ＋ 阴性 10**）
+  ｜**⑬ 新增**全仓镜像对 md5 比对。
+
+【六、✅ 产物重出 ＋ 验收（服务器实跑，主 agent 独立复核）】
+- `manu/report/V2_CANDIDATE_PARAMS_20261118.json`（md5 `6d1a4753…`）：服务器重跑
+  `v2_make_candidate_params.py` ⇒ disclosure **8 → 9** 条（新增 objective 口径披露）；
+  **关键数字逐字未变**（年化 0.135115265855817 / 回撤 −0.32288492472811336 /
+  双边 14.100247974306782 / 单边 7.050123987153391 / 超额 0.07386111447920429）；
+  **objective 原文逐字保留**。
+- **pytest**：`manu/etf_rotation/tests` ＋ `daily/tests` ＋ `v2/tests`
+  ⇒ **1299 passed / 7 skipped / 0 failed**（1286 → **1299**，**+13**）。
+- **顺序无关性**：`pytest v2/tests daily/tests` 与 `pytest daily/tests v2/tests`
+  ⇒ **各 674 passed / 0 failed**（**本轮实测**；此前记录的「673」少 1 条 ⇒ **按实测更正**）。
+  🔴 修复前的现象由 reviewer 实测：**全量跑 19~25 条假红、单跑该文件全绿**（典型的「顺序依赖」）。
+- **md5 双侧比对**：`manu/` 全量 ⇒ **两侧同名却内容不同 = 0**。
+- **memory 三闸门**：`sync_slim_memory.py` / `--check` / `check_memory_tables.py` ⇒ **rc=0**。
+- **封存件未动**：`frozen_params.json` md5 `1508bf0f…`｜`frozen_params_wf.json` md5 `e4b6db07…`（0444）。
+
+【七、🔴 遗留（如实披露，不掩盖）】
+1. 🔴 `etf_rotation_backtest_base/stress.json`（**各 5 次刹车**）**若重跑会变**（刹车档防守资产旁路）
+   ⇒ **本轮未重跑**；**V1 基线（刹车事件 0）数字不变**。
+2. 🔴 **历史产物仍是旧口径**：`val_ma_sweep.json` / `walkforward_summary.json` /
+   `probe_attribution/*` / `frozen_params*.json` 的 `score` 仍被旧惩罚污染；
+   `V2_ATTRIBUTION_20261118.md` 的**换手列未标单/双边** ⇒ **本轮重跑 + 重写（见下）**。
+3. 🔴 `frozen_params_wf.json` 的 `selection.objective` 仍旧措辞（按「旧产物不回改」**未动**）；
+   其 `annualized_turnover=14.1002` 是**双边**。
+4. 🔴 **V2 数字里根本没有刹车**：`v2/etf_layer.py` / `v2/backtest_v2.py` **无** `nav_state`/`in_brake`
+   （已 grep 核实）⇒ 冠军 **+13.51% / −32.29% 不含**急跌刹车
+   ⇒ 刹车是**实盘独有的防守层**（V1 `backtest.py` 有刹车）。
+5. 🔴 **2024–2026 单盲已消耗**；ETF RankIC 0.0488（t=0.795）不显著；
+   **V2 ↔ 每日链非逐位等价**；host `manu/daily/` 是**过期副本**。
+6. 🔴 **本轮未 commit / push**（用户手动做）⇒ HEAD 仍是 `1c4f28a1`。
+
+
+### 2026-11-18 续五 · 🔴 归因探针**完整重跑**（旧报告是「三跑混源」⇒ 同一配置两个数）＋ 独立 reviewer **0 BLOCKING / 3 IMPORTANT / 2 NIT 全处置** ＋ 守卫 **26** 条 ＋ 每日链**加护栏后**真实入口复跑（**未 commit**）
+
+【一、🔴 归因探针完整重跑（服务器 `_probe_attribution_r2/`，13:11 → 13:30，19 分钟）】
+- 🔴 **旧 `V2_ATTRIBUTION_20261118.md` 是「三跑混源」**：Step 1/2 取自主跑、Step 3 取自
+  `_probe_attribution_v2`、MA 对照取自 `_probe_attribution_ma`
+  ⇒ **同一个配置在报告两章里是两个数** ⇒ 读者无从判断哪个为真 ⇒ **已整体重写**。
+- ✅ **重跑命令**（服务器）：`python -u manu/tools/v2_val_attribution_probe.py --steps 1,2,3
+  --out-subdir _probe_attribution_r2 --gate-base-config naked_pure_E_nocap`
+  ⇒ 产物 6 件：`step1_variants.csv/json`、`step2_cadence20_grid.csv/json`、`step3_neg_score_gate.csv/json`；
+  日志 `/tmp/qlib_logs/attribution_r2.log`；结尾「已封存产物 md5 全部未变」✓。
+- ✅ **可复现性（重跑 vs 旧跑逐位一致）**：纯 E（`S1_pure_E_top5_equalweight`）
+  年化 **−0.10709121001309485**｜回撤 **−0.2672984240971319**｜双边换手 **17.76829562611498**
+  ｜单边 **8.88414781305749**｜超额 **0.07061241848292532**｜RankIC **0.10161377628485269**（n=23）
+  ⇒ 逐位相同 ⇒ 归因结论**不是跑出来的噪声**。
+- ✅ **Step 2 网格**：**48 行**（6 配置 × 8 档；CSV 含表头 49 行），
+  **新增 `annualized_turnover_one_way` 列** ⇒ 每行同时给单/双边，不再靠读者换算。
+- ✅ **Step 3 负分闸门（基准档位不变）**：`naked_pure_E_nocap` 关闸门 ⇒ 超额 **+9.93%**
+  （年化 −0.08318904821004414｜回撤 −0.2757902136833805｜双边换手 14.097409915273188｜单边 7.048704957636594）；
+  开闸门 **scale=0.02 / 0.05 / 0.10（min_exposure=0.0）⇒ 超额 +14.45%、回撤 −23.83%**
+  （年化 −0.045433673018802634｜双边换手 13.832661974972476）；
+  **scale=0.20 ⇒ 超额 +12.54%**（回撤 −24.22%）｜`min_exposure=0.3` 档超额 +13.11% / +12.54%。
+- 🔴 **报告重写方式 = 数据驱动生成器**（不是手抄）：`/tmp/qlib_work/gen_attribution_md.py`
+  （源 CSV 在 `/tmp/qlib_work/attr_r2/`）⇒ 新增 **§0 口径披露节**、**每列标单/双边**、
+  **单一出处**（不再跨目录拼数）、**Step 4 MA 对照改用与 §2 同一网格**；
+  `manu/report/V2_ATTRIBUTION_20261118.md` 现 **135 行**。
+
+【二、✅ 独立 reviewer 第二轮（只读审计 41 个文件）＝ 0 BLOCKING / 3 IMPORTANT / 2 NIT —— 全部处置】
+- **IMPORTANT-1（同名遮蔽占位是「谁先到谁赢」）**
+  - `daily/tests/conftest.py` ⇒ 改成**确定性三态**：① `sys.modules["report"]` **已经是 daily 那份**
+    ⇒ **保持原对象**（monkeypatch 依赖**同一模块对象**，另起副本会让 monkeypatch 打空）；
+    ② 不存在 ⇒ **占位**；③ 指向**别链** ⇒ **抢回**成 daily 那份。
+  - 🔴 **生产侧也要 fail-closed**：`daily/main.py` 新增 `_daily_report_path()`（第 92 行）
+    ＋ `_import_daily_report()`（第 110 行）⇒ 两处 `import report`（现第 **624 / 1176** 行）
+    改走它 ⇒ 拿到**非 daily 那份**就抛 `StageError`（不静默用错链的报告）。
+  - 🔴 **锚点踩坑（差点做出假守卫）**：最初拿 `_HERE/report.py` 当锚点
+    ⇒ 5 条变异反证**全转红**（`test_full_run_degradation.py` 把 `main.py` **副本**放进临时目录跑
+    ⇒ 副本的 `__file__` 不在 daily 包目录内 ⇒ 锚点判据失效）
+    ⇒ **正确锚点 = `Path(daily_config.__file__).parent / "report.py"`**（`daily_config` 与 `report` **同属 daily 包**）
+    ⇒ 修后该文件 **28 passed** ✓。
+  - 🔴 **生产实测当前是安全的**：`manu/etf_rotation/report.py` **不存在**、
+    `v2/` **不进**每日链进程（`v2/etf_layer.py:32` 的 `sys.path` 插入**不生效**）
+    ⇒ 属**潜伏**风险（将来在 `manu/etf_rotation/` 下放一个 `report.py` 就会炸）⇒ 现已 fail-closed 护住。
+- **IMPORTANT-2（守卫⑬ 覆盖面比它声称的窄）**
+  - `MIRROR_PAIRS` **4 → 5 对**（新增 `manu/tests` ↔ `manu/etf_rotation/tests`，**55 个文件逐字一致**）
+    ⇒ 以前 `glob("*.py")` **非递归** ⇒ **子目录**里的镜像对根本扫不到 ⇒ 「改一边必须同步另一边」是**假话**。
+  - `glob` → **`rglob` 递归** ⇒ 实际比对文件数 **59 → 123**；
+    **任一侧缺文件也报红**（否则新增文件永远抓不到）；根对**跳过**已成对子树。
+  - 🔴 `manu/daily/` 是**已登记的过期副本**（活链只有 `manu/etf_rotation/daily/`）
+    ⇒ **不豁免会立刻出 9 条 drift** ⇒ 豁免写成**显式常量 `MIRROR_EXEMPT_PAIRS` ＋ 理由**
+    ⇒ 让「不比对」是**登记过的**，不是「碰巧没扫到」。
+  - 🛡️ 新增**常驻**变异反证 `test_规则13_镜像对漂移必须被抓到`（用 `tempfile` 临时目录，**不碰真源码**）。
+- **IMPORTANT-3（守卫⑫ 的语境只靠命名判定）**
+  - 语境扩为**四路信号**：语句/函数名·docstring ｜**单边语义**（赋值目标·函数名·参数名）｜**模块文本级兜底**；
+    匹配形态扩到 `* 0.5` / `0.5 *` / `/ 2`；**豁免链不变**（`one_way_turnover` 函数体、`TURNOVER_ONE_WAY_FACTOR` 定义）。
+  - 阳性样例 **4 → 9+3 = 12** 条、阴性 **5** 条（`_BAD_HALF_SAMPLES`=12、`_GOOD_HALF_SAMPLES`=5）。
+  - 🔴 **主 agent 独立复核后补了 coder 漏掉的两处逃逸口**：
+    ① 变量名 `one_side`（词表补 `("one","side")`）；② `* (1/2)` / `(1/2) *`
+    （`_handwritten_half_form` 增**内联 `1/2`** 识别）⇒ 固化为 **3 条常驻阳性反证**。
+  - ✅ **全仓复扫**：406 个 `.py` 中**仅 3 个测试文件命中**（命中点在测试断言里，
+    `_scan_files()` **已排除 tests** ⇒ 不假红）；自造样例复核 **5/5 逃逸口全部命中、3 条阴性全部放过**。
+- **NIT-4（NaN 被渲染成字面量 `nan` / `None×`）**：`manu/tools/gen_v2_scorecard.py`（`_fmt` 加 `math.isfinite`
+  ⇒ 渲染「—」）、`manu/tools/summarize_etf_grid.py`（新增 `_num(x, spec)`，**全部数值列**走它）、
+  `manu/tools/v2_val_cadence_probe.py`（新增 `_turn()`）
+  ⇒ 🔴 **改渲染层 ≠ 改产物**：三处产物**实测本来就不含 NaN** ⇒ **产物字节不变**。
+- **NIT-5 未改（如实披露，不假装已修）**：`analyze.py` 落盘的 `max_per_theme` 是**入参 0** 而非**生效值**
+  `THEME_CAP_UNLIMITED` ⇒ 改了会**再断一次 TA sha1 链** ⇒ 本轮**刻意不改**。
+
+【三、🛡️ 守卫 25 → **26** 条（`v2/tests/test_turnover_convention_repo_guard.py`，`def test_` 实测 26）】
+- ⑬ 递归 `rglob` ＋ 5 对镜像 ＋ 缺文件双向报红 ＋ `MIRROR_EXEMPT_PAIRS` 显式豁免 ＋ 1 条常驻变异反证。
+- ⑫ 四路语境 ＋ 三种形态 ＋ 阳性 12 / 阴性 5 ＋ 3 条新增逃逸口反证。
+- ⑨⑪ 的阳性/阴性反证保持常驻（`_BAD_TURNOVER_FILTER_SAMPLES`=8、`_GOOD_TURNOVER_DISCLOSURE_SAMPLES`=4、
+  `_BAD_TABLE_CELL_SAMPLES`=3、`_GOOD_PROSE_SAMPLES`=2）。
+
+【三之二、🛡️ 补上「分析侧重放链 ↔ 引擎决策链」的**对齐回归网**（8 条，`daily/tests/test_analyze_rebuild_chain_parity.py`）】
+- 🔴 **本轮把遗留清单里那条「无 analyze/recommend rc 的端到端 pytest 回归网」补了一半**：
+  `analyze.py` 内部有一份「过滤链重放」（`_rebuild_chain`，给报告**逐道解释**淘汰原因），
+  它与真正的决策者 `engine/portfolio.py::build_portfolio` 是**两份独立实现**
+  ⇒ **只改一边** ⇒ 报告里的入选名单与引擎决策**悄悄分叉**（不崩、不报错，只是名单不同）。
+- 🔴 **生产里本来就有防线**：`analyze.py::main`（约 3194 行）
+  `if engine_selected != chain["selected_codes"]: raise RuntimeError(...)`
+  ⇒ 不一致就**拒绝出报告**（fail-closed）⇒ **这条不变量是对的**；
+  但**这条防线自己没人测** ⇒ 只能等**真实跑链**才暴露 ⇒ 实盘当天出不了报告。
+- ✅ **本轮补的 8 条**（纯内存夹具：3 权益 + 2 防守，**只有权益有成分股**
+  ⇒ 正好复现「急跌 ⇒ 退化成 100% 现金」那个坑）：
+  ① **功能级**：刹车档 ＋ 对照档，**两侧入选名单必须逐位相等**
+     （把生产那条 RuntimeError 的不变量在**可测层面**钉住）
+  ｜② **源码级**：刹车「防守资产旁路」在**两处实现**里必须**同时存在**
+     （`or brake_mode` ＋ `keep_mask = coverage_ok | is_defensive`）
+  ｜③ `analyze.py` 必须**复用** `engine.portfolio._is_defensive`（不许自己再写一份）
+  ｜④ 生产那条 RuntimeError **不许被删掉**（源码守卫）。
+- 🛡️ **变异反证 4 条全部实测转红**（服务器真实改源码 → 跑 → **立即还原 + md5 核对**）：
+  M1 引擎侧去 `or brake_mode` ⇒ **2 条转红**｜M2 重放侧去 `or brake_mode` ⇒ **3 条转红**
+  ｜M3 引擎侧删 `keep_mask` 旁路 ⇒ **3 条转红**｜M4 重放侧删 `keep_mask` 旁路 ⇒ **2 条转红**
+  ⇒ 守卫**有牙齿**（不是恒真）；还原后 `engine/portfolio.py` md5 回到
+  `c17636f4152b7d0dadf0824e9ae85a73`（**与已知良好值一致**）、`analyze.py` md5 `9b3ad73d81ba046c72f36a0cb5c025a0`。
+- 🔴 **口径边界（如实披露）**：本文件测的是**决策链的选票**，**不是**整条实盘链
+  （不跑 qlib、不读生产快照）；`analyze.py::main` 那条断言**内联在 `main()` 里**（依赖生产文件）
+  ⇒ **无法在单测里直接调用** ⇒ 用「两侧逐位相等」把**同一条不变量**在可测层面钉住
+  ＋ 用源码守卫钉住那条 RuntimeError **不许被删**。
+
+【四、✅ 本轮验收（服务器实跑，主 agent 独立复核）】
+- **pytest 三连**（服务器 conda env `ql`）：
+  ① 全量 `tests + daily/tests + v2/tests` ⇒ **1308 passed / 7 skipped / 0 failed**（46.30s）；
+  ② `v2/tests + daily/tests` ⇒ **683 passed / 0 failed**（34.71s）；
+  ③ `daily/tests + v2/tests` ⇒ **683 passed / 0 failed**（34.68s）
+  ⇒ 🔴 **两序完全相等** ⇒ 顺序无关性成立（1299 → **1300** → **1308**，后 +8 = 新增对齐回归网）。
+  🔴 本轮共跑了两遍三连：加新测试**前** 1300/675/675、加新测试**后** 1308/683/683（**后者是最终态**）。
+- **每日链真实入口复跑（加完生产护栏之后）**：`daily/main.py --asof 2026-11-10 --dry-run --skip-fetch
+  --skip-llm --no-email --no-increment --no-refresh-scores --no-update-qlib-bin`
+  ⇒ **49.7 秒全链 ok**，日志 `/tmp/qlib_logs/daily_entry_after_guard.log`，快照 `20261118_133208`
+  ⇒ 生效值 `alpha=1.0 / momentum=0.0 / 平滑关 / MA 0/0 / top_k=5 / hold_buffer=2 / 同族上限=关` ✓
+  ⇒ 报告落盘「年化换手（**双边** Σ|Δw|）**16.57×**（成本拖累 2.92%）」＋「（**单边**）**8.28×**」✓。
+- **md5 双侧同步**：`bash manu/tools/sync_to_server.sh manu` ⇒ **498 个文件两侧 md5 完全一致**。
+- **封存件未动**：`frozen_params.json` md5 `1508bf0f5bf66d32ac422fec7e215b75`（0444）、
+  `frozen_params_wf.json` md5 `e4b6db07e8e62b744cbd16a80655126c`（0444）；
+  `manu/report/V2_CANDIDATE_PARAMS_20261118.json` md5 `6d1a475333fbfebb81437a82a5e83256`
+  （披露 8 → 9 条，**关键数字逐字未变**）。
+- **memory 四层**：本条目 + 速览卡 + 精简档 + `rules.md §十四.115`（本轮 reviewer 收口规约）已落。
+
+【五、🔴 遗留（如实披露，不掩盖）】
+1. 🔴 `etf_rotation_backtest_base/stress.json`（**各 5 次刹车**）**若重跑会变**（刹车档防守资产旁路）
+   ⇒ **本轮未重跑**；**V1 基线（刹车事件 0）数字不变**。
+2. 🔴 **历史产物仍是旧口径**：`val_ma_sweep.json` / `walkforward_summary.json` / `probe_attribution/*` /
+   `frozen_params*.json` 的 `score` 仍被旧惩罚污染（objective 串是**改版前旧公式**）
+   ⇒ `V2_ATTRIBUTION_20261118.md` **已重写收口**（本轮），**其余历史产物未回改**。
+3. 🔴 `frozen_params_wf.json` 的 `selection.objective` **仍旧措辞**（未动）；`annualized_turnover=14.1002` 是**双边**。
+4. 🔴 **V2 数字里根本没有刹车**（`v2/etf_layer.py` / `v2/backtest_v2.py` **无** `nav_state`/`in_brake`，已 grep 核实）
+   ⇒ 冠军 **+13.51% / −32.29%** **不含**急跌刹车 ⇒ 刹车是**实盘独有的防守层**。
+5. 🔴 `apply_turnover_gate` 的默认值仍是 `"gate"`（被 `test_turnover_convention_and_target_mode.py:245`
+   **显式钉死**）⇒ **刻意不改**（改了会改动旧行为）⇒ 生产调用点由守卫②覆盖。
+6. 🔴 V1 `one_way_turnover` 对 `None` **抛 TypeError** vs V2 返回 **NaN**（**双实现语义分叉**）
+   ⇒ V1 属**冻结基线**，本轮**不动**。
+7. 🔴 `json.dumps` 默认 `allow_nan=True` ⇒ 含 NaN 的产物是**非 RFC-8259 JSON**（**潜伏**，未改）。
+8. 🔴 `analyze.py` 落盘 `max_per_theme` 是**入参非生效值**（见上，刻意不改）。
+9. 🔴 `manu/daily/` 是**已登记过期副本**（与活链差 4 文件 + 缺 4 文件）⇒ 守卫⑬ **显式豁免**，**未删**。
+10. 🟡 **无 analyze/recommend rc 的端到端 pytest 回归网**（只有运行时探针 + 引擎级 3 条守卫）
+    ⇒ **本轮补了一半**：新增 `daily/tests/test_analyze_rebuild_chain_parity.py`（8 条）把
+    「分析侧重放 ↔ 引擎决策」钉死（功能级逐位相等 ＋ 源码级守卫 ＋ 4 条变异反证实测转红）
+    ⇒ 但**真正的 analyze/recommend 子进程 rc 回归网仍缺**（需要真实快照 ＋ qlib 数据 ⇒ 仍是运行时探针）。
+11. 🔴 **2024–2026 单盲已消耗**；ETF RankIC 0.0488（t=0.795）不显著；**V2 ↔ 每日链非逐位等价**。
+12. 🔴 **本轮未 commit / push**（用户手动做）⇒ HEAD 仍是 `1c4f28a1`，
+    **258 个未跟踪文件**（提醒：`git add -A manu/` 才能一次带上整棵 V2 树，否则会漏）。
+
+
+### 2026-11-18 续六 · 🔴 补上「**接缝端到端**」的常驻回归网（**11 条**）＋ 补网时**当场抓出探针两个真缺陷**（**未 commit**）
+
+【一、🔴 此前「接缝通不通」只有人手跑才知道（这是续五遗留里最值钱的一条）】
+- 🔴 `manu/tools/v2_seam_e2e_probe.py` 是**唯一**能端到端验证「V2 冻结件 → 每日实盘链」的工具：
+  同一份真实快照跑**三档**（``A_v1`` 接缝关 ／ ``B_frozen`` 接缝开 ／ ``C_brake`` 急跌刹车），
+  **真起** ``analyze.py`` / ``recommend.py`` / ``final_rebalance_plan.py`` **三个子进程**，
+  再逐项断言「冻结件口径真的落到每日链」。
+  🔴 但它**只能人手跑** ⇒ 它的一致性判定
+  （``brake_chain_rc`` / ``brake_defensive_only`` / ``control_not_in_brake`` /
+  ``brake_changes_selection`` / ``brake_in_brake_true`` / ``brake_mode_flag`` …）
+  **一条都没有回归网** ⇒ 谁把其中一条删掉、把 rc 判定改恒真、把 C 臂删掉，
+  **pytest 一声不响** ⇒「接缝还通不通」这件事**没有任何自动化证据**。
+- ✅ **新增 `manu/etf_rotation/v2/tests/test_v2_seam_e2e_probe.py`（11 条）**，两层结构：
+  - **第 1 层 · 常驻契约守卫（9 条，秒级，永远跑，不需要任何数据）**：断言探针源码**必须**包含
+    那 8 条一致性判定、**必须**跑满 A/B/C 三档、**必须**真的起三个子进程、
+    一致性不通过**必须**返回非零退出码、JSON **必须**带 ``seam_conformance`` /
+    ``seam_conformance_all_ok`` ⇒ 作用是「**探针不许被悄悄阉割**」。
+  - **第 2 层 · 真跑端到端（2 条，服务器上**有输入完整的快照就默认跑**
+    ⇒ ``ETF_ROTATION_E2E_SEAM=0`` 才显式关掉）**：真起探针 ⇒ 断言 ``rc == 0`` ＋ ``seam_conformance_all_ok``
+    ＋ 9 项判定逐项 ``ok is True`` ＋ **rc 逐项为 0**（急跌日不许崩）
+    ⇒ 这才是「**接缝真的通**」的**链级证据**。
+    - 第 2 层有**两条**：① **默认（最新）快照**档 ⇒ 验「**急跌刹车链**」（analyze/recommend rc=0、
+      只选防守、对照组不刹车、刹车改变入选）；② **带决策件**的快照档 ⇒ 验「**阶段 5 真跑**」
+      （``stage5_rc`` 的 got 必须是数值 0 而不是 ``{"skipped": True}``、
+      ``stage5_weights_used`` 的 alpha/momentum 必须是 **1.0 / 0.0**、
+      ``macro_derisk_band`` 的生效值必须是数值且 **≤ 0.35**）
+      ⇒ **只有第 ② 条**能证明「**V2 冻结件真的穿过阶段 3/4 到达阶段 5**」。
+
+【二、🔴 补回归网时**当场抓出探针自己的两个真缺陷**（都会让人误判「接缝坏了」）】
+- **缺陷 A：探针把 ``asof`` 从「价格面板文件名」反推 ⇒ 最新快照根本跑不起来（假失败）**
+  - 根因：个股打分日是**相位栅格**（每 N 个交易日取一个 ＋ 末日例外）
+    ⇒ **价格面板的末日未必是打分日**。实测最新快照 ``20261118_133208`` 的面板末日是 **2026-11-10**，
+    而 ``stock_scores.csv`` 的 **72 个打分日**里**没有它**
+    （附近是 2026-11-03 / 2026-11-04 / 2026-11-16 / 2026-11-17）
+    ⇒ ``analyze.py`` 抛「信号日没有记录」、``recommend.py`` 抛 KeyError
+    ⇒ **三档全 rc=1** ⇒ 探针整轮**假失败**（看着像「接缝坏了」，其实是 asof 取错了）。
+  - 修法：新增 ``_scoring_days()`` ＋ ``_resolve_asof()`` ⇒ 取 **≤ 请求日的最后一个打分日**，
+    并**如实披露**改成了哪天；JSON 补 ``asof_requested`` / ``asof_adjusted_from``。
+- **缺陷 B：无决策件的快照 ⇒ 阶段 5 整段没跑，但探针仍把阶段 5 三项判 FAIL ⇒ 假警报**
+  - 根因：``--skip-llm`` 的日常跑、以及 TradingAgents 缺失，都会让快照**没有**
+    ``tradingagents_decision.md`` ⇒ 阶段 5 **不适用**（≠ 不合格）。
+  - 修法：``stage5_rc`` / ``stage5_weights_used`` / ``macro_derisk_band`` 三项改成
+    「不适用 ⇒ 标记 SKIP（``ok=True``）」，并在**口径边界**里**明确写清**
+    「本快照没有决策件 ⇒ 阶段 5 整段没跑 ⇒ 本次探针**不覆盖**阶段 5」。
+
+【三、🛡️ 变异反证：这条网**真的咬得住生产代码**（不是只测探针自己）】
+- 服务器上**真实改坏生产代码** → 跑 → **立即还原 ＋ md5 核对**：
+  - **M-A** 变异 ``engine/portfolio.py``（**两份镜像**）的刹车旁路 ``or brake_mode``
+    ⇒ **端到端转红**（急跌档入选空仓 ⇒ ``brake_defensive_only`` FAIL）；
+  - **M-B** 变异 ``analyze.py``（**两份镜像**）重放链的刹车旁路
+    ⇒ **端到端转红**（引擎与重放分叉 ⇒ 生产那条 RuntimeError「拒绝出报告」生效 ⇒ rc=1）。
+  - 还原后复跑 **10 passed**；``engine/portfolio.py`` md5 回到
+    ``c17636f4152b7d0dadf0824e9ae85a73``、``analyze.py`` md5 回到
+    ``9b3ad73d81ba046c72f36a0cb5c025a0``（**与已知良好值一致**）。
+
+【四、✅ 端到端真跑结果（服务器，asof 自动对齐到 **2026-11-04**）】
+- 三档 **analyze / recommend 的 rc 全部 = 0**；
+- **B 档（接缝开）生效参数逐项 == 冻结件**：alpha=1.0 / momentum=0.0 / buffer=2 /
+  target_n=5 / MA入=0・MA出=0 / max_per_theme=0 / **平滑关** ⇒ **8 项全 PASS**；
+- **C 档（急跌刹车）**：``in_brake=True``、``brake_mode=True``、入选
+  **``['159001','159834','511660','511880','511990']``（5 只全防守、权益类 0 只、非空）**
+  ⇒ 与续四那次 C 臂产物**逐字一致**；
+- **B 档对照组**：``in_brake=False``（同参数同峰值、只因净值没跌 ⇒ 不刹车）、
+  入选 ``['159307','510880','512800','512890','515450']`` ⇒ **C ≠ B**；
+- 接缝**确实改变了入选**：A(V1) 买入 ``['512170','515450','515650']``
+  → B(V2) 买入 ``['159307','510880','512890','515450']`` ⇒ 口径真的切过去了；
+- 规则层目标 A = 4 只 ／ B = 5 只（== 冻结件 top_k=5）⇒ 规则层与交付层**同源**。
+
+【四之二、✅ 再跑一档「**带决策件**」的快照 ⇒ 阶段 5 **真跑**，**19 项全绿**】
+- 🔴 动机：最新快照（`20261118_133208`）**没有** ``tradingagents_decision.md``
+  ⇒ 阶段 5 **整段没跑** ⇒ 那三项判定是「**不适用**」⇒
+  「**冻结件真的穿到阶段 5**」这件事**本轮还没被验证**。
+- ✅ **显式指定** `--snapshot-dir .../snapshots/20261117_221846`（带决策件）重跑
+  ⇒ asof **2026-11-17 本身就在打分栅格上**（无需对齐）⇒ **19 项判定全部 PASS**：
+  - **阶段 5 规则层对账 rc = 0**；
+  - **阶段 5 权重口径 alpha=1.0 / momentum=0.0** ⇒ 🔴 **V2 冻结件真的穿过阶段 3/4 到达阶段 5**；
+  - **TA 宏观降仓带 base=0.8 → TA 0.25 → 生效 0.25**（权益上限带硬顶 0.35）
+    ⇒ **降仓带与接缝同时生效**（接缝不污染防守层）；
+  - C 档入选 `['159001','511660','511880','511990','518850']`（5 只全防守、权益 0 只、非空）
+    ⇒ 与续四那次 C 臂产物（`seam_e2e_20261118_C2.json`）**逐字一致**；
+  - B 档入选 `['159263','159307','515180','515450','563020']` ⇒ **C ≠ B**。
+- ✅ 该档已固化为**回归网的第 2 层第 ② 条用例**（`_latest_decision_snapshot()` 自动找最新带决策件的快照）。
+
+【四之三、🛡️ 把端到端从「**显式开关**」升级成「**默认就跑**」（否则这张网等于没有）】
+- 🔴 上一版第 2 层要 ``ETF_ROTATION_E2E_SEAM=1`` 才跑 ⇒ **默认套件里没人跑它**
+  ⇒ 「接缝真的通」仍然只取决于「谁记得手动跑」⇒ **与「只能人手跑的探针」只有一步之遥**。
+- ✅ 改成：**服务器上只要有输入完整的快照，就默认跑**（``ETF_ROTATION_E2E_SEAM=0`` 才显式关掉）
+  ⇒ 现在是**真·常驻回归网**。
+- 🔴 随之而来的**假红风险**：每日链是**增量写**快照的 ⇒ 刚跑完 / 跑到一半时，
+  **最新那个快照可能是半写的**（缺 ``stock_scores.csv`` 或 ``account_snapshot.csv``）
+  ⇒ 拿它去跑 ⇒ **假失败**（看着像「接缝坏了」，其实是快照没写完）。
+  ⇒ **修法（探针侧）**：新增 ``_snapshot_complete()`` ＋ ``_pick_snapshot()``
+  ⇒ **跳过不完整快照、退到上一个完整的**，并**打印**跳过了哪几个；找不到完整快照 ⇒ **明确报错**。
+  ⇒ **修法（测试侧）**：``_complete_snapshots()`` **独立实现**一遍完整性判据
+  （**不 import 探针**）⇒ 与探针形成**交叉核对**；找不到 ⇒ **skip 并写明原因**。
+- ✅ 探针新增 ``--require-decision`` 开关 ⇒ 「带决策件」那一档由**探针自己**挑快照。
+
+【五、✅ 本轮验收（服务器实跑，主 agent 独立复核）】
+- **pytest 三连（默认套件，端到端**已自动纳入**）**：
+  ① 全量 ⇒ **1319 passed / 7 skipped / 0 failed**（146.72s）；
+  ② ``v2/tests + daily/tests`` ⇒ **694 passed / 0 skipped**；③ ``daily/tests + v2/tests``
+  ⇒ **694 passed / 0 skipped** ⇒ 🔴 **两序完全相等** ⇒ 顺序无关性成立
+  （1308 → **1317** → **1319**，+9 = 常驻契约守卫、+2 = 端到端两条**真跑**）。
+- **接缝端到端**（显式开关下同跑一遍）：**11 passed**（107.27s）。
+- **md5 双侧同步**：`manu/` 全量 ⇒ 两侧**完全一致**。
+- **封存件未动**：`frozen_params.json` md5 `1508bf0f…`（0444）、
+  `frozen_params_wf.json` md5 `e4b6db07…`（0444）。
+- **memory 四层**：本条目 ＋ 速览卡 ＋ 精简档 ＋ `rules.md §十四.117` 已落。
+
+【六、🔴 遗留（如实披露，不掩盖）】
+1. ✅ **阶段 5 三项已在「带决策件」的快照上真跑并全绿**（见【四之二】）
+   ⇒ 「**冻结件穿到阶段 5**」这条证据**已进回归网**（第 2 层第 ② 条用例）。
+   🔴 **仍存的边界**：那个带决策件的快照是 **2026-11-17 的**（决策件是**V1 口径**下生成的）
+   ⇒ 它证的是「**冻结件口径真的穿到阶段 5**」（权重口径 / 候选池 / 降仓带），
+   **不是**「阶段 5 的最终名单是干净的 V2 端到端」⇒ 真正的 V2 端到端要等**下一次真实调仓日**
+   （决策件按 V2 报告重新生成）。
+2. 🟡 **端到端第 2 层已改成「默认就跑」**（服务器上有输入完整的快照时）
+   ⇒ 代价：默认套件从 ~50 秒涨到 ~147 秒（RUN1 146.72s）。
+   🔴 **仍存的边界**：它依赖**服务器侧的真实快照与 qlib 数据** ⇒ 在没有数据的机器上会 **skip**
+   （skip 理由写在测试里）⇒ **不许**把「skip」当成「已验证」。
+   🔴 `ETF_ROTATION_E2E_SEAM=0` 可显式关掉（跑得慢时用）。
+3. 🔴 续五那条遗留「**无 analyze/recommend rc 的端到端 pytest 回归网**」⇒ **本轮闭合**
+   （第 2 层真起子进程并断言 rc）；但它是**显式开关**，不是默认套件的一部分。
+4. 🔴 续五其余遗留**全部照旧**：`base/stress.json` 未重跑｜历史 score 仍被旧惩罚污染｜
+   `frozen_params_wf.json` 的 `selection.objective` 仍旧措辞（14.1002 是**双边**）｜
+   **V2 数字里根本没有刹车**（冠军 +13.51% / −32.29% **不含**急跌刹车）｜
+   `apply_turnover_gate` 默认值仍 `"gate"`（刻意不改）｜V1/V2 `one_way_turnover` 语义分叉｜
+   `allow_nan=True` 非 RFC JSON（潜伏）｜`max_per_theme` 披露口径（刻意不改）｜
+   `manu/daily/` 过期副本显式豁免未删｜单盲已消耗｜seam 非逐位等价。
+5. 🔴 **本轮未 commit / push**（用户手动做）⇒ HEAD 仍是 `1c4f28a1`。

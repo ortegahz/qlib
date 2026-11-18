@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -42,6 +43,41 @@ def _fmt_num(x: float | None, digits: int = 2) -> str:
     if x is None:
         return "—"
     return f"{float(x):,.{digits}f}"
+
+
+def _fmt_turn(x: float | None) -> str:
+    """换手倍数渲染（缺失 / 非有限 ⇒ 「—」，**不编数字**，也不当成 0.0）。"""
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v):
+        return "—"
+    return f"{v:.2f}"
+
+
+def _turnover_pair(cost: dict) -> tuple[str, str]:
+    """回测 ``cost_assumption`` ⇒ (双边换手串, 单边换手串)。
+
+    🔴 2026-11-18 口径正名 + 缺键防护：
+      * **双边键优先 → 旧键兜底 → 都没有 ⇒ None**（**任何缺键组合都不许 KeyError**）；
+        （``dict.get(k, default)`` 的 default 是**急切求值** ⇒ 旧键一旦被删就直接炸；
+          而 ``backtest.py`` 的注释明写旧键「保留仅为兼容」⇒ 随时可删。）
+      * 单边**只走唯一实现** ``config.one_way_turnover``（🔴 **不许手写 ``* 0.5``**）；
+      * 算不出来 ⇒ 「—」（**不编数字**）。
+    """
+    two = cost.get("annualized_turnover_two_way")
+    if two is None:
+        two = cost.get("annualized_one_way_turnover")   # 旧键兜底（原始产物兼容保留）
+    one = cost.get("annualized_turnover_one_way")
+    if one is None and two is not None:
+        try:
+            one = C.one_way_turnover(two)
+        except (TypeError, ValueError):
+            one = None
+    return _fmt_turn(two), _fmt_turn(one)
 
 
 def _req(d: dict, key: str, label: str | None = None) -> float:
@@ -368,10 +404,16 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
     if backtest_new and backtest_new.exists():
         b = json.loads(backtest_new.read_text(encoding="utf-8"))
         p, bm, ex = b["portfolio_net"], b["benchmark_510300"], b["excess_vs_510300"]
+        # 🔴 2026-11-18 口径正名：``annualized_one_way_turnover`` 的**值是双边**
+        #    （Σ|Δw| / 年）⇒ 引用时**必须标明口径**，并并列给出单边。
+        #    缺键防护：旧键「保留仅为兼容」⇒ 随时可删 ⇒ **不许**用
+        #    ``get(k, default)``（default 急切求值 ⇒ 旧键一删就 KeyError）。
+        _turn_two, _turn_one = _turnover_pair(b.get("cost_assumption") or {})
         add(f"- **现役口径**（同族硬分区 + 直接冲突对聚类，prefer-held=on）："
             f"年化 **{p['annualized_return'] * 100:.2f}%**，超额（相对口径）"
             f"**{ex['annualized_return'] * 100:+.2f}%**，MDD **{p['max_drawdown'] * 100:.2f}%**，"
-            f"年化单边换手 **{b['cost_assumption']['annualized_one_way_turnover']:.2f}×**，"
+            f"年化换手（**双边** Σ|Δw|）**{_turn_two}×**"
+            f"（单边 **{_turn_one}×**），"
             f"成本拖累 {b['cost_assumption']['total_cost_drag'] * 100:.2f}%")
         add(f"- 基准 510300：年化 {bm['annualized_return'] * 100:.2f}%，"
             f"MDD {bm['max_drawdown'] * 100:.2f}%；评估窗口 "

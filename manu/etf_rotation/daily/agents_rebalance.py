@@ -52,8 +52,10 @@ if str(_HERE) not in sys.path:
 
 import account_state  # noqa: E402
 import daily_config as DC  # noqa: E402
+import nav_state as nav_mod  # noqa: E402
 import snapshot as snap_mod  # noqa: E402
 import run_paths  # noqa: E402
+import v2_frozen_params as V2FP  # noqa: E402
 
 #: 研究链根目录（``manu/etf_rotation``）—— 导入研究链模块时按**绝对路径**加载
 _RESEARCH_ROOT = Path(__file__).resolve().parents[1]
@@ -837,6 +839,60 @@ def _smoothing_args() -> list[str]:
         "--smoothing-history-days", str(getattr(cfg, "SMOOTHING_HISTORY_SPAN_DAYS", 30)),
     ]
 
+def _load_v2_frozen_params():
+    """🔴 读 V2 冻结件（**fail-closed**）⇒ 每日链 ETF 层参数的**唯一来源**。
+
+    🔴 **为什么必须 fail-closed**：接缝开着却读不到冻结件时若静默回落 V1 常量，
+       等于「V2 的冠军参数又没进每日链」而且**不会报错** ⇒ 老坑复发且无痕。
+    ⇒ 读不到 / 口径不符 ⇒ **抛异常中止**（宁可不产出，不许产出错口径的交付件）。
+    """
+    if not DC.V2_FROZEN_PARAMS_ENABLED:
+        return None
+    return V2FP.load_frozen_params(
+        DC.V2_FROZEN_PARAMS_FILE, required=DC.V2_FROZEN_PARAMS_REQUIRED
+    )
+
+
+def _etf_layer_args() -> tuple[list[str], dict]:
+    """🔴 ETF 层参数（**分析链 ``analyze.py`` 与规则链 ``recommend.py`` 同一组**）。
+
+    🔴 **接缝开着** ⇒ 参数来自 **V2 冻结件**（``frozen_params_wf.json``）：
+    纯 E（alpha=1.0 / momentum=0.0）、**关掉** V1 的 E 层 EWMA（``--no-smoothing``）、
+    **关掉** V1 的 MA60 入场/退出闸门（``--entry-ma-window 0 / --exit-ma-window 0``）、
+    ``top_k`` / ``hold_buffer`` / 同族上限全按冻结件。
+    🔴 **接缝关着** ⇒ 回落 V1 老口径（平滑参数取研究链 config，MA 取 ``daily_config``）。
+
+    🔴 **两链必须逐字相同**：少传一条 ⇒ 分析链与规则层分叉 ⇒ 交付件与规则选出不同的票
+    （历史上真出过「规则层 11-03 无平滑 vs 交付层 11-05 有平滑」的分叉）。
+    """
+    fp = _load_v2_frozen_params()
+    if fp is None:
+        cfg = _research_config()
+        args = _smoothing_args() + [
+            "--entry-ma-window", str(DC.ENTRY_MA_WINDOW),
+            "--exit-ma-window", str(DC.EXIT_MA_WINDOW),
+        ]
+        return args, {
+            "seam": "🔴 **关闭**（回落 V1 老配置：E 层 EWMA + MA60 闸门）",
+            "enabled": False,
+        }
+
+    # ---- 口径守卫（fail-closed）----
+    cfg = _research_config()
+    deployed = int(getattr(cfg, "DEPLOYED_REBALANCE_EVERY_N_DAYS", 0) or 0)
+    if deployed and deployed != int(fp.rebalance_every_n_days):
+        raise V2FP.V2FrozenParamsError(
+            f"🔴 V2 冻结件 cadence = {fp.rebalance_every_n_days}，"
+            f"每日链部署节奏 = {deployed} ⇒ 两链口径不一致 ⇒ 拒绝跑"
+        )
+    account_positions = int(getattr(DC, "TARGET_POSITIONS", 0) or 0)
+    if account_positions and account_positions != int(fp.top_k):
+        raise V2FP.V2FrozenParamsError(
+            f"🔴 V2 冻结件 top_k = {fp.top_k}，每日链账户目标持仓数 = {account_positions}"
+            " ⇒ 两链口径不一致 ⇒ 拒绝跑"
+        )
+    return fp.etf_layer_args(), fp.disclosure()
+
 
 def _sha1_of_file(path: Path) -> str:
     import hashlib
@@ -937,9 +993,52 @@ def _carry_context_trio(src_snap: Path, dst_snap: Path, cur_context: Path,
     )
 
 
+def _brake_args(nav: float | None, nav_peak: float | None) -> list[str]:
+    """🔴 2026-11-18：**急跌刹车**参数（``--nav`` / ``--nav-peak``）。
+
+    🔴 事故背景（审计缺陷 ``no_drawdown_brake`` · high 级）：
+      研究链的组合级回撤刹车是实现了的（``analyze.py`` / ``recommend.py`` 收
+      ``--nav`` / ``--nav-peak`` ⇒ ``engine/portfolio.py`` 的 ``brake_mode``
+      ⇒ 整个组合切防守资产），但**每日链从不传** ⇒ ``nav_state`` 恒为 ``None``
+      ⇒ 刹车**永远不触发** ⇒ 「急跌无刹车」。
+
+    ⇒ 这里把每日链算出的**账户净值 / 历史峰值**传下去。
+      算不出来（净值不可得）⇒ **不传**（保持原行为，绝不编数字）。
+    """
+    if nav is None or nav_peak is None:
+        return []
+    return ["--nav", f"{float(nav):.6f}", "--nav-peak", f"{float(nav_peak):.6f}"]
+
+
+def _resolve_rules_etf_args(etf_args: list[str] | None) -> list[str]:
+    """规则层（``recommend.py``）的 ETF 层参数：**接缝开着时必须显式传入**。
+
+    🔴 2026-11-18（续三）：旧写法 ``etf_args if etf_args is not None else <V1 老参数>``
+       ⇒ 任何**漏传** ``etf_args`` 的调用点都会**静默**回落 V1 老参数
+       （E 层 EWMA + MA60 闸门）⇒ **分析链用 V2 参数、规则层用 V1 参数**
+       ⇒ 两链分叉（历史上真出过「规则层 11-03 无平滑 vs 交付层 11-05 有平滑」）。
+       ⇒ **接缝开着 + 没传参 ⇒ 直接抛异常**（fail-closed，不许静默回落）。
+
+    🔴 接缝**关着**时仍允许回落 V1 老配置（那是**明确**的老口径，不是漏传）。
+    """
+    if etf_args is not None:
+        return list(etf_args)
+    if bool(getattr(DC, "V2_FROZEN_PARAMS_ENABLED", False)):
+        raise V2FP.V2FrozenParamsError(
+            "🔴 V2 冻结件接缝**已开启** ⇒ 规则层 ETF 层参数必须由 `_etf_layer_args()` 提供"
+            "（漏传 ⇒ 分析链用 V2 参数、规则层回落 V1 参数 ⇒ 两链分叉）⇒ 拒绝跑"
+        )
+    return _smoothing_args() + [
+        "--entry-ma-window", str(DC.ENTRY_MA_WINDOW),
+        "--exit-ma-window", str(DC.EXIT_MA_WINDOW),
+    ]
+
+
 def _run_rules_layer(run_path: Path, notes: list[str], *, analysis_asof: str,
                      scores_path: Path, prices_path: Path, universe_path: Path,
-                     holdings_arg: str = "") -> Path | None:
+                     holdings_arg: str = "",
+                     nav: float | None = None, nav_peak: float | None = None,
+                     etf_args: list[str] | None = None) -> Path | None:
     """**阶段 3b · 规则层**：``recommend.py`` 在**本快照目录内**现跑。
 
     🔴 为什么不再「从研究链产物根只读复制」：复制来的是**另一次跑**的产物
@@ -957,9 +1056,7 @@ def _run_rules_layer(run_path: Path, notes: list[str], *, analysis_asof: str,
         "--holdings-csv", str(DC.ETF_HOLDINGS_CSV),
         "--out-dir", str(run_path),
         "--pool-mode", "e_covered",
-        "--entry-ma-window", str(DC.ENTRY_MA_WINDOW),
-        "--exit-ma-window", str(DC.EXIT_MA_WINDOW),
-    ] + _smoothing_args()
+    ] + _resolve_rules_etf_args(etf_args) + _brake_args(nav, nav_peak)
     if holdings_arg:
         cmd += ["--holdings", holdings_arg]
     _run_cmd(cmd, step=STEP_RULES)
@@ -1165,7 +1262,51 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
     # ---- 2b. export_qlib_prices.py（个股日线，供 analyze.py 的多日 RankIC）----
     stock_prices_path = _export_stock_prices(analysis_asof, notes, out_dir=run_path)
 
+    # ---- 2c. 急跌刹车：净值 / 峰值（**日频防守**的唯一事实源）--------------
+    # 🔴 2026-11-18：账户净值按 asof 收盘价重估 ⇒ 跨日持久化 ⇒ 峰值是真峰值。
+    #    算不出来 ⇒ 不传 --nav/--nav-peak（保持原行为，不编数字）。
+    nav_info = nav_mod.prepare_daily_nav(
+        asof=str(analysis_asof),
+        account=account_state.account_summary(),
+        prices_csv=Path(prices_path),
+        notes=notes,
+    )
+    try:
+        (run_path / "nav_state.json").write_text(
+            json.dumps(nav_info, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    _nav = nav_info.get("nav")
+    _nav_peak = nav_info.get("peak")
+
     # ---- 3. analyze.py（阶段 3：E=W×S 穿透 + MA20/MA60 过滤）----
+    # 🔴 2026-11-18：ETF 层参数走 **V2 冻结件接缝**（分析链 / 规则层**同一组**）。
+    etf_args, seam_disclosure = _etf_layer_args()
+    try:
+        (run_path / "v2_frozen_params.json").write_text(
+            json.dumps(seam_disclosure, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    if seam_disclosure.get("enabled", False):
+        notes.append(
+            "🔴 **V2 冻结件接缝已接通**：ETF 层参数来自 "
+            f"`{seam_disclosure.get('source')}`（md5 {str(seam_disclosure.get('source_md5'))[:12]}…"
+            f"｜冠军臂 {seam_disclosure.get('winner_arm')}）"
+            f"｜alpha={seam_disclosure.get('params', {}).get('alpha_weight')}"
+            f" / momentum={seam_disclosure.get('params', {}).get('momentum_weight')}"
+            f"｜平滑臂 {seam_disclosure.get('params', {}).get('smoothing_arm')}"
+            f"（平滑{'开' if seam_disclosure.get('params', {}).get('smoothing_enabled') else '关'}）"
+            f"｜MA 入/出 {seam_disclosure.get('params', {}).get('entry_ma_window')}"
+            f"/{seam_disclosure.get('params', {}).get('exit_ma_window')}"
+            f"｜top_k={seam_disclosure.get('params', {}).get('top_k')}"
+            f"｜hold_buffer={seam_disclosure.get('params', {}).get('hold_buffer')}"
+            f"｜同族上限={'关' if not seam_disclosure.get('params', {}).get('allow_theme_cap') else '开'}"
+        )
+    else:
+        notes.append(
+            "🔴 **V2 冻结件接缝未启用** ⇒ ETF 层仍用 V1 老配置"
+            "（E 层 EWMA + MA60 闸门）⇒ 与 V2 五折冠军口径**不一致**"
+        )
     _run_cmd([
         DC.QL_PY, str(_RESEARCH_ROOT / "analyze.py"),
         "--asof", analysis_asof,
@@ -1179,7 +1320,7 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
         # 🔴 2026-11-11（缺陷 C）：顺延池必须是**完整候选池** ⇒ 不能用默认的 Top-15
         "--top-n", str(_analyze_top_n()),
     ] + (["--stock-prices", str(stock_prices_path)] if stock_prices_path else [])
-        + _smoothing_args(), step=STEP_ANALYZE)
+        + etf_args + _brake_args(_nav, _nav_peak), step=STEP_ANALYZE)
     notes.append(f"✅ 分析报告已产出：{report_json}（分析日 = {analysis_asof}）")
     # 🔴 穿透分平滑口径披露：每日链**不复制**平滑参数（单一事实源在研究链 `config.py`），
     #    但日报必须把**实际生效**的排序口径写出来 ⇒ 读分析报告里的 `score_smoothing` 段。
@@ -1207,6 +1348,9 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
         prices_path=prices_path,
         universe_path=universe_path,
         holdings_arg=holdings_arg,
+        nav=_nav,
+        nav_peak=_nav_peak,
+        etf_args=etf_args,
     )
 
     # ---- 3/4. TradingAgents 阶段 ----

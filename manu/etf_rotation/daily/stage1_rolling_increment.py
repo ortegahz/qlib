@@ -1011,6 +1011,13 @@ def fetch_missing_bars(
     # ---- 当天：实时快照（收盘后 = 当日收盘）----
     for day in spot_days:
         path = load_archived_snapshot(day)
+        # 🔴 2026-11-17 夜跑修复（真 bug）：**复用已归档快照时 `source` 从未被赋值**
+        #    ⇒ 下面的 `stats[day] = {"source": source, ...}` 抛
+        #       `UnboundLocalError: cannot access local variable 'source'`。
+        #    触发条件：同一天**第二次**跑全量（当天 bar 已归档 ⇒ 走 `path is not None` 分支）
+        #    ⇒ 后果：自建增量日整体失败 ⇒ 派生目录算成 None ⇒ 校验回落到基座末日
+        #       （把"派生库已覆盖信号日"误报成"数据滞后"）。
+        source = "archived(已归档)"
         if path is None:
             csv = out_dir / f"bars_{day.replace('-', '')}.csv"
             # 🔴 **必须传 prev_day**：spot 通道的「昨收」是**除权调整后的参考价**

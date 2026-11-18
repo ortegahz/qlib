@@ -48,6 +48,15 @@ RUNS_DIR = Path(EXP_ROOT) / "runs"
 #    （LocalExpressionProvider.expression: query_start = start_index - lft_etd），
 #    但扩展不出 handler start_time 之前的数据 ⇒ 若两者相同，训练段开头 60 天的
 #    特征会是 NaN→Fillna 填 0 的垃圾值。这里留 1 年预热。
+# ---------------------------------------------------------------- 换手口径
+#: 🔴 **单边换手系数**（本 Top-K 线的**定义式出处**）：
+#:    ``单边换手(t) = 0.5 × Σ_i |w_i(t) − w_i(t−1)|``（2026-11-04 立档，
+#:    见 ``manu/memory/ashare_topk_20261104.md``「单边换手定义」行）。
+#:    ⇒ ETF-rotation / V2 链的同口径换算**一律走唯一实现**
+#:      ``config_v2.one_way_turnover()``（``manu/etf_rotation/v2/config_v2.py``）；
+#:    ⇒ 本常量**只**服务于本线的**定义式**（Σ|Δw| 直接算单边，不是「双边→单边」的换算）。
+ONE_WAY_TURNOVER_FACTOR = 0.5
+
 START_TIME = "2015-01-01"
 END_TIME = "2026-11-03"
 TRAIN = ("2016-01-01", "2021-12-31")     # 6 年

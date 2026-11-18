@@ -41,6 +41,11 @@ from engine.features import (  # noqa: E402
 from engine.weights import map_scores_to_etfs  # noqa: E402
 
 
+#: 🔴 2026-11-18（V2 冻结件接缝）：``max_per_theme=0`` ⇒ **同族上限不限**
+#:    （V2 冠军 ``allow_theme_cap=False``；⚠️ 同质化冲突对过滤网**仍生效** ⇒ 不完全等价）
+THEME_CAP_UNLIMITED = 10 ** 6
+
+
 def _z(series: pd.Series) -> pd.Series:
     """截面 z-score；非有限值填 0（中性）。"""
     s = series.astype(float)
@@ -124,6 +129,8 @@ def build_portfolio(
     prefer_held_in_theme: bool | None = None,
     alpha_override: pd.DataFrame | None = None,
     smoothing_config: SS.SmoothingConfig | None = None,
+    n_target: int | None = None,
+    max_per_theme: int | None = None,
 ) -> dict:
     """算出 asof 截面的持仓建议。返回 dict（含明细、打分、过滤统计、交易指令）。
 
@@ -136,6 +143,14 @@ def build_portfolio(
     nav_state : dict | None
         组合级风控刹车状态：``{"nav": float, "peak": float, "in_brake": bool,
         "cooldown_left": int}``。``in_brake=True`` ⇒ **整个组合切防守资产**。
+    n_target : int | None
+        **目标持仓只数**（默认 ``config.TARGET_N_HOLDINGS``）。
+        🔴 2026-11-18：V2 冻结件接缝 ⇒ 由 ``frozen_params_wf.json`` 的 ``top_k`` 驱动
+        （V2 五折冠军 = 5，与 V1 同值，但**口径来源必须唯一**）。
+    max_per_theme : int | None
+        **同族上限**（默认 ``config.MAX_PER_THEME``；**0 = 不限**）。
+        🔴 2026-11-18：V2 冠军 ``allow_theme_cap=False`` ⇒ 每日链接缝传 ``0``
+        （⇒ 只放开「同族去重」，同质化冲突对过滤网仍生效 ⇒ 与 V2 **不完全等价**，已披露）。
     alpha_override : pd.DataFrame | None
         **平滑后的穿透分覆盖表**（列含 ``etf_code`` / ``smoothed_score`` / ``score_stability``），由
         ``manu/etf_rotation/score_smoothing.py`` 产出。给了 ⇒ 排序用**平滑分**；
@@ -150,6 +165,9 @@ def build_portfolio(
     """
     asof = pd.Timestamp(asof)
     current_holdings = current_holdings or {}
+    # 🔴 2026-11-18 续四：**刹车态必须提前知道** —— 池过滤（coverage 严格口径）
+    #    排在刹车过滤**前面** ⇒ 刹车态若到后面才算，防守资产已经被剔光了。
+    brake_mode = bool(nav_state and nav_state.get("in_brake"))
 
     feats_all = compute_etf_features(prices, asof)
     merged = apply_liquidity_filter(universe, feats_all)
@@ -199,7 +217,15 @@ def build_portfolio(
     if mode == "e_covered":
         # 🔴 **严格口径（2026-11-06）**：与 `analyze.py` 同口径 ⇒ coverage 不达标一律剔除
         #    （含防守资产）⇒ 回测与实盘**口径一致** ⇒ 旧数字（含旁路）已作废，必须重跑。
-        if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False):
+        # 🔴 2026-11-18 续四（**唯一的例外：刹车档**）：急跌刹车时**防守资产必须能进池**。
+        #    事故形态：黄金 / 国债 / 货币 ETF 本来就**没有 A 股穿透** ⇒ coverage=0
+        #    ⇒ 严格口径把防守资产全剔掉 ⇒ 后面的「刹车 ⇒ 只留防守资产」**无货可留**
+        #    ⇒ 组合变**空仓（100% 现金）**，而不是「切防守资产」
+        #    （实测 2026-11-18：接缝探针 C 档入选 = [] ⇒ 承诺落空）。
+        #    ⇒ 只在**刹车档**开这个口子：那时池里只剩防守资产，**不会**让货币 ETF
+        #    靠自身动量混进正常榜单（2026-11-06 严格口径要防的正是那个问题）。
+        #    ⇒ 正常档**一字不改** ⇒ V1 基线（刹车事件数 = 0）数值**不受影响**。
+        if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False) or brake_mode:
             keep_mask = cand["coverage_ok"].eq(True) | cand["is_defensive"].eq(True)
         else:
             keep_mask = cand["coverage_ok"].eq(True)
@@ -226,7 +252,7 @@ def build_portfolio(
     stats["forced_exit_codes"] = sorted(exit_codes)
 
     # ---- v2 · 组合级回撤刹车：净值自峰值回撤超阈值 ⇒ 整个组合切防守资产 ----
-    brake_mode = bool(nav_state and nav_state.get("in_brake"))
+    #    （``brake_mode`` 已在函数开头算好 —— 池过滤要用）
     if brake_mode:
         cand = cand[cand["is_defensive"]].copy().reset_index(drop=True)
         stats["brake_mode"] = True
@@ -275,8 +301,15 @@ def build_portfolio(
     )
     keep_codes = set(current_holdings) if current_holdings else set()
     buf = C.HOLD_BUFFER if hold_buffer is None else int(hold_buffer)
+    _n_target = int(n_target) if n_target else int(C.TARGET_N_HOLDINGS)
+    _max_per_theme = (
+        THEME_CAP_UNLIMITED if max_per_theme is not None and int(max_per_theme) == 0
+        else (int(max_per_theme) if max_per_theme is not None and int(max_per_theme) > 0
+              else int(C.MAX_PER_THEME))
+    )
     pool = apply_theme_cap(pool, theme_map, keep_codes=keep_codes, hold_buffer=buf,
                            conflicts=conflict_pairs,
+                           n_target=_n_target, max_per_theme=_max_per_theme,
                            prefer_held_in_theme=prefer_held_in_theme)
 
     selected = pool[pool["selected"]].copy().sort_values("final_score", ascending=False)

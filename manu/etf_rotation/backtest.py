@@ -372,8 +372,17 @@ def run_backtest(args: argparse.Namespace) -> dict:
         "cost_assumption": {
             "commission_one_side": args.commission,
             "slippage_one_side": args.slippage,
+            # 🔴 2026-11-18 口径正名：``turnover = Σ|w_new − w_prev|`` = **Σ|Δw|**
+            #    = **双边**（= 总成交额 / 组合净值）⇒ **单边 = 0.5 × 双边**。
+            #    ⚠️ 旧键 ``one_way_turnover_sum`` / ``annualized_one_way_turnover``
+            #       **装的是双边值**（历史错标）⇒ 保留**仅为兼容**，
+            #       新读法一律用带口径后缀的键（下方三行）。
             "one_way_turnover_sum": total_turnover,
             "annualized_one_way_turnover": total_turnover / years,
+            "turnover_sum_two_way": total_turnover,
+            "annualized_turnover_two_way": total_turnover / years,
+            "annualized_turnover_one_way": C.one_way_turnover(total_turnover / years),
+            "turnover_convention": "two_way_sum_abs_dw（Σ|Δw|；单边 = 0.5 × 双边）",
             "total_cost_drag": total_turnover * (args.commission + args.slippage),
             "note": "ETF 免印花税、免过户费；佣金按万 1.5、滑点 5bp（压力情景见 stress）",
         },
@@ -439,7 +448,8 @@ def main() -> int:
     print("=" * 78)
     print(f"场景 {res['scenario']}：年化 {res['portfolio_net']['annualized_return']} "
           f"基准 {res['benchmark_510300']['annualized_return']} 超额 {res['excess_vs_510300']['annualized_return']}")
-    print(f"换手（年化单边） {res['cost_assumption']['annualized_one_way_turnover']:.2f}×  "
+    print(f"换手（年化**双边**） {res['cost_assumption']['annualized_turnover_two_way']:.2f}×"
+          f"（单边 {res['cost_assumption']['annualized_turnover_one_way']:.2f}×）  "
           f"成本拖累 {res['cost_assumption']['total_cost_drag']:.4f}")
     print(f"已写出 {path}")
     return 0

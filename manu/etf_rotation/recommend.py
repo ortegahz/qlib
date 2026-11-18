@@ -52,6 +52,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pool-mode", default=None, help="标的池口径：e_covered（默认）/ all")
     p.add_argument("--prefer-held-in-theme", type=int, default=None, choices=[0, 1],
                    help="同族内「已持有品种优先」：1=开（默认 config.THEME_PREFER_HELD），0=关")
+    p.add_argument("--alpha-weight", type=float, default=None,
+                   help="E（W×S）的合成权重（默认 config.ALPHA_SCORE_WEIGHT）")
+    p.add_argument("--momentum-weight", type=float, default=None,
+                   help="ETF 自身动量分的合成权重（默认 config.MOMENTUM_SCORE_WEIGHT）")
+    p.add_argument("--hold-buffer", type=int, default=None,
+                   help="迟滞缓冲（默认 config.HOLD_BUFFER）")
+    p.add_argument("--target-n-holdings", type=int, default=None,
+                   help="目标持仓只数（默认 config.TARGET_N_HOLDINGS；"
+                        "🔴 V2 冻结件接缝由 frozen_params_wf.json 的 top_k 驱动）")
+    p.add_argument("--max-per-theme", type=int, default=None,
+                   help="同族上限（默认 config.MAX_PER_THEME；**0 = 不限**；"
+                        "🔴 V2 冠军 allow_theme_cap=False ⇒ 接缝传 0）")
     p.add_argument("--entry-ma-window", type=int, default=None, help="入场破位过滤均线（0=关）")
     p.add_argument("--exit-ma-window", type=int, default=None, help="持仓强制退出均线（0=关）")
     # ---- 🔴 穿透分时间平滑（与 analyze.py **同名同默认**，少一个就分叉）----
@@ -136,6 +148,9 @@ def main() -> int:
         scores=scores,
         universe=universe,
         current_holdings=parse_holdings_arg(args.holdings),
+        alpha_weight=args.alpha_weight,
+        momentum_weight=args.momentum_weight,
+        hold_buffer=args.hold_buffer,
         pool_mode=args.pool_mode,
         nav_state=nav_state,
         entry_ma_window=args.entry_ma_window,
@@ -143,6 +158,9 @@ def main() -> int:
         prefer_held_in_theme=(None if args.prefer_held_in_theme is None
                               else bool(args.prefer_held_in_theme)),
         smoothing_config=smoothing_config,
+        n_target=(int(args.target_n_holdings) if args.target_n_holdings is not None
+                  else None),
+        max_per_theme=args.max_per_theme,
     )
     smoothing_diag = result.get("score_smoothing") or {}
     if smoothing_diag.get("warning"):

@@ -89,6 +89,49 @@ class StageError(RuntimeError):
         self.cause = cause
 
 
+def _daily_report_path() -> Path:
+    """daily 那份 ``report.py`` 的**权威路径**（用 daily 包自己所在的目录推）。
+
+    🔴 为什么**不能**用 ``_HERE``（本文件所在目录）当锚点：
+       ``daily/main.py`` 的**变异副本**会被放到**临时目录**里跑
+       （``daily/tests/test_full_run_degradation.py`` 的 5 条变异反证就是这么干的）
+       ⇒ ``_HERE`` 指向临时目录 ⇒ 那里**没有** report.py
+       ⇒ 拿 ``_HERE/report.py`` 当锚点会**误判成「被同名模块抢占」**（实测 5 条变异反证转红）。
+
+    🔴 正确锚点 = ``daily_config.__file__`` 所在目录下的 ``report.py``
+       （``daily_config`` 与 ``report`` **同属 daily 包** ⇒ 必然同一个目录）
+       ⇒ 生产与「副本」两种场景**都**指向**真正的那份** daily report。
+    """
+    import daily_config as _dc  # noqa: PLC0415
+
+    return Path(_dc.__file__).resolve().parent / "report.py"
+
+
+def _import_daily_report():
+    """🔴 2026-11-18 续四（reviewer IMPORTANT-1 的**生产侧**）：**同名模块遮蔽**的 fail-closed 护栏。
+
+    🔴 事故形态：``daily/report.py`` 与 ``v2/report.py`` **同名**
+       ⇒ 裸 ``import report`` 命中哪一份**取决于 ``sys.path`` 顺序**
+       （``v2/etf_layer.py:32`` 就会把 ``v2/`` 插到 ``sys.path[0]``）
+       ⇒ 命中错的那份 ⇒ ``write_report(run_root)`` 与 ``write_report(markdown, path)``
+       **签名不同** ⇒ 崩；更糟的是失败报告路径上的 ``render_failure_report`` 可能根本不存在。
+
+    🔴 今天**实测安全**（``manu/etf_rotation/report.py`` 不存在 ⇒ 命中 daily 那份），
+       但这是**潜伏**风险 ⇒ 这里**显式核对**拿到的到底是哪一份；
+       不是 daily 的就**立刻报错**（fail-closed），**不许**静默用错实现。
+    """
+    import report  # noqa: PLC0415
+
+    got = getattr(report, "__file__", None)
+    want = _daily_report_path()
+    if got is None or Path(got).resolve() != want:
+        raise StageError(
+            "report",
+            f"🔴 报告模块被同名模块抢占：拿到 {got!r}，期望 {str(want)!r}",
+        )
+    return report
+
+
 class LockError(RuntimeError):
     """单实例锁被占（已有另一个实例在跑）—— **不是故障**。"""
 
@@ -577,7 +620,8 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
     import calendar_gate
     import fetch_data
     import notify_email
-    import report
+
+    report = _import_daily_report()
 
     live_trade = bool(getattr(args, "live_trade", False))
     flags = resolve_stage_flags(args)
@@ -1129,7 +1173,7 @@ def _handle_failure(asof: str, stage: str, tb: str, exc: BaseException,
     error_text = f"{type(exc).__name__}: {exc}"
     path = _failure_report_path(asof)
     try:
-        import report
+        report = _import_daily_report()
 
         markdown = report.render_failure_report(
             asof=asof, stage=stage, error=error_text, traceback_text=tb

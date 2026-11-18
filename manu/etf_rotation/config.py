@@ -142,6 +142,13 @@ CASH_RESERVE_RATIO = 0.20
 #: 🔴 每日链（`daily/daily_config.py`）是**另一份**事实源 ⇒ 两边必须同值，
 #:    不一致直接炸（不许静默分叉出两套现金口径）。
 assert CASH_RESERVE_RATIO == DAILY.CASH_RESERVE_RATIO
+#: 🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：**压到 25%~35% 权益上限**。
+#:    含义 = 宏观避险时，组合**权益仓位上限**压到 25%~35%（其余是现金），
+#:    **不是**「降仓 25~35 个百分点」。
+MACRO_DERISK_EQUITY_CAP_MIN = 0.25
+MACRO_DERISK_EQUITY_CAP_MAX = 0.35
+#: 开关（便于审计时切回旧口径）；**不许**在生产里关掉。
+MACRO_DERISK_BAND_ENABLED = True
 #: 🔴 2026-11-11（新增；审计缺陷 C）：`analyze.py --top-n` 的**单一事实源**
 #:    = 报告 JSON 里 `candidates` 的条数 = **顺延池**（TA 合规筛选的补位来源）。
 #:    🔴 **为什么不能太小**：`analyze.py` 的 `--top-n` 默认 **15**，而
@@ -212,6 +219,20 @@ SMOOTHING_ALPHA = 0.20
 #: EWMA 预热历史跨度（**交易日**）—— 取这么多个交易日的观测做递推起点
 #:   ⇒ 保证结果与「无限历史」一致（EWMA 收敛后更早的点权重可忽略）
 SMOOTHING_HISTORY_SPAN_DAYS = 30
+
+# ---------------------------------------------------------------- 换手口径（2026-11-18 正名）
+#: 🔴 **换手口径约定**（与 Top-K 线**同源**）：
+#:    ``manu/memory/ashare_topk_20261104.md``「单边换手定义」行 = ``0.5 × Σ|Δw|``
+#:    ⇒ **Σ|Δw| 是双边**（= 总成交额 / 组合净值），**单边 = 0.5 × 双边**。
+#:    ⚠️ 历史错标：``backtest.py`` 的 ``annualized_one_way_turnover`` 装的是
+#:       ``Σ|Δw| / 年`` ⇒ **值是双边**、键名却说单边（数字被低估/高估 2 倍）。
+#:       ⇒ 新读法一律用**带口径后缀**的键；旧键保留仅为兼容。
+TURNOVER_ONE_WAY_FACTOR = 0.5
+#: **双边 → 单边**换算（唯一实现；V2 侧同名实现见 ``v2/config_v2.one_way_turnover``）
+def one_way_turnover(turnover: float) -> float:
+    """双边换手 → 单边换手（单边 = 0.5 × 双边；**不编数字**，只做口径换算）。"""
+    return float(turnover) * TURNOVER_ONE_WAY_FACTOR
+
 
 # ---------------------------------------------------------------- 换手控制（迟滞）
 #: 已持有的标的，只要排名还在「目标只数 + 缓冲区」之内就**继续持有**（不换手）
@@ -378,6 +399,9 @@ CROWDING_PERCENTILE_THRESHOLD = 0.80
 #: 组合级回撤刹车：组合净值自**历史峰值**回撤 ≥ 阈值 ⇒ 整个组合切到防守资产
 #:   （黄金 ETF / 货币 ETF），而不是继续在权益里挨打。
 DRAWDOWN_BRAKE_THRESHOLD = 0.15      # 回撤 15% ⇒ 触发
+#: 🔴 2026-11-18：每日链（`daily/daily_config.py`）是**另一份**事实源 ⇒ 两边必须同值，
+#:    不一致直接炸（不许静默分叉出两套刹车口径；与 `CASH_RESERVE_RATIO` 同款守卫）。
+assert DRAWDOWN_BRAKE_THRESHOLD == DAILY.DRAWDOWN_BRAKE_THRESHOLD
 #: 刹车触发后至少保持防守的调仓期数（冷静期，防止刚触发就又被打回权益）
 DRAWDOWN_BRAKE_COOLDOWN = 1
 #: 解除条件：净值回到「峰值 × (1 - 该值)」以内才允许恢复权益（默认离峰值 5%）

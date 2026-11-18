@@ -31,6 +31,27 @@ from engine.filters import cluster_by_overlap  # noqa: E402
 import backtest as BT  # noqa: E402
 
 
+def _turnover_pair(cost: dict) -> tuple[float | None, float | None]:
+    """回测 ``cost_assumption`` ⇒ (双边换手, 单边换手)。
+
+    🔴 2026-11-18 口径正名 + 缺键防护：
+      * **双边键优先 → 旧键兜底 → 都没有 ⇒ None**（**任何缺键组合都不许 KeyError**）：
+        ``dict.get(k, default)`` 的 default 是**急切求值** ⇒ 旧键一旦被删就直接炸，
+        而 ``backtest.py`` 的注释明写旧键「保留仅为兼容」⇒ 随时可删。
+      * 单边**只走唯一实现** ``config.one_way_turnover``（🔴 **不许手写 ``* 0.5``**）。
+    """
+    two = cost.get("annualized_turnover_two_way")
+    if two is None:
+        two = cost.get("annualized_one_way_turnover")   # 旧键兜底（原始产物兼容保留）
+    one = cost.get("annualized_turnover_one_way")
+    if one is None and two is not None:
+        try:
+            one = C.one_way_turnover(two)
+        except (TypeError, ValueError):
+            one = None
+    return two, one
+
+
 def _legacy_theme_and_conflicts(holdings, codes, overlap_thresh=None, names=None,
                                 prices=None, asof=None):
     """老口径：并查集聚类（传递闭包），**没有**「直接冲突对」这一层。"""
@@ -65,12 +86,16 @@ def main() -> int:
     bt_args = BT.parse_args()
     res = BT.run_backtest(bt_args)
 
+    cost = res.get("cost_assumption") or {}
+    # 🔴 2026-11-18 口径正名：旧键的值是**双边**（Σ|Δw| / 年）⇒ 带口径后缀。
+    _turn_two, _turn_one = _turnover_pair(cost)
+
     out = {
         "mode": args_cli.mode,
         "portfolio": res["portfolio_net"],
         "benchmark": res["benchmark_510300"],
         "excess": res["excess_vs_510300"],
-        "cost": res["cost_assumption"],
+        "cost": cost,
         "rebalance": res["rebalance"],
         "eval_window": res["eval_window"],
         "n_failed_rebalances": res.get("n_failed_rebalances"),
@@ -88,7 +113,8 @@ def main() -> int:
         "benchmark": res["benchmark_510300"]["annualized_return"],
         "excess": res["excess_vs_510300"]["annualized_return"],
         "mdd": res["portfolio_net"]["max_drawdown"],
-        "turnover": res["cost_assumption"]["annualized_one_way_turnover"],
+        "turnover_two_way": _turn_two,
+        "turnover_one_way": _turn_one,
         "out": str(path),
     }, ensure_ascii=False, indent=2))
     return 0

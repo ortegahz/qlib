@@ -289,12 +289,15 @@ def run_checks(run_root: Path) -> list[tuple[str, str, bool, str]]:
             f"硬编码={'无' if ok else m.group(1)}",
         )
 
+    # 🔴 2026-11-18：f-string 表达式里**不能带反斜杠**（3.12+ 才放开）⇒ 3.10 上 SyntaxError。
+    #    等价改写：先把判断结果落到局部变量，f-string 只引用变量。
+    _stale_skip_residue = 'set(existing["code"].unique())' in src_prices
     checker.add(
         "S3", "fetch_etf_prices.py：resume 必须按「最新日」判定（不得按存在性跳过）",
         "codes_needing_price_refresh" in src_prices
         and 'set(existing["code"].unique())' not in src_prices,
         f"调用策略函数={'codes_needing_price_refresh' in src_prices}"
-        f"｜旧存在性跳过残留={'set(existing[\"code\"].unique())' in src_prices}",
+        f"｜旧存在性跳过残留={_stale_skip_residue}",
     )
     checker.add(
         "S4", "fetch_etf_holdings.py：resume 必须按「快照日期」判定（不得按存在性跳过）",

@@ -23,6 +23,15 @@
 ⇒ 若只在阶段 5 设门槛，阶段 6 会把被拦下的碎单**重新算回来** ⇒ 门槛形同虚设。
 ⇒ 两个脚本**共用本模块**（口径、阈值、分类、披露结构完全一致）⇒ 单一事实源。
 
+🔴 **2026-11-17（夜班 · 真机闸门 P12 红灯）新增口径：风险硬约束优先于最低佣金门槛**
+    真机证据（快照 `20261117_190638`）：512800 目标 16% / 实际超配 22.5%（执行价口径 23.5%），
+    减仓 **2,290 元** < 存量微调门槛 **2,800 元** ⇒ 旧口径把它**拦下**（省 5 元最低佣金）
+    ⇒ 计划权益权重 **87.48%** 破生效上限 **80%**、计划现金权重 **12.52%** 破 **20%** 现金预留
+    ⇒ 闸门 P12 转红（**真 bug**：门槛把「5 元手续费」放在了「权益上限 / 现金预留」之上）。
+    ⇒ 新口径：**拦下这一笔会让组合权益权重破上限时 ⇒ 门槛不得作废这笔减仓**（照常执行并披露）。
+    ⚠️ 只对**减仓**生效：拦下买入只会让现金更多 ⇒ 永远不会破现金预留 ⇒ 行为不变。
+    ⚠️ 「权益上限」= 本轮**生效**上限（`min(1 − 现金预留比例, TA 建议)`）；没给上限 ⇒ 旧行为不变。
+
 【口径纪律】
 * **分类只看三个事实**（当前股数 / 目标股数 / 变动方向），**不看金额**；
 * **被拦下的行不删**（动作从计划里消失 ⇒ 市值凭空蒸发 ⇒ 交付件自相矛盾）
@@ -58,6 +67,94 @@ def classify_min_amount_kind(row: dict) -> str:
     if int(row.get("current_shares") or 0) == 0 and delta > 0:
         return "新开仓"
     return "存量微调"
+
+
+def _weight_snapshot(plans: list[dict]) -> tuple[dict[str, float], dict[str, float]]:
+    """取「门槛作废前」的目标市值与当前市值（**执行价口径**）。
+
+    ⇒ 返回 ``(intended, current)``：``intended[code] = target_shares × price``、
+    ``current[code] = current_shares × price``（单位：元）。
+    ⚠️ 必须在**任何一行被作废之前**取快照 ⇒ 作废会改写 `target_shares`。
+    """
+    intended: dict[str, float] = {}
+    current: dict[str, float] = {}
+    for row in plans or []:
+        code = str(row.get("code") or "")
+        price = row.get("price")
+        if not code or price is None:
+            continue
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            continue
+        intended[code] = float(row.get("target_shares") or 0) * p
+        current[code] = float(row.get("current_shares") or 0) * p
+    return intended, current
+
+
+def risk_veto_for_cap(
+    row: dict,
+    *,
+    kind: str,
+    amount: float,
+    threshold: float,
+    intended: dict[str, float],
+    current: dict[str, float],
+    total_assets: float | None,
+    equity_cap: float | None,
+    min_commission: float = 5.0,
+    commission_rate: float = 0.0,
+    eps: float = 1e-6,
+) -> dict | None:
+    """🔴 **风险硬约束优先**：这笔减仓若被门槛作废 ⇒ 会不会破「权益上限」？
+
+    ⇒ 破 ⇒ 返回**否决记录**（门槛不得作废这一笔）；不破 ⇒ 返回 ``None``（照旧走门槛）。
+    ⚠️ 判定口径（与 `_EQUITY_CAP` / `C.CASH_RESERVE_RATIO` 同源）：
+      * ``w_exec``    = 全部行**按计划成交后**的权益权重（Σ 目标市值 ÷ 总资产）；
+      * ``w_blocked`` = 把这一行拦下（保留当前持仓）后的权益权重；
+      * 只有 ``w_blocked > 上限`` **且** ``w_exec ≤ 上限`` ⇒ **是门槛把组合推破上限**
+        ⇒ 否决作废（这正是「5 元手续费让位给风控」的场景）。
+    ⚠️ 只管**减仓**（``delta_shares < 0``）：拦下买入只会让现金更多 ⇒ 永远不破现金预留。
+    """
+    if equity_cap is None or not total_assets:
+        return None
+    if kind != "存量微调":
+        return None
+    delta = int(row.get("delta_shares") or 0)
+    if delta >= 0:
+        return None
+    code = str(row.get("code") or "")
+    total_assets = float(total_assets)
+    sum_intended = float(sum(intended.values()))
+    w_exec = sum_intended / total_assets
+    w_blocked = (
+        sum_intended - float(intended.get(code, 0.0)) + float(current.get(code, 0.0))
+    ) / total_assets
+    cap = float(equity_cap)
+    if not (w_blocked > cap + eps):
+        return None
+    if w_exec > cap + eps:
+        return None          # 破上限**不是**门槛造成的 ⇒ 不归门槛管
+    fee_now = max(float(min_commission), float(amount) * float(commission_rate or 0.0))
+    return {
+        "code": code,
+        "name": row.get("name"),
+        "kind": kind,
+        "amount": round(float(amount), 2),
+        "threshold": float(threshold),
+        "equity_cap": round(cap, 6),
+        "equity_weight_if_executed": round(w_exec, 6),
+        "equity_weight_if_blocked": round(w_blocked, 6),
+        "min_commission_paid": round(fee_now, 2),
+        "reason": (
+            f"🔴 **风险硬约束优先于最低佣金门槛**：这笔减仓 {float(amount):.0f} 元虽低于"
+            f"「{kind}」门槛 {float(threshold):.0f} 元，但**拦下它**会让计划权益权重升到 "
+            f"**{w_blocked * 100:.2f}%**（破生效上限 {cap * 100:.2f}%）"
+            f" ⇒ 门槛**不得**作废这一笔 ⇒ 本轮照常执行"
+            f"（多付最低佣金 {fee_now:.2f} 元，换回组合回到 "
+            f"{w_exec * 100:.2f}% ≤ {cap * 100:.2f}%）"
+        ),
+    }
 
 
 def resolve_thresholds(overrides: dict | None = None) -> dict:
@@ -201,10 +298,13 @@ def apply_min_trade_threshold(
     thresholds: dict | None = None,
     enabled: bool = True,
     price_basis: str = "",
+    equity_cap: float | None = None,
 ) -> dict:
     """最小调仓门槛（方案一）：把**低于门槛**的调仓动作就地作废（**行不删**）。
 
-    ⇒ 返回值 = **披露结构**（挂到 `plan["min_amount_gate"]` ⇒ JSON 与 MD 如实呈现）。
+    ⇒ 返回值 = **披露结构**（挂到 ``plan["min_amount_gate"]`` ⇒ JSON 与 MD 如实呈现）。
+    🔴 ``equity_cap``（本轮**生效**权益上限）给了以后，多一道**风险否决**：
+    拦下某笔减仓会让组合权益权重**破上限** ⇒ **不得作废这一笔**（风控优先于手续费）。
     """
     thr = resolve_thresholds(thresholds)
     min_commission = float(C.ETF_MIN_COMMISSION_STRICT)
@@ -214,6 +314,11 @@ def apply_min_trade_threshold(
     new_open_total = 0
     new_open_skipped = 0
     saved_fee = 0.0
+    #: 🔴 风险否决记录（门槛**没有**拦下、但**差点**拦下的减仓 ⇒ 如实披露）
+    risk_overrides: list[dict] = []
+
+    #: 🔴 作废前的权重快照（作废会改写 `target_shares` ⇒ 必须先取）
+    _intended, _current = _weight_snapshot(plans)
 
     if enabled:
         for row in plans:
@@ -234,6 +339,25 @@ def apply_min_trade_threshold(
                 new_open_total += 1
             if amount >= limit:
                 continue                      # 达标 ⇒ 放行
+
+            #: 🔴 风险硬约束优先（2026-11-17 真机 P12 红灯修）：
+            #:    拦下这笔**减仓**会不会把组合权益权重推破生效上限？
+            #:    会 ⇒ 门槛**不得**作废它（省 5 元手续费 ≠ 破风控约束）。
+            _veto = risk_veto_for_cap(
+                row,
+                kind=kind,
+                amount=amount,
+                threshold=limit,
+                intended=_intended,
+                current=_current,
+                total_assets=total_assets,
+                equity_cap=equity_cap,
+                min_commission=min_commission,
+                commission_rate=commission_rate,
+            )
+            if _veto is not None:
+                risk_overrides.append(_veto)
+                continue                      # **不拦** ⇒ 这一行照常执行
 
             record = block_row(
                 row,
@@ -259,6 +383,14 @@ def apply_min_trade_threshold(
     ]
     if price_basis:
         notes.append(f"判定金额口径 = **{price_basis}**")
+    if risk_overrides:
+        notes.append(
+            "🔴 **风险硬约束优先于最低佣金门槛**：本轮有 "
+            f"**{len(risk_overrides)}** 笔减仓虽低于门槛，但**拦下它**会让计划权益权重"
+            "破生效上限 ⇒ 门槛**未**作废 ⇒ 照常执行（多付的最低佣金已计入现金流）"
+        )
+        for _ov in risk_overrides:
+            notes.append(f"　· {_ov.get('code')} {_ov.get('name')}｜{_ov.get('reason')}")
     if deadlock:
         notes.append(
             "🔴 **门槛与账户规模不匹配（数学死锁）**：本轮**所有**新开仓都被门槛拦下"
@@ -275,5 +407,8 @@ def apply_min_trade_threshold(
         "new_open_skipped": new_open_skipped,
         "deadlock_risk": deadlock,
         "min_commission_saved": round(saved_fee, 2),
+        "risk_overrides": risk_overrides,
+        "risk_overrides_count": len(risk_overrides),
+        "equity_cap_used": (round(float(equity_cap), 6) if equity_cap is not None else None),
         "notes": notes,
     }

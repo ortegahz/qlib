@@ -717,8 +717,17 @@ _TABLE_CURRENT_HEADER_WORDS: tuple[str, ...] = (
 #:    ⇒ 目标是**转变之后**那个数（10%）；前面的 20%/22.54% 是**现值**。
 #:    ⚠️ 旧口径把「由/从」放进 `SKIP_BEFORE` ⇒ 两个数**都被**跳过 ⇒ 整格 `None`
 #:    ⇒ `target_pct` 缺失 ⇒ `make_decision_scenarios` 硬失败（与本次要修的缺陷同类）。
+#: 🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证 · A20③ 红灯实证）：
+#:    **过渡写法里的箭头**（「22.54% → 约12%」）不在旧标记表里
+#:    ⇒ 旧口径取**第一个**百分数（= **起点** 22.54%）⇒ 目标权重取错
+#:    ⇒ 计划把 512800 记成「目标 22.5%」（= 当前权重）
+#:    ⇒ ① A20③「最终裁决必须可回放」判红（原文里没有独立的「22.5」这个数）
+#:       ② 交付面的「TA 目标」与裁决原文（减至约 12%）**自相矛盾**。
+#:    ⇒ 修法：把箭头形态（→ / -> / ⇒ / ⟶ / —>）也认作**转变标记**
+#:      ⇒ 取箭头**之后**那个百分数（= 落点）⇒ 12%。
 _TABLE_TRANSITION_RE = re.compile(
-    r"(?:降至|减至|降到|调至|下调至|下调到|压缩至|压缩到|调整至|调整到)"
+    r"(?:降至|减至|降到|调至|下调至|下调到|压缩至|压缩到|调整至|调整到"
+    r"|→|->|⇒|⟶|—>)"
 )
 #: 目标格里「数字**前面/后面**」只看**紧邻**的那一段（到最近的标点/括号为止）
 #:    ⇒ 修旧「8 字滑窗」把**别的分句**的排除词也算了进来（假绿：抽不出就静默 None）。
@@ -1047,6 +1056,25 @@ def extract_final_decision(text: str) -> dict:
         if not slot["evidence"]:
             slot["evidence"] = evidence[:_EVIDENCE_MAX]
 
+    # 🔴 2026-11-17（真机件 `snapshots/20261117_210415` · A20⑥ 红灯实证）
+    #    **裸「卖出」的豁免必须做到「章级」**（与交付面探针 `probe_llm_parser`
+    #    的口径一致 —— 探针那边本来就是章级，生产这边只有**句级** ⇒ 口径漂移）。
+    #    真机原文（最终交易决定章）：
+    #      「三位风险分析员都同意512800应当卖出，分歧仅在于卖出后是否清零。」
+    #      「激进派与中立派关于"减仓而不清仓"的论证更有说服气：512800最终分1.3372…」
+    #    ⇒ 旧口径只在**同一句**里找「减仓/部分卖出」证据 ⇒ 第一句（章内**别处**
+    #      才说「减仓而不清仓」）把 512800 判成「卖 + 0%」（= 清仓）
+    #    ⇒ 与同章原文自相矛盾 ⇒ A20⑥ 判红（且交付件会把「减至 16%」写成「清零」）。
+    #    ⇒ 现在：**章级**汇总「减仓/部分卖出」点名的代码 ⇒ 命中时**裸卖出不生效**
+    #      ⇒ 交给更明确的表述裁决（第 ③ 档「减仓 / 减至」）。
+    #    ⚠️ 明写「清仓 / 全部卖出 / 不买 / 不建仓」**不受**此豁免影响
+    #      （真清仓照样判零方向 ⇒ 不许把探针改废）。
+    _section_partial: set[str] = set()
+    for _s_start, _s_end, _sentence in _sentence_offsets(section):
+        if _is_conditional(_sentence):
+            continue
+        _section_partial |= _sentence_partial_sell_codes(_sentence)
+
     # ---- 第 1 遍：子句级「动作词」⇒ 同一子句里的代码**一起**成立 ----
     for s_start, s_end, sentence in _sentence_offsets(section):
         if _is_conditional(sentence):
@@ -1088,7 +1116,8 @@ def extract_final_decision(text: str) -> dict:
                         #    ⇒ 交给更明确的表述裁决（第 ② 档「卖出约 N 份」/ 第 ③ 档「减仓」）。
                         if (direction == "卖" and target_pct == 0.0
                                 and note == "原文写明卖出"
-                                and code in _sentence_partial_sell_codes(sentence)):
+                                and (code in _sentence_partial_sell_codes(sentence)
+                                     or code in _section_partial)):
                             continue
                         slot["direction"] = direction
                         slot["note"] = note
@@ -1413,6 +1442,18 @@ _REJECT_NEG_PREFIX_RE = re.compile(
     r"(?<!得)(?<!未尝)(?<!无)"
     r"(?:尚未|从未|不再|不予|不得|不可|不能|不应|无需|无须|避免|禁止|杜绝|并非|不|未)"
     r"[\s*`_~]*(?:正式|再|会|予以|进行|做|作|考虑|准备|打算)?[\s*`_~]*"
+    # 🔴 2026-11-17（真机交付件 `snapshots/20261117_162113` 实证）**分支②**：
+    #    否定前缀 + 「对/向 <代码> 行使/动用 … 一票 否决」
+    #    ⇒ 旧口径要求「否定词 + 少量修饰 + **裸动词**」**贴脸**
+    #    ⇒ 「**不对**512800**行使一票**否决」中间隔了「对 + 代码 + 行使 + 一票」
+    #    ⇒ 逃过护栏 ⇒ `512800` 被当成**一票否决**
+    #    （而研究经理原文是「**不对**512800行使一票否决」⇒ 恰恰是**不否决**）
+    #    ⇒ 交付层把 512800 冻结成「维持席位」（23.48%）、把一个槽位白送 `512010`
+    #    ⇒ **TA 最终裁定的「卖出约 4,700 份、保留约 3,000 份」被整条吞掉**。
+    #    ⇒ 分支②只放**受限**的中间成分（对/向/针对 + 可选代码 + 行使类动词 + 可选「一票」）
+    #    ⇒ 真否决「对512800行使一票否决」（**无否定前缀**）**不受影响**。
+    r"(?:(?:对|向|针对)[\s*`_~]*(?:\d{6})?[\s*`_~]*"
+    r"(?:行使|动用|使用|施加|加以|实施|投下)?[\s*`_~]*(?:一票)?[\s*`_~]*)?"
     r"(?P<verb>否决|剔除|排除|移除|回避|暂缓|放弃)"
 )
 
@@ -1518,6 +1559,12 @@ _ITEM_SPLIT_RE = re.compile(r"、")
 _ITEM_ACTION_WORDS: tuple[str, ...] = (
     "只", "仅", "买", "建仓", "加仓", "补仓", "保留", "持有", "维持", "留",
     "卖", "清仓", "减持", "减仓", "减到", "换成", "换入", "配置", "观望", "观察",
+    # 🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证）：**降配类**动作
+    #    「实际部署因否决515650、**削减159207/159263**而落在…」
+    #    ⇒ 旧词表没有「削减」⇒ 该并列项被当成「没有自带动作」⇒ **前面那项的
+    #    否决动词跨项泄漏**过去 ⇒ 159207/159263（TA 要买）被连坐成否决 ✗✗
+    #    ⇒ 补齐「削减/降权/降配/减配」⇒ 这些项**自带动作** ⇒ 不受外部动词管辖。
+    "削减", "降权", "降配", "减配",
 )
 
 
@@ -2003,6 +2050,33 @@ def _hypothetical_verb_positions(
     return positions
 
 
+def _hypothetical_codes(text: str) -> set[str]:
+    """本段里处于**让步/假设结构**中的代码（⇒ 那不是本轮裁决对象）。
+
+    🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证）：
+       表格行 `| 515020 / 516310 / 512820 | 不作为替代 | 0 | …**即便512800被否决**
+       也不做机械替换… |` ⇒ 表格路径**没有**假设护栏 ⇒ 512800 被当成被否决 ✗
+       （真机裁决明写 512800「保留核心仓、超配部分必须减」⇒ 不是否决）。
+    ⇒ 这里把「让步词 + （可选代码） + （可选被动）+ 否决动词」里的**代码**挑出来。
+    """
+    out: set[str] = set()
+    if not text:
+        return out
+    for marker in _HYPOTHETICAL_MARKERS:
+        for m in re.finditer(re.escape(marker), text):
+            gap = _HYPOTHETICAL_GAP_RE.match(text, m.end())
+            if gap is None:
+                continue
+            code_m = re.search(r"\d{6}", gap.group(0))
+            if code_m is None:
+                continue
+            for vpos, _word in _reject_verb_hits(text[gap.end():]):
+                if vpos == 0:
+                    out.add(code_m.group(0))
+                    break
+    return out
+
+
 def _codes_with_own_action(
     clause: str, cstart: int, subjects: list[tuple[int, str]]
 ) -> set[str]:
@@ -2040,10 +2114,19 @@ def _codes_with_own_action(
 #:   —— 真机原文：`正因如此我拒绝熊方对 515650 的否决：…`
 #:   ⇒ 旧正则只认「熊方的否决」⇒ 夹在中间的「对 515650」让它**匹配不上**
 #:   ⇒ 「否决」动词被当成本轮的裁决 ⇒ 515650 被写进「TA 一票否决」名单。
+#: 🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证 · G-TA1 红灯实证）：
+#:    **阵营称呼的词表缺口** —— 真机原文写的是「**熊派** / **多派**」
+#:    （不是「熊方 / 牛方」）⇒ 旧词表**认不出主语**
+#:    ⇒ 「熊派否决512800的依据是…」里的「否决」被当**权威裁决**
+#:    ⇒ 512800 进否决名单 ⇒ 同子句的 515450/159207/159263（相关性**对照对象**）
+#:       被**连坐** ⇒ 而 TA 明确要买这三只 ⇒ G-TA1 红灯。
+#:    ⇒ 修法：把「派」系阵营词**补进**本层（第三方立场元指代层）⇒ 各司其职不变。
 _META_VETO_RE = re.compile(
-    r"(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方)"
+    r"(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方"
+    r"|熊派|牛派|多派|多头派|空头派|空方派|多方派)"
     r"\s*(?:对|针对|给)?\s*(?:\d{6}\s*)?的?\s*(?:一票\s*)?否决"
-    r"|否决\s*(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方)"
+    r"|否决\s*(?:熊方|牛方|空方|多头|空头|对方|对手方|多方|空方"
+    r"|熊派|牛派|多派|多头派|空头派|空方派|多方派)"
 )
 
 #: 🔴 2026-11-13（真 bug · 交付件 `20261113_092926`）**「驳回否决」的元结构**
@@ -2136,6 +2219,7 @@ _EXPLICIT_ITEM_RE = re.compile(
     r"^[ \t]*\d+[)）][ \t]*[*_`]*([0-9]{6})[*_`]*"
 )
 
+
 def _explicit_item_verdicts(text: str) -> dict[str, tuple[str, int]]:
     """权威节里**逐只点名**的裁决条目 ⇒ ``{代码: (条目原文, 条目起点偏移)}``。
 
@@ -2177,11 +2261,143 @@ def _weakened_veto_positions(clause: str, verbs: list[tuple[int, str]]) -> set[i
     return out
 
 
-def _meta_veto_positions(clause: str, verbs: list[tuple[int, str]]) -> set[int]:
+#: 🔴 2026-11-17（真机件 `snapshots/20261117_210415` · G-TA1 红灯实证）
+#:    **权威段引用「第三方（观点角色）提出的否决」** ⇒ 那不是权威自己的裁决。
+#:    真机原文（辩论裁决章 · 裁判自己的话）：
+#:      「空头提出否决 512800 的宏观风险没有新增事件证据支持，
+#:        不能把"外部数据缺失"当作已经发生黑天鹅。」
+#:    ⇒ 裁判是在**驳回**空头的提议（旧口径却把「否决 512800」当成权威否决）
+#:    ⇒ 512800 被误当成「TA 一票否决」⇒ 交付层把它冻结成「维持席位」并顺延补位
+#:       512690（原文明写要清仓）⇒ **双错**。
+#:    ⇒ 修法：否决动词的**主语是观点角色**（空头/多头/激进派/…）+「提出/建议/…」
+#:      ⇒ 该否决属于**第三方提议** ⇒ **不算本轮否决**
+#:      （**除非**同句出现「采纳/接受/同意…」等**采纳**措辞 ⇒ 权威接受了那个提议）。
+#:    ⚠️ 与既有口径一致：「观点没有否决权」—— 这里只是把该原则**落到句内引用**上。
+_VIEWPOINT_ROLES: tuple[str, ...] = (
+    "空头", "多头", "激进派", "保守派", "中立派", "熊方", "牛方",
+    "多方", "空方", "对方", "对手方", "研究员", "分析师",
+    # 🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证）：真机原文用的是
+    #    「**熊派** / **多派**」（不是「熊方/牛方」）⇒ 旧词表**认不出**主语
+    #    ⇒ 观点立场的否决被当成权威裁决。
+    "熊派", "牛派", "多派", "多头派", "空头派", "空方派", "多方派",
+)
+#: 「观点角色 + **提议动词**（提出/建议/…）+（对 <代码>）? +（一票）? + 否决类动词」
+#: 🔴 **必须带提议动词**：不带提议动词的形态（「熊方的否决」「空头否决 X」）
+#:    由既有的 `_META_VETO_RE`（第三方立场元指代）负责 ⇒ 两层护栏**各司其职**
+#:    （否则本护栏会把元指代那条也吃掉 ⇒ 既有变异反证测试会失效）。
+_THIRD_PARTY_VETO_RE = re.compile(
+    r"(?:" + "|".join(_VIEWPOINT_ROLES) + r")\s*(?:的)?\s*"
+    r"(?:提出|提议|建议|主张|要求|坚持|力主)\s*的?\s*"
+    r"(?:对\s*(?:\d{6}\s*)?)?(?:一票\s*)?"
+    r"(?:否决|剔除|排除|移除|回避)"
+)
+#: 「第三方提议**被采纳**」标记（否定式「不采纳/未采纳/拒绝采纳」**不算**采纳）
+_ADOPTION_RE = re.compile(r"采纳|接受|同意|照办|据此|予以否决")
+_ADOPTION_NEGATIONS: tuple[str, ...] = ("不", "未", "非", "拒")
+
+
+#: 🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证 · G-TA1 红灯实证）
+#:    **观点角色作「纯主语」+ 否决动词**（**没有**「提出/建议」等提议动词）
+#:    ⇒ 那是**第三方立场**，不是权威自己的裁决。
+#:    真机原文（研究经理结论章 + 辩论裁决章 · 裁判在**驳回**熊派）：
+#:      「1. 熊派否决512800的依据是"与515450/159207/159263的120日相关性0.835—0.848"。」
+#:    ⇒ 旧口径把「熊派否决512800」当成**权威否决**
+#:    ⇒ 512800 进 `ta_screening.rejected`
+#:    ⇒ **同一子句**里的 515450/159207/159263（只是相关性**对照对象**）被**连坐**
+#:    ⇒ 而 TA 明确要买 515450/159207/159263 ⇒ G-TA1「否决名单里有买侧标的」红灯。
+#:    ⇒ 修法：主语是**纯观点角色**（熊派/多派/空头/…）+（对 CODE）?+（一票）?
+#:      + 否决动词 ⇒ 该否决属于**第三方立场** ⇒ 不算本轮否决。
+#:    ⚠️ 两条豁免（保证**真否决**不被误伤）：
+#:      ① 同**句**出现「采纳/接受/同意/照办/据此」等**采纳**措辞
+#:         （真机原文：「保守派与中立派对515650行使一票否决……**我采纳这一多数意见**」）
+#:         ⇒ 权威接受了那个提议 ⇒ 仍算否决；
+#:      ② 同**子句**的主语里带**权威角色**（研究经理/裁判/Trader/规则层）
+#:         （真机原文：「563020三位分析师与**研究经理**一致否决」）⇒ 权威自己的裁决 ⇒ 仍算否决。
+#: ⚠️ 角色表**刻意不含** `_META_VETO_RE` 已覆盖的角色（熊方/牛方/空方/多头/空头/
+#:    对方/对手方/多方 + 派系阵营词）⇒ **两层严格各司其职**
+#:    （否则「熊方的否决」会被两层同时接管 ⇒ 既有变异反证测试
+#:      `test_meta_veto_mutation_guard_is_load_bearing` 会空转）。
+#: ⚠️ 也**刻意不带**「的」⇒ 「X方的否决」这类**元指代**归 `_META_VETO_RE` 管。
+_VIEWPOINT_SUBJECT_ROLES: tuple[str, ...] = (
+    "激进派", "保守派", "中立派", "研究员", "分析师",
+)
+_VIEWPOINT_SUBJECT_VETO_RE = re.compile(
+    r"(?:" + "|".join(_VIEWPOINT_SUBJECT_ROLES) + r")\s*"
+    r"(?:对\s*(?:\d{6}\s*)?)?(?:一票\s*)?"
+    r"(?:否决|剔除|排除|移除|回避)"
+)
+#: **权威角色**（裁判自己）⇒ 子句主语里出现它 ⇒ 不是「纯观点角色」⇒ 豁免纯主语护栏
+_AUTHORITY_AGENT_RE = re.compile(
+    r"研究经理|裁判|交易员|Trader|规则层|委员会|最终交易决定"
+)
+
+
+def _viewpoint_subject_veto_positions(
+    clause: str, verbs: list[tuple[int, str]], sentence: str = ""
+) -> set[int]:
+    """**观点角色作纯主语**的否决动词位置 ⇒ 不是权威自己的裁决。
+
+    🔴 2026-11-17（真机 `snapshots/20261117_221846` 实证）：
+       「熊派否决512800的依据是…」⇒ 旧口径误判成权威否决 ⇒ 512800 被冻成「维持席位」
+       ⇒ 同子句的 515450/159207/159263（TA 明确要买）被连坐 ⇒ G-TA1 红灯。
+    """
+    if _has_adoption(sentence or ""):
+        return set()                      # ① 权威采纳了 ⇒ 仍算否决
+    if _AUTHORITY_AGENT_RE.search(clause):
+        return set()                      # ② 子句主语含权威角色 ⇒ 权威自己的裁决
+    out: set[int] = set()
+    for match in _VIEWPOINT_SUBJECT_VETO_RE.finditer(clause):
+        for pos, _word in verbs:
+            if match.start() <= pos < match.end():
+                out.add(pos)
+    return out
+
+
+def _has_adoption(text: str) -> bool:
+    """这段话里有没有「第三方提议**被采纳**」的措辞（否定式不算）。"""
+    raw = text or ""
+    for match in _ADOPTION_RE.finditer(raw):
+        prefix = raw[max(0, match.start() - 3):match.start()]
+        if any(neg in prefix for neg in _ADOPTION_NEGATIONS):
+            continue
+        return True
+    return False
+
+
+def _third_party_veto_positions(clause: str, verbs: list[tuple[int, str]],
+                                sentence: str = "") -> set[int]:
+    """**第三方（观点角色）提出的**否决动词位置 ⇒ 不是权威自己的裁决。
+
+    🔴 2026-11-17（真机 `snapshots/20261117_210415` 实证）：裁判在权威段里
+       **引用**空头的否决提议（「空头提出否决 512800 …」）⇒ 旧口径误判成权威否决
+       ⇒ 512800 被冻成「维持席位」⇒ 顺延补位 512690 ⇒ 双错。
+    """
+    if _has_adoption(sentence or ""):
+        return set()
+    out: set[int] = set()
+    for match in _THIRD_PARTY_VETO_RE.finditer(clause):
+        for pos, _word in verbs:
+            if match.start() <= pos < match.end():
+                out.add(pos)
+    return out
+
+
+def _meta_veto_positions(clause: str, verbs: list[tuple[int, str]],
+                         sentence: str = "") -> set[int]:
     """第三方立场元指代（`熊方的否决` / `否决熊方`）里的否决动词位置。
 
     ⇒ 这些动词**不否决**子句里的任何代码（否则「被保留的那只」会被当成被否决）。
+
+    🔴 2026-11-17（真机件 `snapshots/20261117_221846` 实证 · G-TA1 红灯实证）：
+       真机原文写的是「**熊派**否决512800的依据是…」⇒ 阵营称呼的词表缺口
+       ⇒ 这一层**认不出主语** ⇒ 否决动词被当**权威裁决**
+       ⇒ 512800 进否决名单 ⇒ 同子句的 515450/159207/159263（相关性对照对象）被**连坐**
+       ⇒ 而 TA 明确要买这三只 ⇒ G-TA1 红灯 ⇒ 本层补齐「派」系阵营词（见 `_META_VETO_RE`）。
+    🔴 **采纳豁免**：权威**采纳**了那个第三方否决（「……予以采纳该提议」）
+       ⇒ 那就**是**本轮裁决 ⇒ 本层**不豁免**（否则会漏放真否决）。
     """
+    if _has_adoption(sentence or ""):
+        return set()
     out: set[int] = set()
     for match in _META_VETO_RE.finditer(clause):
         for pos, _word in verbs:
@@ -2272,7 +2488,7 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
         # 🔴 2026-11-11（真误伤 · 第 5 处根因）：「**熊方的否决**」这类
         #    **第三方立场**的元指代 ⇒ 否决权属于对方，**不否决**本子句里任何代码
         #    （否则「研究经理明写『持 / 减至目标权重』的 512800」会被当成被否决）。
-        meta_local = _meta_veto_positions(clause, clause_verbs)
+        meta_local = _meta_veto_positions(clause, clause_verbs, sentence)
         # 🔴 2026-11-11（真误伤 · 第 5 处根因续）：「一票否决**理由不足**」
         #    ⇒ 这条**否决不成立**（权威段明确否掉了对方的否决）⇒ 否决动词作废。
         weak_local = _weakened_veto_positions(clause, clause_verbs)
@@ -2280,6 +2496,12 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
         #    （`我拒绝熊方对 515650 的否决`）里的否决动词**不否决**该代码
         #    ⇒ 说话人驳回的是「否决这件事」，并且往往**买入**这只标的。
         refused_local = _refused_veto_positions(clause, clause_verbs)
+        # 🔴 2026-11-17：第三方（观点角色）**提出的**否决 ⇒ 不是权威裁决
+        third_local = _third_party_veto_positions(clause, clause_verbs, sentence)
+        # 🔴 2026-11-17（真机 `20261117_221846` 实证）：**观点角色作纯主语**的否决
+        #    （「熊派否决512800的依据是…」）⇒ 第三方立场 ⇒ 不是权威裁决
+        viewpoint_local = _viewpoint_subject_veto_positions(
+            clause, clause_verbs, sentence)
         # 🔴 2026-11-13（真 bug · G-TA1）：「只可**作否决的补充理由**」里的「否决」
         #    是**名词**（宾语），不是裁决动词 ⇒ 位置作废。
         noun_local = _noun_veto_positions(clause, clause_verbs)
@@ -2288,7 +2510,8 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
             for pos, word in clause_verbs
             if pos not in hypo_local and pos not in meta_local
             and pos not in weak_local and pos not in refused_local
-            and pos not in noun_local
+            and pos not in noun_local and pos not in third_local
+            and pos not in viewpoint_local
         ]
         # 🔴 2026-11-11 修（真误伤）：**比较引用 / 工具引用**里的代码
         #    （「与 515450 相关性 0.917」「只用 515450 表达足够」）
@@ -2383,8 +2606,12 @@ def _row_hits(row: str) -> list[tuple[str, str]]:
     has_intent, attached = _buy_intent(row)
     if has_intent and not attached:
         return []
+    #: 🔴 2026-11-17（真机 `20261117_221846` 实证）：**假设结构**里的代码
+    #:    （「即便512800被否决也不做机械替换」）⇒ 不是本轮裁决对象
+    _hypo = _hypothetical_codes(action)
     codes = list(dict.fromkeys(
-        code_list + [m.group(1) for m in _CODE_RE.finditer(action)]))
+        code_list + [m.group(1) for m in _CODE_RE.finditer(action)
+                     if m.group(1) not in _hypo]))
     codes = [c for c in codes if c not in attached]
     if _positive_weight(cells, code_idx):
         # 🔴 本行目标权重 > 0 ⇒ **本行自己的代码**不是否决（买行）。

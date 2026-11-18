@@ -12,7 +12,10 @@
 ③ 解析不出 ⇒ **完全保持原行为**（产物逐字节不变）；
 ④ 席位目标权重**等比缩放**到「生效上限 − 维持行占额」，差额**留现金**；
 ⑤ 「维持」行（被 TA 否决但仍在持仓）**权重不动**；
-⑥ `ta_screening.equity_cap` **恒为 0.8**（验收脚本按它断言，不许被 TA 改写）。
+⑥ `ta_screening.equity_cap` **恒为 0.8**（验收脚本按它断言，不许被 TA 改写）；
+⑦ 🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：**宏观降仓带 25%~35%**
+   ⇒ TA 建议 36% ⇒ 生效上限 = **0.35**（压进带内**上沿**；TA 更严 ⇒ 保留 TA 的值）。
+   （带的完整钉子见同目录 `test_macro_derisk_band.py`。）
 """
 
 from __future__ import annotations
@@ -181,12 +184,19 @@ def test_解析_高于硬上限_忽略():
 
 # ───────────────────────── ② 端到端（build_plan） ─────────────────────────
 def test_端到端_TA建议36_权益被压降(tmp_path):
+    """🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：生效上限口径**已改**。
+
+    旧口径：TA 建议 36% ⇒ 生效上限 = 0.36（直接采纳 TA 的值）。
+    新口径：**宏观降仓带** = 25%~35% ⇒ TA 建议 36% ⇒ 生效上限 = **0.35**
+    （压进带内**上沿**；带只往下压，**绝不抬高**）。
+    ⇒ 下面所有 0.36 都改成 0.35（**不许**为了让旧断言变绿而回退新口径）。
+    """
     plan = _plan(tmp_path, _DECISION_REDUCE)
     scr = plan.get("ta_screening") or {}
-    assert abs(float(scr.get("equity_cap_effective") or 0) - 0.36) < 1e-9, scr
+    assert abs(float(scr.get("equity_cap_effective") or 0) - 0.35) < 1e-9, scr
     total = _sum_target_weight(plan)
-    assert total <= 0.36 + 1e-9, f"计划权益合计 {total} 超过生效上限 0.36"
-    assert abs(total - 0.36) < 1e-9, f"计划权益合计 {total}，应恰好落在 0.36"
+    assert total <= 0.35 + 1e-9, f"计划权益合计 {total} 超过生效上限 0.35"
+    assert abs(total - 0.35) < 1e-9, f"计划权益合计 {total}，应恰好落在 0.35"
     # 🔴 `equity_cap` 恒为 0.8（验收脚本按它断言）
     assert abs(float(scr.get("equity_cap") or 0) - 0.8) < 1e-9, scr
     rec = scr.get("equity_cap_ta_recommendation") or {}
@@ -229,7 +239,8 @@ def test_端到端_维持行权重不动(tmp_path):
     assert hold_row.get("ta_rejected") is True, hold_row
     assert abs(float(hold_row["target_weight"]) - 6000.0 / 30000.0) < 1e-9, hold_row
     total = _sum_target_weight(plan)
-    assert total <= 0.36 + 1e-9, f"计划权益合计 {total} 超过生效上限 0.36"
+    # 🔴 2026-11-18：新口径生效上限 = 0.35（带内上沿），不再是 0.36。
+    assert total <= 0.35 + 1e-9, f"计划权益合计 {total} 超过生效上限 0.35"
 
 
 def test_端到端_md必须披露Beta避险(tmp_path):
@@ -244,7 +255,7 @@ def test_变异负例_关掉建议解析_权益不再被压降(tmp_path, monkeyp
     """把 `_resolve_ta_equity_cap` 打成「无建议」⇒ 权益**必须**回到 80%
     ⇒ 证明上面那些断言真的在检验「采纳 TA 建议」这件事。"""
     plan_ok = _plan(tmp_path / "ok", _DECISION_REDUCE)
-    assert _sum_target_weight(plan_ok) <= 0.36 + 1e-9
+    assert _sum_target_weight(plan_ok) <= 0.35 + 1e-9
     monkeypatch.setattr(
         F, "_resolve_ta_equity_cap",
         lambda raw: {"pct": None, "evidence": "", "reason": "no_ta_advice"},
@@ -323,8 +334,10 @@ def test_解析_小数形式判越界_不许静默压降100倍():
 def test_端到端_顺延补位继承缩放后权重(tmp_path):
     """🔴 **最关键的一条**：席位等比缩放必须发生在 TA 筛选**之前**。
 
-    ⇒ 顺延补位者拿到的是**缩放后**的权重（0.18），**不是**未缩放的 0.4；
-    ⇒ 否则 Σtarget_weight = 0.4 + 0.18 = 0.58 > 生效上限 0.36（权益自相矛盾）。
+    ⇒ 顺延补位者拿到的是**缩放后**的权重（0.175），**不是**未缩放的 0.4；
+    ⇒ 否则 Σtarget_weight = 0.4 + 0.175 = 0.575 > 生效上限 0.35（权益自相矛盾）。
+    🔴 2026-11-18（新口径）：生效上限 = **0.35**（宏观降仓带 25%~35% 的上沿）
+    ⇒ 缩放系数 = 0.35 / 0.8 = 0.4375 ⇒ 补位者权重 = 0.4 × 0.4375 = **0.175**。
     """
     actions = [
         {"code": "512800", "name": "银行ETF华宝", "action": "买入",
@@ -353,15 +366,15 @@ def test_端到端_顺延补位继承缩放后权重(tmp_path):
     rows = {str(p["code"]): p for p in plan.get("actions") or []}
     assert "159915" in rows, f"顺延补位未发生：{rows}"
     sub_w = float(rows["159915"]["target_weight"])
-    assert abs(sub_w - 0.18) < 1e-9, f"补位者权重 {sub_w}，应为缩放后的 0.18"
+    assert abs(sub_w - 0.175) < 1e-9, f"补位者权重 {sub_w}，应为缩放后的 0.175"
     total = _sum_target_weight(plan)
-    assert abs(total - 0.36) < 1e-9, f"Σtarget_weight={total}，应恰为 0.36"
+    assert abs(total - 0.35) < 1e-9, f"Σtarget_weight={total}，应恰为 0.35"
     scr = plan.get("ta_screening") or {}
-    assert abs(float(scr.get("equity_cap_effective") or 0) - 0.36) < 1e-9, scr
+    assert abs(float(scr.get("equity_cap_effective") or 0) - 0.35) < 1e-9, scr
 
 
 def test_变异负例_缩放挪到筛选之后_补位权重必须转红(tmp_path, monkeypatch):
-    """🔴 断言必须有牙：把「缩放」挪到 TA 筛选之后 ⇒ 补位者权重必须变（不再 0.18）。"""
+    """🔴 断言必须有牙：把「缩放」挪到 TA 筛选之后 ⇒ 补位者权重必须变（不再 0.175）。"""
     actions = [
         {"code": "512800", "name": "银行ETF华宝", "action": "买入",
          "target_weight": 0.4, "current_weight": 0.0},
@@ -405,12 +418,12 @@ def test_变异负例_缩放挪到筛选之后_补位权重必须转红(tmp_path
     if "159915" in rows_mut:
         sub_w_mut = float(rows_mut["159915"]["target_weight"])
     else:
-        # 🔴 「先筛选、后缩放」的**真实后果**：补位会把权益顶到 0.8 > 生效上限 0.36
+        # 🔴 「先筛选、后缩放」的**真实后果**：补位会把权益顶到 0.8 > 生效上限 0.35
         #    ⇒ 补位被上限闸门挡下 ⇒ **席位空缺**（顺延彻底失效）。
         sub_w_mut = None
     assert sub_w_mut != sub_w, (
         f"变异体补位权重 {sub_w_mut} 与正确值 {sub_w} 相同 ⇒ 断言没有牙")
     assert sub_w_mut is None or abs(sub_w_mut - 0.4) < 1e-9, (
         f"变异体补位权重 {sub_w_mut}，应为 None（补位被上限挡下）或 0.4（未缩放）")
-    assert abs(_sum_target_weight(plan_mut) - 0.36) > 1e-9, (
-        "变异体的 Σtarget_weight 竟仍等于 0.36 ⇒ 断言没有牙")
+    assert abs(_sum_target_weight(plan_mut) - 0.35) > 1e-9, (
+        "变异体的 Σtarget_weight 竟仍等于 0.35 ⇒ 断言没有牙")

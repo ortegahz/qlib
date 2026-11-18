@@ -207,6 +207,44 @@ LOT_SIZE = 100
 #:    **比例下限（6,007 元）压倒绝对下限** ⇒ **本轮判定结果不变**（口径对齐，不是行为变更）。
 CASH_BUFFER_MIN = 400.0
 CASH_BUFFER_MAX = 400.0
+#: 🔴 2026-11-18（用户目标文档 §三.2 + 审计缺陷 `no_drawdown_brake` · high 级）：
+#:    **组合级急跌刹车**阈值（账户净值自历史峰值回撤 ≥ 该值 ⇒ 整个组合切防守资产）。
+#:    与研究链 `config.DRAWDOWN_BRAKE_THRESHOLD` **同值**（每日链独立复制，
+#:    与 `CASH_RESERVE_RATIO` 同一套「避免跨链传导」的约定）。
+DRAWDOWN_BRAKE_THRESHOLD = 0.15
+#: 急跌刹车开关（关掉 ⇒ 每日链**不传** `--nav` / `--nav-peak` ⇒ 刹车永不触发）。
+DRAWDOWN_BRAKE_ENABLED = True
+#: 🔴 净值序列状态文件（**跨日持久化** ⇒ 峰值才是真峰值，不是当日环）。
+#:    落点 `<RUN_ROOT>/_state/nav_history.json`。
+NAV_STATE_FILE = RUN_ROOT / "_state" / "nav_history.json"
+
+# =============================================================================
+# 4b. 🔴 V2 冻结件接缝（2026-11-18 用户目标文档第三条）
+# =============================================================================
+#: 🔴 **V2 五折滚动前推选出来的冠军参数 ⇒ 接入每日实盘链**（替换 V1 的 ETF 层老配置）。
+#:    改造前审计结论：每日链的 ETF 层参数**全部**来自 V1 研究链常量
+#:    （alpha/momentum = 0.5/0.5、E 层 EWMA alpha=0.20 window=5、MA60 入场 + MA60 强制退出）
+#:    ⇒ V2 的冠军参数**压根没进每日链** ⇒ V2 ↔ 每日链**无 seam**。
+#:
+#:    冻结件落点（服务器）：`<RESULTS_ROOT>/v2/frozen_params_wf.json`
+#:    （由 `manu/tools/v2_freeze_from_walkforward.py` 从 2019–2023 五折 OOS 产出）。
+#:    ⚠️ **封存的 `frozen_params.json` 不是它**（那是 2026-11-17 单盲登记的指纹，**不许动**）。
+V2_FROZEN_PARAMS_FILE = Path(
+    os.environ.get(
+        "ETF_ROTATION_V2_FROZEN_PARAMS",
+        str(RESEARCH_RUN_ROOT / "v2" / "frozen_params_wf.json"),
+    )
+)
+#: 接缝开关（关掉 ⇒ 每日链回落 V1 老参数；**只给紧急回退用**，默认开）。
+V2_FROZEN_PARAMS_ENABLED = os.environ.get(
+    "ETF_ROTATION_V2_FROZEN_PARAMS_ENABLED", "1"
+) not in {"0", "false", "False"}
+#: 🔴 **fail-closed**：开着接缝时冻结件读不到 ⇒ **整轮中止**（不许静默回落 V1 参数）。
+#:    理由：静默回落 = 回到「V2 只是回测里的玩具」的老坑，而且**不会报错**。
+V2_FROZEN_PARAMS_REQUIRED = os.environ.get(
+    "ETF_ROTATION_V2_FROZEN_PARAMS_REQUIRED", "1"
+) not in {"0", "false", "False"}
+
 #: 佣金（万分之；买卖各算一次，下限 5 元 —— 与研究链一致）
 COMMISSION_RATE = 0.0003
 MIN_COMMISSION = 5.0

@@ -482,6 +482,35 @@ _LLM_PNL_ABS_WORDS = (
     "成本", "价格", "收益率", "回报", "收益", "当前", "现价", "现值",
 )
 _LLM_VERB_CHARS = "到至升降调改变增减提为"
+
+#: 🔴 2026-11-17（服务器真机交付件 `snapshots/20261117_162113` 实证 · **真缺陷**）：
+#:    **「当前/现有/… + 权重/仓位/…」= 账户现状**，不是**说话人的目标**。
+#:    真机原文（多头表 512800 行 · 理由列）：
+#:        「多头核心，但不追涨。**当前权重22.54%**，高于机械目标16%；……」
+#:    ⇒ `_backward_segment` 的「锚点截断」把「当前」一起吞掉 ⇒ 语境守卫失明
+#:    ⇒ **现状权重 22.54% 被当成目标权重**（幽灵数字）
+#:    ⇒ 方向-权重语义守卫按「减 ⇒ 目标 22.54% ≥ 当前 22.20%」判 ⇒ **假红灯**。
+#:    ⇒ 修法：命中本正则 ⇒ 锚点截断**保留**限定词 ⇒ 数字判为**非目标**。
+#:    ⚠️ 只认**持仓状态名词** ⇒ 「当前**目标** 20%」口径**不变**（那确实是目标）。
+_CURRENT_STATE_PHRASE_RE = re.compile(
+    r"(?:当前|现有|目前|现存|原有|原本|原)\s*(?:的)?\s*(?:权重|仓位|比例|持仓|市值)"
+    r"(?:比例|权重|仓位)?"
+    r"\s*(?:为|是|=|:|：)?"
+)
+
+#: 🔴 2026-11-17（同一真机交付件实证 · **第二个真缺陷**）：
+#:    正文里的「**机械目标**X%」是**规则层**的数（表头口径早有先例：A14
+#:    「机械目标」列不是说话人的目标 ⇒ `final_rebalance_plan.py` 修 1），
+#:    **不是说话人自己的目标** ⇒ 不得读成目标权重。
+#:    真机原文：「当前权重22.54%，**高于机械目标16%**」
+#:    ⇒ 若把 16% 当成多头目标：方向「减」+ 目标 16% 在**当前权重降到 16% 以下**时
+#:       必然触发「减 ⇒ 目标 < 当前」的**假冲突** ⇒ 交付被假红灯拦下
+#:       （本轮 512800 卖到 7.00% 后，下一轮就会踩中）。
+#:    ⇒ 修法：数字**紧邻**这些标签 ⇒ 属于**规则层** ⇒ 跳过（说话人自己的数照常取）。
+_RULE_LAYER_NUM_LABELS = (
+    "机械目标", "规则机械目标", "规则目标", "规则层目标", "机械槽位",
+    "原目标", "原绝对权重", "原权重", "机械权重",
+)
 #: 「目标类锚点」：出现它 ⇒ 后面的百分数**才可能是目标权重**（用于兜底路径限定搜索范围）。
 _LLM_TARGET_ANCHORS = ("目标", "建议", "权重", "仓位", "比例", "配置", "调仓", "方向")
 #: 兜底路径用的**严格**锚点（必须明确表示「这是目标」）。
@@ -875,6 +904,18 @@ def _backward_segment(cell: str, start: int) -> str:
        · **标点截断**：「卖，浮亏18.91%」⇒ 片段是「浮亏」（不是「卖，浮亏」）；
        · **锚点截断**：「当前目标 20%」⇒ 片段是「」（「当前」是「当前**目标**」的一部分
          ⇒ 不该判它污染语境）；「目标收益 20%」⇒ 片段是「收益」。
+
+    🔴 2026-11-17（服务器真机交付件 `snapshots/20261117_162113` 实证 · **真缺陷**）：
+       **锚点截断不许把「现状限定词」一起吞掉**。
+       真机原文（多头表 512800 行 · 理由列）：
+           「多头核心，但不追涨。**当前权重22.54%**，高于机械目标16%；……」
+       ⇒ 旧口径把「当前权重」截成「」⇒ 语境守卫**看不见「当前」**
+       ⇒ 理由列里的**账户现状权重 22.54%** 被当成**说话人的目标权重**
+       ⇒ 交付件里出现「LLM 目标 22.54%」这个**幽灵数字**（LLM 从未这么说过）
+       ⇒ 方向-权重语义守卫按「减 ⇒ 目标 22.54% ≥ 当前 22.20%」判 ⇒ **假红灯**。
+       ⇒ 修法：**现状限定词 + 持仓状态名词**（当前/现有/… + 权重/仓位/…）
+         ⇒ 该数字是**账户现状** ⇒ 锚点截断**保留**限定词（让语境守卫看得见「当前」）。
+       ⚠️ 「当前**目标** 20%」的口径**不变**（限定词修饰的是「目标」⇒ 那确实是目标）。
     """
     seg = cell[max(0, start - 8):start]
     seg = re.split(r"[，。；、,;：:（）()\[\]【】「」《》]", seg)[-1]
@@ -884,7 +925,9 @@ def _backward_segment(cell: str, start: int) -> str:
         if idx > best:
             best, best_len = idx, len(a)
     if best >= 0:
-        seg = seg[best + best_len:]
+        # 🔴 2026-11-17：现状限定词（当前/现有/… + 权重/仓位/…）**不许**被截断吞掉
+        if not _CURRENT_STATE_PHRASE_RE.fullmatch(seg):
+            seg = seg[best + best_len:]
     return seg
 
 
@@ -918,10 +961,28 @@ def _attached_non_target(segment: str,
 
 def _is_non_target_pct(cell: str, start: int, end: int) -> bool:
     """这个百分数是不是**盈亏/价格/动量**语境里的数（⇒ 不是目标权重）。"""
+    # 🔴 2026-11-17：账户**现状权重**（当前/现有/… + 权重/仓位/…）也不是目标权重
+    if _is_current_state_pct(cell, start):
+        return True
     if _attached_non_target(_backward_segment(cell, start)):
         return True
     fwd = _forward_segment(cell, end)
     return any(w in fwd for w in _LLM_NON_TARGET_FORWARD)
+
+
+def _is_current_state_pct(cell: str, start: int) -> bool:
+    """这个百分数是不是**账户现状**（「当前/现有/… + 权重/仓位/…」）⇒ 不是目标权重。
+
+    🔴 2026-11-17（真机交付件 `snapshots/20261117_162113` 实证 · **真缺陷**）：
+       「**当前权重**22.54%」里的 22.54% 是**账户当前持仓权重**，
+       不是**说话人的目标权重** ⇒ 读成目标 ⇒ 交付件出现**幽灵数字**
+       ⇒ 方向-权重语义守卫按「减 ⇒ 目标 22.54% ≥ 当前 22.20%」判 ⇒ **假红灯**。
+       ⚠️ 现状类词表（`_LLM_NON_TARGET_BACKWARD`）只收了「当前/现价/现值」
+       ⇒ 「现有权重/目前仓位/原有仓位」这些同型写法会**漏网** ⇒ 这里单列一条判定。
+    """
+    seg = cell[max(0, start - 12):start]
+    seg = re.split(r"[，。；、,;：:（）()\[\]【】「」《》]", seg)[-1]
+    return bool(_CURRENT_STATE_PHRASE_RE.fullmatch(seg))
 
 
 def _is_abs_pnl_pct(cell: str, start: int, end: int) -> bool:
@@ -932,6 +993,10 @@ def _is_abs_pnl_pct(cell: str, start: int, end: int) -> bool:
        而**假阳性拦下交付**（2026-11-05 04:5x 实测：官方决策里 512800 的多头行
        目标 20%、同行「120日动量+12.10%」⇒ 动量口径下两者不相等，但口径本身有风险）。
     """
+    # 🔴 2026-11-17：账户**现状权重**同属「当前」类 ⇒ A16 不变量必须看得见它
+    #    （否则「目标权重 == 现状权重」这类自相矛盾**不被拦下**）。
+    if _is_current_state_pct(cell, start):
+        return True
     if _attached_non_target(_backward_segment(cell, start), _LLM_PNL_ABS_WORDS):
         return True
     fwd = _forward_segment(cell, end)
@@ -944,6 +1009,28 @@ def _is_anchored_pct(cell: str, start: int) -> bool:
     if "%" in seg:
         seg = seg.rsplit("%", 1)[1]
     return bool(_LLM_TARGET_ANCHOR_RE.search(seg))
+
+
+def _is_rule_layer_number(cell: str, start: int) -> bool:
+    """这个百分数是不是**规则层（机械目标）的数**（⇒ 不是说话人的目标权重）。
+
+    🔴 2026-11-17（真机交付件 `snapshots/20261117_162113` 实证）：
+       「高于机械目标16%」里的 16% 是**规则模板给的数**（表头口径已有先例：A14
+       「机械目标」列不是说话人的目标）⇒ 不得读成说话人的目标权重。
+       ⇒ 否则方向「减」+ 目标 16%（规则层的数）在**当前权重 < 16%** 时
+         必然触发「减 ⇒ 目标 < 当前」的**假冲突**（下一轮 512800 卖到 7% 就会踩中）。
+       判定口径：标签**紧邻**该数字（中间只允许「为/是/:/＝/约/大约/左右」等连接词）。
+    """
+    seg = cell[max(0, start - 18):start]
+    for label in _RULE_LAYER_NUM_LABELS:
+        idx = seg.rfind(label)
+        if idx < 0:
+            continue
+        tail = seg[idx + len(label):]
+        if not re.fullmatch(r"[\s:：=是为约大约左右上下]*", tail):
+            continue
+        return True
+    return False
 
 
 #: 🔴 2026-11-11（真机实测）：**区间**写法（两个百分数之间是区间分隔符）
@@ -996,7 +1083,9 @@ def _extract_target_pct(cell: str, anchor_required: bool = False) -> float | Non
     _ft = _LLM_FROM_TO.search(scope)
     if _ft is not None:
         _b = float(_ft.group(2))
-        if _pct_ok(_b) and not _is_non_target_pct(scope, _ft.start(2), _ft.end(2)):
+        if (_pct_ok(_b)
+                and not _is_non_target_pct(scope, _ft.start(2), _ft.end(2))
+                and not _is_rule_layer_number(scope, _ft.start(2))):
             return _b
     # 🔴 2026-11-11（真机实测）：**区间在前、基准在后** ⇒ 取**基准值**，不取区间下沿。
     #    「**0%—10%，基准约10%**」⇒ 说话人明说「保留约 10%」⇒ 必须取 10.0，
@@ -1009,13 +1098,18 @@ def _extract_target_pct(cell: str, anchor_required: bool = False) -> float | Non
             _pm = _LLM_PCT_LOOSE.search(_tail, _bm.end())
             if _pm is not None:
                 _pv = float(_pm.group(1))
-                if _pct_ok(_pv) and not _is_non_target_pct(scope, _pm.start(), _pm.end()):
+                if (_pct_ok(_pv)
+                        and not _is_non_target_pct(scope, _pm.start(), _pm.end())
+                        and not _is_rule_layer_number(scope, _pm.start())):
                     return _pv
     for m in hits:
         value = float(m.group(1))
         if not _pct_ok(value):
             continue
         if _is_non_target_pct(scope, m.start(), m.end()):
+            continue
+        # 🔴 2026-11-17：规则层（机械目标）的数**不是**说话人的目标 ⇒ 跳过
+        if _is_rule_layer_number(scope, m.start()):
             continue
         if anchor_required and not _is_anchored_pct(scope, m.start()):
             continue
@@ -1989,6 +2083,85 @@ def _resolve_ta_equity_cap(llm_raw: dict | None) -> dict:
     return out
 
 
+#: 🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：宏观避险的**权益上限带**。
+#:    口径 = 「**压到 25%~35% 权益上限**」⇒ 权益**仓位上限**落在 25%~35%（其余现金），
+#:    **不是**「降仓 25~35 个百分点」。
+#:    ⇒ 单一事实源 = config.MACRO_DERISK_EQUITY_CAP_MIN/MAX（**不许**在这里写死字面量）。
+_MACRO_BAND_REASONS = (
+    "no_ta_advice",        # 没有**可采纳的** TA 压降建议 ⇒ 带不参与 ⇒ 上限完全不变
+    "above_band_max",      # TA 建议高于带内上沿 ⇒ **压到**上沿
+    "below_band_min_kept", # TA 建议低于带内下沿 ⇒ TA 比带**更严** ⇒ **保留 TA 的值**
+    "in_band",             # TA 建议落在带内 ⇒ 原样采纳
+    "band_disabled",       # 带开关关掉（仅供审计切回旧口径；生产恒开）
+)
+
+#: 🔴 2026-11-18：带判定的**中文口径**（md 披露用；键 = `_MACRO_BAND_REASONS` 取值）。
+_MACRO_BAND_REASON_ZH = {
+    "no_ta_advice": "没有可采纳的 TA 压降建议 ⇒ 带不参与",
+    "above_band_max": "高于带内上沿 ⇒ 压到上沿",
+    "below_band_min_kept": "低于带内下沿 ⇒ TA 更严 ⇒ 保留 TA 的值",
+    "in_band": "落在带内 ⇒ 原样采纳",
+    "band_disabled": "带开关关闭（仅供审计切回旧口径）",
+}
+
+
+def _apply_macro_derisk_band(ta_pct: float | None, base_cap: float) -> tuple[float, dict]:
+    """🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：把宏观避险的**权益上限压进 25%~35% 区间**。
+
+    口径（fail-closed、可审计）
+    --------------------------
+    ① **没有** TA 压降建议 ⇒ 生效上限**完全不变**（= base_cap，默认 0.80）
+       ⇒ 产物**逐字节不变**（既有金标不动）。
+    ② **有** TA 压降建议 ⇒ 生效上限 = min(base_cap, ta_pct, MACRO_DERISK_EQUITY_CAP_MAX)：
+       - TA=36% ⇒ **0.35**（压进带内上沿）；TA=50% ⇒ **0.35**；
+       - TA=20% ⇒ **0.20**（TA 比带**更严** ⇒ **保留 TA 的值**，
+         **绝不许**抬高回 0.25 ⇒ MACRO_DERISK_EQUITY_CAP_MIN 只作**披露/断言**用）；
+       - TA=0%  ⇒ **0.00**。
+    ③ 🔴 **TA 建议 ≥ 规则层硬上限**（_resolve_ta_equity_cap 判 at_or_above_base_cap
+       ⇒ 该建议**已被规则层忽略**）⇒ 本轮**没有**压降 ⇒ 带**不参与**
+       ⇒ 生效上限 = base_cap（行为与今天一致）。
+    ④ 🔴 **绝不抬高**：带只把上限**往下**压（min 语义）⇒ 生效上限 ≤ 旧口径取值。
+
+    返回 (effective_cap, band_info)；band_info ∈
+    {band_enabled, band_min, band_max, applied, reason}：
+      * applied = 带**是否参与了**本轮上限计算（False ⇒ 上限完全由规则层/TA 决定）；
+      * reason  ∈ _MACRO_BAND_REASONS（**与** _TA_CAP_REASONS **分开**，
+        不许混用 ⇒ 别的代码读旧枚举不受影响）。
+    """
+    band_min = float(C.MACRO_DERISK_EQUITY_CAP_MIN)
+    band_max = float(C.MACRO_DERISK_EQUITY_CAP_MAX)
+    enabled = bool(C.MACRO_DERISK_BAND_ENABLED)
+    base_cap = float(base_cap)
+    info: dict = {
+        "band_enabled": enabled,
+        "band_min": band_min,
+        "band_max": band_max,
+        "applied": False,
+        "reason": "no_ta_advice",
+    }
+    if ta_pct is None:
+        return base_cap, info
+    ta_pct = float(ta_pct)
+    # 🔴 ③：TA 建议 ≥ 规则层硬上限 ⇒ 规则层**已忽略**（at_or_above_base_cap）
+    #    ⇒ 本轮**没有**压降 ⇒ 带不参与 ⇒ 生效上限 = 硬上限（与今天行为一致）。
+    if ta_pct >= base_cap - 1e-12:
+        return base_cap, info
+    if not enabled:
+        info["reason"] = "band_disabled"
+        return min(base_cap, ta_pct), info
+    # 🔴 ②④：min ⇒ 只往下压，**绝不抬高**（TA 比带更严时保留 TA 的值）。
+    effective = min(base_cap, ta_pct, band_max)
+    if ta_pct > band_max:
+        reason = "above_band_max"
+    elif ta_pct < band_min:
+        reason = "below_band_min_kept"
+    else:
+        reason = "in_band"
+    info["applied"] = True
+    info["reason"] = reason
+    return effective, info
+
+
 def apply_ta_screening(
     *,
     actions: list[dict] | None = None,
@@ -2534,9 +2707,11 @@ def build_plan(args) -> dict:
     _ta_cap = _resolve_ta_equity_cap(
         llm_final_mod.load_from_decision(getattr(args, "decision", None))
     )
-    _effective_cap = (
-        _EQUITY_CAP if _ta_cap["pct"] is None else min(_EQUITY_CAP, float(_ta_cap["pct"]))
-    )
+    # 🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：把宏观避险的**权益上限压进
+    #    25%~35% 区间**（其余现金）⇒ TA=36%/50% ⇒ 0.35；TA=20% ⇒ 保留 0.20（更严）。
+    #    ⚠️ **没有** TA 压降建议 ⇒ `_apply_macro_derisk_band` 返回硬上限 ⇒ 产物逐字节不变。
+    _effective_cap, _macro_band = _apply_macro_derisk_band(
+        None if _ta_cap["pct"] is None else float(_ta_cap["pct"]), _EQUITY_CAP)
     # 🔴 一票否决**只认权威裁决段落**（观点段落没有否决权）——
     #    真实决策件里空头说「暂不买入 515450/515650」、激进派说「清仓512800，
     #    等于放弃…」⇒ 旧实现（扫全文）误伤 3 只
@@ -2611,9 +2786,17 @@ def build_plan(args) -> dict:
         "reason": _ta_cap["reason"],
         "base_cap": round(_EQUITY_CAP, 6),
         "effective_cap": round(_effective_cap, 6),
+        # 🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：披露**权益上限带**
+        #    （25%~35%）⇒ 审计看得见：带是否参与、为什么这么判。
+        "macro_band_enabled": bool(_macro_band["band_enabled"]),
+        "macro_band_min": round(float(_macro_band["band_min"]), 6),
+        "macro_band_max": round(float(_macro_band["band_max"]), 6),
+        "macro_band_applied": bool(_macro_band["applied"]),
+        "macro_band_reason": str(_macro_band["reason"]),
         "note": (
             "TA 的**权益上限压降建议**（只认『降至/定为/控制在』这类目标动词；"
-            "陈述句不算建议）；**只许压降、不许抬高**；解析不出 ⇒ 不压降"
+            "陈述句不算建议）；**只许压降、不许抬高**；解析不出 ⇒ 不压降；"
+            "**宏观降仓**：压降时权益上限压进 25%~35% 区间（TA 更严 ⇒ 保留 TA 的值）"
         ),
     }
     _ta_screening["equity_cap_scale"] = {
@@ -2877,6 +3060,10 @@ def build_plan(args) -> dict:
         thresholds=gate_mod.thresholds_from_args(args),
         enabled=_gate_enabled,
         price_basis=f"{asof} 收盘价（信号日价）",
+        #: 🔴 2026-11-17（真机 P12 红灯修）：把**本轮生效**权益上限传进门槛
+        #:    ⇒ 「省 5 元最低佣金」不得覆盖「权益上限 / 现金预留」这条风控硬约束
+        #:    （真机证据：512800 减仓 2,290 元被门槛拦下 ⇒ 计划权益 87.48% 破 80% 上限）。
+        equity_cap=float(_effective_cap),
     )
 
     def _gate_block(p: dict, amount: float, reason_suffix: str = "") -> dict:
@@ -3483,6 +3670,29 @@ def render_markdown(plan: dict) -> str:
             ]
         else:
             lines += ["本轮**没有被门槛拦下的调仓动作**（所有动作金额均达标）。", ""]
+        #: 🔴 2026-11-17（真机 P12 红灯修）：「风险硬约束优先」的否决记录**必须如实披露**
+        _ovr = _gate.get("risk_overrides") or []
+        if _ovr:
+            lines += [
+                "🔴 **风险硬约束优先于最低佣金门槛**（本轮有 "
+                f"**{len(_ovr)}** 笔减仓因「拦下会破生效权益上限」而**未被门槛拦下**）：",
+                "",
+                "| 代码 | 名称 | 档位 | 金额（元） | 门槛（元） | 执行后权益权重 | 拦下后权益权重 | 生效上限 |",
+                "|:--|:--|:--|--:|--:|--:|--:|--:|",
+            ]
+            for _o in _ovr:
+                lines.append(
+                    f"| {_o.get('code')} | {_o.get('name')} | {_o.get('kind')} | "
+                    f"{float(_o.get('amount') or 0):.2f} | {float(_o.get('threshold') or 0):.0f} | "
+                    f"{float(_o.get('equity_weight_if_executed') or 0) * 100:.2f}% | "
+                    f"{float(_o.get('equity_weight_if_blocked') or 0) * 100:.2f}% | "
+                    f"{float(_o.get('equity_cap') or 0) * 100:.2f}% |")
+            lines += [
+                "",
+                "⇒ 上述减仓**照常执行**（多付的最低佣金已计入现金流）"
+                "：**省 5 元手续费不得覆盖「权益上限 / 现金预留」这条风控硬约束**。",
+                "",
+            ]
 
     lines += [
         "",
@@ -3564,6 +3774,12 @@ def render_markdown(plan: dict) -> str:
             _cap_base = _scr.get("equity_cap")
             _cap_scale = _scr.get("equity_cap_scale") or {}
             if _cap_rec.get("reason") == "accepted":
+                # 🔴 兜底回 `config` 常量 ⇒ 老产物（无带字段）渲染时不出现「0.0%~0.0%」。
+                _band_min = float(_cap_rec.get("macro_band_min")
+                                  or C.MACRO_DERISK_EQUITY_CAP_MIN)
+                _band_max = float(_cap_rec.get("macro_band_max")
+                                  or C.MACRO_DERISK_EQUITY_CAP_MAX)
+                _band_reason = str(_cap_rec.get("macro_band_reason") or "")
                 lines += [
                     "**Beta 避险（TA 建议压降组合权益上限）**：TA 建议本轮权益上限 **"
                     f"{float(_cap_rec.get('pct') or 0.0) * 100:.1f}%** ⇒ 本轮**生效上限 = "
@@ -3573,6 +3789,15 @@ def render_markdown(plan: dict) -> str:
                     f"{float(_cap_scale.get('factor') or 1.0):.4f}），差额**留现金**。",
                     "",
                     f"> TA 原文证据：{str(_cap_rec.get('evidence') or '（未记录证据句）')[:200]}",
+                    "",
+                    # 🔴 2026-11-18（用户目标文档 §三.2「宏观降仓」）：md 里必须
+                    #    **看得见这条带**（25%~35%）⇒ 审计知道上限为什么是这个数。
+                    "**宏观降仓（权益上限带）**：权益上限**带 = "
+                    f"{_band_min * 100:.1f}%~{_band_max * 100:.1f}%** ⇒ "
+                    f"{_MACRO_BAND_REASON_ZH.get(_band_reason, _band_reason)} ⇒ "
+                    "本轮生效上限 **"
+                    f"{float(_cap_eff or 0.0) * 100:.1f}%**（TA 比带**更严** ⇒ "
+                    "**保留 TA 的值**、**绝不抬高**；**没有** TA 压降建议 ⇒ 上限完全不变）。",
                     "",
                 ]
             else:

@@ -607,7 +607,9 @@ def run_checks(report: dict, calendar: list[str],
             "相对超额": ex.get("annualized_return"),
             "组合 MDD": pf.get("max_drawdown"),
             "基准年化": bm.get("annualized_return"),
-            "年化换手": co.get("annualized_one_way_turnover"),
+            # 🔴 2026-11-18 口径正名：旧键的值是**双边**（Σ|Δw| / 年）。
+            "年化换手（双边）": co.get(
+                "annualized_turnover_two_way", co.get("annualized_one_way_turnover")),
             "窗口天数": (bs.get("eval_window") or {}).get("n_days"),
         }
         miss = [k for k, v in need.items() if v is None]
@@ -638,8 +640,11 @@ def run_checks(report: dict, calendar: list[str],
                      (raw.get("benchmark_510300") or {}).get("annualized_return")),
                     ("组合 MDD", pf.get("max_drawdown"),
                      (raw.get("portfolio_net") or {}).get("max_drawdown")),
-                    ("年化换手", co.get("annualized_one_way_turnover"),
-                     (raw.get("cost_assumption") or {}).get("annualized_one_way_turnover")),
+                    ("年化换手（双边）",
+                     co.get("annualized_turnover_two_way", co.get("annualized_one_way_turnover")),
+                     (raw.get("cost_assumption") or {}).get(
+                         "annualized_turnover_two_way",
+                         (raw.get("cost_assumption") or {}).get("annualized_one_way_turnover"))),
                 ]
                 for sg in segs:
                     block_ = (raw.get("segment_report") or {}).get(sg.get("key")) or {}

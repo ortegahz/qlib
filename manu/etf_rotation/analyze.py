@@ -68,6 +68,7 @@ from engine.filters import (  # noqa: E402
     build_theme_and_conflicts,
 )
 from engine.portfolio import (  # noqa: E402
+    THEME_CAP_UNLIMITED,
     _is_defensive,
     _ma_ok_map,
     _z,
@@ -936,6 +937,8 @@ def _rebuild_chain(
     exit_ma_window: int | None,
     brake_mode: bool = False,
     alpha_override: pd.DataFrame | None = None,
+    n_target: int | None = None,
+    max_per_theme: int | None = None,
 ) -> dict:
     """在分析侧重放 `engine/portfolio.build_portfolio` 的过滤链（调用同一批 engine 函数）。
 
@@ -1049,7 +1052,15 @@ def _rebuild_chain(
         #    「防守资产」（货币 / 黄金 / 商品）**不再走旁路** ⇒ 否则「没有 A 股卷面」的标的
         #    会靠**自身动量**混进与 E=W×S 真实打分同一张榜单 ⇒ 口径不自洽。
         #    ⇒ 保留 `POOL_ALLOW_DEFENSIVE_BYPASS=True` 开关以复现 v1 旧行为（回测对照用）。
-        if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False):
+        # 🔴 2026-11-18 续四：**唯一的例外 = 刹车档** ⇒ 防守资产必须能进池。
+        #    事故形态：黄金 / 国债 / 货币 ETF 本来就**没有 A 股穿透** ⇒ coverage=0
+        #    ⇒ 严格口径把防守资产全剔掉 ⇒ 后面的「刹车 ⇒ 只留防守资产」**无货可留**
+        #    ⇒ 组合变**空仓（100% 现金）**，而不是「切防守资产」。
+        #    ⇒ 正常档**一字不改**（2026-11-06 严格口径要防的「货币 ETF 混进正常榜单」
+        #       在刹车档不存在 —— 那时池里只剩防守资产，没有权益可挤）。
+        #    ⇒ 🔴 **必须与 `engine/portfolio.py` 同一口径** ⇒ 否则重放与引擎不一致
+        #       ⇒ `analyze.py` 会**拒绝出报告**（fail-closed）。
+        if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False) or brake_mode:
             keep_mask = cand["coverage_ok"].eq(True) | cand["is_defensive"].eq(True)
         else:
             keep_mask = cand["coverage_ok"].eq(True)
@@ -1295,8 +1306,15 @@ def _rebuild_chain(
     )
     buf = C.HOLD_BUFFER if hold_buffer is None else int(hold_buffer)
     n_in_theme = len(pool)
+    _n_target = int(n_target) if n_target else int(C.TARGET_N_HOLDINGS)
+    _max_per_theme = (
+        THEME_CAP_UNLIMITED if max_per_theme is not None and int(max_per_theme) == 0
+        else (int(max_per_theme) if max_per_theme is not None and int(max_per_theme) > 0
+              else int(C.MAX_PER_THEME))
+    )
     pool = apply_theme_cap(
-        pool, theme_map, keep_codes=held, hold_buffer=buf, conflicts=conflict_pairs
+        pool, theme_map, keep_codes=held, hold_buffer=buf, conflicts=conflict_pairs,
+        n_target=_n_target, max_per_theme=_max_per_theme,
     )
     selected_codes = sorted(str(c) for c in pool.loc[pool["selected"], "code"])
     selected_themes = {
@@ -1334,7 +1352,7 @@ def _rebuild_chain(
             reason = (
                 "已持仓但未进入目标名额（分数回落 / 被同族标的占位）"
                 if code in held
-                else f"分数排名未进入目标名额（目标 {C.TARGET_N_HOLDINGS} 只 + 迟滞缓冲 {buf}）"
+                else f"分数排名未进入目标名额（目标 {_n_target} 只 + 迟滞缓冲 {buf}）"
             )
             other_blocked.append(_row_brief(r, reason, {"final_score": _clean(r["final_score"])}))
 
@@ -1617,6 +1635,20 @@ def _backtest_summary(backtest: dict | None) -> dict | None:
             out[f"{name}_max_drawdown"] = sub.get("max_drawdown")
         return out
 
+    # 🔴 2026-11-18 口径正名 + 缺键防护（**双边键优先 → 旧键兜底 → 都没有 ⇒ None**）：
+    #    任何缺键组合都**不许 KeyError**（``dict.get(k, default)`` 的 default 急切求值
+    #    ⇒ 旧键一删就炸，而旧键「保留仅为兼容」⇒ 随时可删）。
+    #    单边**只走唯一实现** ``config.one_way_turnover``（🔴 不许手写 ``* 0.5``）。
+    _turn_two_way = cost.get("annualized_turnover_two_way")
+    if _turn_two_way is None:
+        _turn_two_way = cost.get("annualized_one_way_turnover")   # 旧键兜底（原始产物兼容）
+    _turn_one_way = cost.get("annualized_turnover_one_way")
+    if _turn_one_way is None and _turn_two_way is not None:
+        try:
+            _turn_one_way = C.one_way_turnover(_turn_two_way)
+        except (TypeError, ValueError):
+            _turn_one_way = None
+
     segments = [_segment(k, v) for k, v in (data.get("segment_report") or {}).items()]
     exc_vals = [s.get("excess_annualized") for s in segments]
     exc_vals = [v for v in exc_vals if v is not None]
@@ -1638,7 +1670,14 @@ def _backtest_summary(backtest: dict | None) -> dict | None:
         "cost": {
             "commission_one_side": cost.get("commission_one_side"),
             "slippage_one_side": cost.get("slippage_one_side"),
-            "annualized_one_way_turnover": cost.get("annualized_one_way_turnover"),
+            # 🔴 2026-11-18 口径正名（**派生摘要层**）：旧键 ``annualized_one_way_turnover``
+            #    的**值是双边**（Σ|Δw| / 年；历史错标）⇒ **派生摘要里不再保留这个错标键**
+            #    （旧键只允许留在 ``backtest.py`` 的 ``cost_assumption`` 原始产物里，兼容保留）
+            #    ⇒ 这里只落**正名**后的三键：双边 / 单边 / 口径声明。
+            "annualized_turnover_two_way": _turn_two_way,
+            "annualized_turnover_one_way": _turn_one_way,
+            "turnover_convention": cost.get(
+                "turnover_convention", "two_way_sum_abs_dw（Σ|Δw|；单边 = 0.5 × 双边）"),
             "total_cost_drag": cost.get("total_cost_drag"),
         },
         "rebalance": {
@@ -2672,8 +2711,12 @@ def _render_markdown(rep: dict) -> str:
                                   f"（算术口径 {_pct(bs.get('excess_arithmetic_annualized'))}）"],
             ["组合最大回撤", f"{_pct(pf.get('max_drawdown'))}"
                             f"（基准 {_pct(bm.get('max_drawdown'))}）"],
-            ["年化单边换手", f"{_num(co.get('annualized_one_way_turnover'), 2)}×"
-                            f"（成本拖累 {_pct(co.get('total_cost_drag'))}）"],
+            # 🔴 2026-11-18 口径正名：Σ|Δw| = **双边** ⇒ 单边 = 0.5 × 双边。
+            ["年化换手（**双边** Σ|Δw|）",
+             f"{_num(co.get('annualized_turnover_two_way'), 2)}×"
+             f"（成本拖累 {_pct(co.get('total_cost_drag'))}）"],
+            ["年化换手（**单边** = 双边 × 0.5）",
+             f"{_num(co.get('annualized_turnover_one_way'), 2)}×"],
             ["基准 510300 年化", f"{_pct(bm.get('annualized_return'))}"
                                 "（回归探针：必须恒为 12.11%）"],
             ["有效调仓期数", f"{rb.get('n_rebalances_in_window')} 期"
@@ -2904,6 +2947,12 @@ def parse_args() -> argparse.Namespace:
                    help="EWMA 系数 alpha（默认取 config.SMOOTHING_ALPHA）")
     p.add_argument("--smoothing-history-days", type=int, default=None,
                    help="EWMA 预热历史跨度（**交易日**；默认 30）")
+    p.add_argument("--target-n-holdings", type=int, default=None,
+                   help="目标持仓只数（默认 config.TARGET_N_HOLDINGS；"
+                        "🔴 V2 冻结件接缝由 frozen_params_wf.json 的 top_k 驱动）")
+    p.add_argument("--max-per-theme", type=int, default=None,
+                   help="同族上限（默认 config.MAX_PER_THEME；**0 = 不限**；"
+                        "🔴 V2 冠军 allow_theme_cap=False ⇒ 接缝传 0）")
     p.add_argument("--entry-ma-window", type=int, default=None, help="入场破位过滤均线（0=关）")
     p.add_argument("--exit-ma-window", type=int, default=None, help="持仓强制退出均线（0=关）")
     p.add_argument("--nav", type=float, default=None, help="账户实际净值（配合 --nav-peak 判断回撤刹车）")
@@ -3043,6 +3092,14 @@ def main() -> int:
     )
     next_rebalance = _next_rebalance(calendar, asof, C.DEPLOYED_REBALANCE_EVERY_N_DAYS)
 
+    # ---- 🔴 2026-11-18（V2 冻结件接缝）：目标持仓只数 / 同族上限的**生效值** ----
+    #    CLI 优先；没传 ⇒ 回落研究链 config（**旧行为逐字不变**）。
+    n_target = (
+        int(args.target_n_holdings) if args.target_n_holdings is not None
+        else int(C.TARGET_N_HOLDINGS)
+    )
+    max_per_theme = args.max_per_theme
+
     account_available = True
     account_reason = None
     try:
@@ -3112,6 +3169,8 @@ def main() -> int:
         exit_ma_window=args.exit_ma_window,
         brake_mode=bool(nav_state and nav_state.get("in_brake")),
         alpha_override=alpha_override,
+        n_target=n_target,
+        max_per_theme=max_per_theme,
     )
     portfolio = build_portfolio(
         asof=asof,
@@ -3129,6 +3188,8 @@ def main() -> int:
         exit_ma_window=args.exit_ma_window,
         alpha_override=alpha_override,
         smoothing_config=smoothing_config,
+        n_target=n_target,
+        max_per_theme=max_per_theme,
     )
     engine_selected = sorted(str(h["code"]) for h in portfolio["holdings"])
     if engine_selected != chain["selected_codes"]:
@@ -3489,7 +3550,7 @@ def main() -> int:
                 "effective_half_life_trading_days"
             ),
             "score_smoothing_observation_dates": smoothing_diag.get("observation_dates"),
-            "target_n_holdings": C.TARGET_N_HOLDINGS,
+            "target_n_holdings": n_target,
             "min_n_holdings": C.MIN_N_HOLDINGS,
             "hold_buffer": chain["hold_buffer"],
             "entry_ma_window": C.ENTRY_MA_FILTER_WINDOW if args.entry_ma_window is None else args.entry_ma_window,
@@ -3498,7 +3559,8 @@ def main() -> int:
             "min_avg_amount_20d": C.MIN_AVG_AMOUNT_20D,
             "min_float_mcap": C.MIN_FLOAT_MCAP,
             "min_history_days": C.MIN_HISTORY_DAYS,
-            "max_per_theme": C.MAX_PER_THEME,
+            "max_per_theme": (int(max_per_theme) if max_per_theme is not None
+                              else int(C.MAX_PER_THEME)),
             "absolute_momentum_threshold": C.ABSOLUTE_MOMENTUM_THRESHOLD,
             "momentum_weights": {str(k): v for k, v in C.MOMENTUM_WEIGHTS.items()},
             "rebalance_every_n_days": C.DEPLOYED_REBALANCE_EVERY_N_DAYS,
