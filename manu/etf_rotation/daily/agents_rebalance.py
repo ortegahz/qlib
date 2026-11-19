@@ -1367,6 +1367,13 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
         #    喂给 TA 上下文 ⇒ 避免 build_ta_context 回落到 canonical 旧行情，
         #    导致 corr120 / 拥挤度与规则层对不上。
         "--prices", str(prices_path),
+        # 🔴 2026-11-18（用户目标文档 §二.1）：**强制**喂实盘账户口径。
+        #    旧口径：build_ta_context 读研究链 canonical 账户（2026-11-04 旧件：
+        #    总资产 29,854.67 / 现金 15,518.87 / 5 只持仓 / 权益 48%）
+        #    ⇒ TA 以为账户是重仓 ⇒ 给出 Underweight + 权益上限 20%
+        #    ⇒ 下游拿真实 23.43% 去比 ⇒ 「一笔不动」⇒ 实盘前夜的风控大脑看着假账本。
+        #    ⇒ 现在必须用本轮快照导出的实盘口径（`account_context.json`）。
+        "--account-json", str(account_json_path),
     ], step=STEP_CONTEXT)
     notes.append(f"✅ TA 上下文已产出：{run_path / 'ta_research_context.md'}")
     llm_status = "skipped"

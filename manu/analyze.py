@@ -1882,16 +1882,24 @@ def _risk_disclosure(
     rank_ic: dict | None = None,
     micro: dict | None = None,
     lookahead: dict | None = None,
+    ma_windows: tuple[int, int] | None = None,
 ) -> list[dict]:
     """逐条风险披露（**禁止空数组**；数字只来自实测产物，缺产物就明说「产物不可得」）。
 
     🔴 **每条都要带数字**：``score_stats``（退化守卫实测）/ ``rank_ic``（上游区分度）/
     ``backtest``（回测真值）/ ``micro``（折溢价·流动性·跟踪误差代理）任一不可得时，
     对应文案明写「不可得」，**不许只写结论不给数字**（rules.md §十四.66）。
+
+    🔴 2026-11-18（用户 11-18 复核意见）：``ma_windows = (入场 MA 窗口, 持仓强制退出 MA 窗口)``
+    ⇒ 风险披露里「靠 MA 破位过滤部分缓解」这句话必须**按本轮实际参数**写：
+    **V2 冻结臂是 MA 入/出 = 0/0** ⇒ 该层缓解**不存在** ⇒ 旧文案（写死「入场 MA20 破位过滤
+    + 持仓 MA60 强制退出」）在 V2 臂里是**假话**。
     """
     bt = backtest["data"] if backtest else None
     bt_path = backtest["path"] if backtest else None
     items: list[dict] = []
+    #: 🔴 2026-11-18：本轮实际的 MA 窗口（V2 冻结臂 = 0/0 ⇒ 无均线层缓解）
+    _ma_in, _ma_out = (int(ma_windows[0]), int(ma_windows[1])) if ma_windows else (0, 0)
 
     # ---- 3.1 分段稳定性真值（现役口径）----
     # 🔴 指针必须指向 **§18.4**（唯一可引用）；§11 / §11.2 是聚类重构**前**的老口径，已作废。
@@ -1940,7 +1948,8 @@ def _risk_disclosure(
         if ic1.get("mean_rank_ic") is not None:
             up_text += (
                 f"；1 日前瞻 RankIC 均值 {_num(ic1.get('mean_rank_ic'), 4)}"
-                f"（ICIR {_num(ic1.get('icir'), 3)}，{ic1.get('n_cross_sections')} 个截面）"
+                f"（ICIR {_num(ic1.get('icir'), 3)}，{ic1.get('n_cross_sections')} 个截面；"
+                "**评估指标，不参与选股**）"
             )
         up_text += " ⇒ 上游当前**有区分度**。"
 
@@ -2052,6 +2061,7 @@ def _risk_disclosure(
                 "title": "当前回撤位置：组合正处在历史最大回撤区间内",
                 "severity": "high",
                 "detail": (
+                    "[**历史参考基线，非本臂实时回测**] "
                     f"回测实测最大回撤 {_pct(mdd)}"
                     + (f"，**期末净值自峰值回撤 {_pct(final_dd)}**" if final_dd is not None else "")
                     + (f"（峰值日 {peak_date} / 谷底日 {trough_date}）"
@@ -2223,8 +2233,13 @@ def _risk_disclosure(
             "severity": "high",
             "detail": (
                 "120 日动量在急跌段仍可能为正 ⇒ 该过滤**不是**回撤保护；"
-                "当前 v2 靠「入场 MA20 破位过滤 + 持仓 MA60 强制退出」部分缓解，"
-                "但仍**没有组合级硬止损** ⇒ 极端行情下回撤可能再次显著扩大。"
+                + (
+                    f"本轮入场 MA{_ma_in} 破位过滤 + 持仓 MA{_ma_out} 强制退出**部分缓解**"
+                    if (_ma_in > 0 or _ma_out > 0) else
+                    f"🔴 **本轮 MA 入/出 = {_ma_in}/{_ma_out}**（V2 冻结臂口径）"
+                    "⇒ **没有任何均线层缓解**"
+                )
+                + "，但仍**没有组合级硬止损** ⇒ 极端行情下回撤可能再次显著扩大。"
             ),
         }
     )
@@ -2689,6 +2704,14 @@ def _render_markdown(rep: dict) -> str:
 
     # ---- 八之二、回测口径真值（唯一可引用；含分段稳定性） ----
     add("## 八之二、回测口径真值（**唯一可引用**；含分段稳定性）")
+    add("")
+    # 🔴 2026-11-18（用户目标文档 §二.3）：**只披露，不改口径**。
+    #    每日增量推理链**不跑历史回测** ⇒ 本节数字是读取 **11-04 缓存的静态基线**
+    #    （`etf_rotation_backtest_v4_prefer1.json`），**不是本臂的实时回测**。
+    #    ⇒ 标题旁加注，避免下游（含 TA）把它当成本轮实测业绩。
+    add("> ⚠️ **[历史参考基线，非本臂实时回测]**：本节数字来自 **11-04 缓存的静态回测产物**"
+        "（每日增量推理链**不跑**历史回测）⇒ **不参与**本轮的买卖信号与仓位计算；"
+        "仅供横向参照。")
     add("")
     bs = (rep.get("meta") or {}).get("backtest_summary")
     if not bs:
@@ -3496,6 +3519,14 @@ def main() -> int:
     print(f"[INFO] 前视审计：决策前视 {la_inputs['n_look_ahead']} 项（W 快照 +{_gap} 天）"
           f"｜E 上界 现实 ≤ {_num(_max_real, 4)} / 极端 ≤ {_num(_max_ext, 4)}")
 
+    # 🔴 2026-11-18：本轮**生效**的 MA 窗口（入场 / 持仓强制退出）。
+    #    ⚠️ 口径**单一事实源**：披露段与 ``meta`` 段必须用**同一对数**
+    #    （V2 冻结臂 = 0/0 ⇒ 无均线层缓解 ⇒ 披露不许再写「MA20 破位 + MA60 退出」）。
+    _entry_ma_window = int(
+        C.ENTRY_MA_FILTER_WINDOW if args.entry_ma_window is None else args.entry_ma_window)
+    _exit_ma_window = int(
+        C.EXIT_MA_FILTER_WINDOW if args.exit_ma_window is None else args.exit_ma_window)
+
     risk_disclosure = _risk_disclosure(
         asof=asof,
         chain={**chain, "w_snapshot_date": w_snapshot_date},
@@ -3510,6 +3541,7 @@ def main() -> int:
         rank_ic=rank_ic,
         micro=micro,
         lookahead=lookahead,
+        ma_windows=(_entry_ma_window, _exit_ma_window),
     )
     if not risk_disclosure:
         raise RuntimeError("风险披露为空 ⇒ 违反「禁止空数组」，拒绝出报告")
@@ -3553,8 +3585,8 @@ def main() -> int:
             "target_n_holdings": n_target,
             "min_n_holdings": C.MIN_N_HOLDINGS,
             "hold_buffer": chain["hold_buffer"],
-            "entry_ma_window": C.ENTRY_MA_FILTER_WINDOW if args.entry_ma_window is None else args.entry_ma_window,
-            "exit_ma_window": C.EXIT_MA_FILTER_WINDOW if args.exit_ma_window is None else args.exit_ma_window,
+            "entry_ma_window": _entry_ma_window,
+            "exit_ma_window": _exit_ma_window,
             "min_e_coverage": C.MIN_E_COVERAGE,
             "min_avg_amount_20d": C.MIN_AVG_AMOUNT_20D,
             "min_float_mcap": C.MIN_FLOAT_MCAP,

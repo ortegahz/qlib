@@ -515,11 +515,19 @@ def _render_pipeline(result: Mapping, account: object,
                 _rec_ev = str(_get(cap_recommend, "evidence") or "").strip()
                 _rec_reason = str(_get(cap_recommend, "reason") or "")
                 if _rec_pct is not None:
+                    # 🔴 2026-11-18（用户目标文档 §三.1）：`bearish_fallback_cap`
+                    #    = **TA 看空但没给数字 ⇒ 规则层兜底压降** ⇒ 同样**已采纳**
+                    #    （落进「未采纳」分支 ⇒ 口径说反）。
+                    _fallback = (_rec_reason == "bearish_fallback_cap")
+                    _applied = _rec_reason in ("accepted", "bearish_fallback_cap")
                     lines.append(
-                        f"**Beta 避险（TA 权益上限建议）**：TA 建议 "
-                        f"{_fmt(_rec_pct, pct=True)}（{_rec_reason}）"
+                        ("**Beta 避险（TA 看空但未给数字上限 ⇒ 规则层兜底压降）**："
+                         f"兜底上限 {_fmt(_rec_pct, pct=True)}（{_rec_reason}）"
+                         if _fallback else
+                         f"**Beta 避险（TA 权益上限建议）**：TA 建议 "
+                         f"{_fmt(_rec_pct, pct=True)}（{_rec_reason}）")
                         + (f" ⇒ **本轮生效上限 {_fmt(equity_cap_eff, pct=True)}**"
-                           if _rec_reason == "accepted" and equity_cap_eff is not None
+                           if _applied and equity_cap_eff is not None
                            else " ⇒ **未采纳**（只许压降、不许抬高）")
                         + (f"｜原文依据：{_rec_ev[:160]}" if _rec_ev else "")
                     )
@@ -535,6 +543,23 @@ def _render_pipeline(result: Mapping, account: object,
                         + (f"｜原文依据：{_rec_ev[:160]}" if _rec_ev else "")
                     )
                     lines.append("")
+        # 🔴 2026-11-18（用户目标文档 §二.2）：**Final Theme Guard** 的披露
+        #    （日报也要看得见：同主题最终只留 1 只，拦下了谁）
+        _guard = _get(ta_screen, "theme_guard") or {}
+        if isinstance(_guard, Mapping) and _get(_guard, "applied"):
+            _g_blocked = _get(_guard, "blocked") or []
+            _g_breach = _get(_guard, "concentration_breaches") or []
+            lines.append(
+                f"**Final Theme Guard（同主题最终只留 1 只，MAX_PER_THEME="
+                f"{int(_get(_guard, 'max_per_theme') or 1)}）**"
+                + (f"：拦下 {len(_g_blocked)} 行新买"
+                   + ("（" + "、".join(
+                       f"{str(_get(b, 'code'))}（主题 {_get(b, 'theme')}）"
+                       for b in _g_blocked) + "）")
+                   if _g_blocked else "")
+                + (f"｜⚠️ 集中度披露 {len(_g_breach)} 项" if _g_breach else "")
+            )
+            lines.append("")
         if screen_pairs:
             # 🔴 2026-11-11：TA 已被明确授权可**据此点名否决**（合规陪审团）
             #    ⇒ 标题不再写「仅供审查参考」；规则层**硬拦口径本身不变**（仍只拦重叠 ≥ 0.90 / corr120 ≥ 0.95）。

@@ -173,14 +173,173 @@ def _resolve_prices_path(run_root: Path, asof: str, explicit: str | None = None)
     return Path(C.ETF_PRICES_CSV)
 
 
+#: 🔴 2026-11-18（用户目标文档 §二.1）：**账户口径的单一事实源开关**。
+#:    每日流水线导出的 `account_context.json`（实盘口径：30,035.57 / 现金 23,367.37 /
+#:    唯一底仓 512800）与研究链 canonical `account.py`（2026-11-04 旧件：29,854.67 /
+#:    现金 15,518.87 / 5 只持仓 / 权益 48%）**是两个完全不同的账户**。
+#:    ⇒ 只要给了 `--account-json`，**必须**用它；读不到 / 校验不过 ⇒ **抛错**（fail-closed），
+#:      **绝不**回落到 canonical —— 那正是「TA 看着假账本做决策」的根因。
+_ACCOUNT_JSON_REQUIRED = ("cash", "total_assets", "positions")
+#: 对账容差（元）：总资产 vs 现金 + 持仓市值
+_ACCOUNT_TOLERANCE = 0.01
+
+
+def load_account_from_json(path: str | Path) -> dict:
+    """读**账户上下文 JSON**（每日流水线导出的实盘口径）⇒ TA 上下文的账户三件套。
+
+    🔴 2026-11-18（用户目标文档 §二.1）：本函数是**唯一的**「非 canonical 账户」入口。
+    返回 ``{"summary": {...}, "rows": [...], "weights": {...}, "source": str, ...}``，
+    字段与研究链 `account.account_summary()` **同构** ⇒ 渲染层零改动。
+
+    **fail-closed 语义**（任一条不满足 ⇒ 抛异常，**不回落**）：
+      ① 文件不存在 / 读不出 / 不是 JSON 对象；
+      ② 缺 `cash` / `total_assets` / `positions` 或 `positions` 不是数组；
+      ③ `total_assets` 与「现金 + 持仓市值」对不上（偏差 ≥ 0.01 元）⇒ 数字自相矛盾，
+         宁可不投喂（**不拿半张账本喂 LLM**）。
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"账户上下文 JSON 不存在：{p} ⇒ 拒绝回落研究链 canonical 账户（旧口径）"
+        )
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"账户上下文 JSON 读取失败：{exc}（{p}）") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"账户上下文 JSON 结构不对（不是对象）：{p}")
+    missing = [k for k in _ACCOUNT_JSON_REQUIRED if k not in payload]
+    if missing:
+        raise ValueError(f"账户上下文 JSON 缺必需字段 {missing}：{p}")
+    positions = payload.get("positions")
+    if not isinstance(positions, list):
+        raise ValueError(f"账户上下文 JSON 的 positions 不是数组：{p}")
+
+    def _num_or_none(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    rows: list[dict] = []
+    total_cost = 0.0
+    total_pnl = 0.0
+    market_value = 0.0
+    for pos in positions:
+        if not isinstance(pos, dict):
+            raise ValueError(f"账户上下文 JSON 的 positions 里有非对象元素：{p}")
+        code = str(pos.get("code") or "").zfill(6)
+        if not code.strip("0"):
+            raise ValueError(f"账户上下文 JSON 里有缺 code 的持仓行：{p}")
+        shares = _num_or_none(pos.get("shares")) or 0.0
+        price = _num_or_none(pos.get("price"))
+        mv = _num_or_none(pos.get("market_value"))
+        if mv is None:
+            mv = shares * (price or 0.0)
+        if price is None and shares:
+            price = mv / shares
+        cost = _num_or_none(pos.get("cost"))
+        if cost is None:
+            cost = mv
+        pnl = _num_or_none(pos.get("pnl"))
+        if pnl is None:
+            pnl = mv - cost
+        pnl_pct = _num_or_none(pos.get("pnl_pct"))
+        if pnl_pct is None:
+            pnl_pct = (pnl / cost) if cost else 0.0
+        rows.append({
+            "code": code,
+            "name": str(pos.get("name") or "—"),
+            "shares": int(shares),
+            "price": float(price or 0.0),
+            "market_value": float(mv),
+            "cost": float(cost),
+            "pnl": float(pnl),
+            "pnl_pct": float(pnl_pct),
+        })
+        total_cost += float(cost)
+        total_pnl += float(pnl)
+        market_value += float(mv)
+
+    total_assets = float(payload["total_assets"])
+    cash = float(payload["cash"])
+    if total_assets <= 0:
+        raise ValueError(f"账户上下文 JSON 的 total_assets 非正：{total_assets}（{p}）")
+    diff = cash + market_value - total_assets
+    if abs(diff) >= _ACCOUNT_TOLERANCE:
+        raise ValueError(
+            f"账户上下文 JSON 对账失败：现金 {cash:.2f} + 持仓市值 {market_value:.2f} = "
+            f"{cash + market_value:.2f}，与 total_assets {total_assets:.2f} 偏差 {diff:+.2f} 元"
+            f"（{p}）⇒ 拒绝投喂半张账本"
+        )
+    summary = {
+        "total_assets": total_assets,
+        "cash": cash,
+        "market_value": market_value,
+        "cash_weight": cash / total_assets,
+        "market_value_weight": market_value / total_assets,
+        "n_positions": len(rows),
+        "total_cost": total_cost,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": (total_pnl / total_cost) if total_cost else 0.0,
+    }
+    weights = {
+        r["code"]: (r["market_value"] / total_assets) for r in rows if r["market_value"]
+    }
+    return {
+        "summary": summary,
+        "rows": rows,
+        "weights": weights,
+        "source": str(p),
+        "source_label": "snapshot_json",
+        "snapshot_date": str(payload.get("snapshot_date") or ""),
+        "cleared_positions": payload.get("cleared_positions") or [],
+        "discrepancy_note": str(payload.get("discrepancy_note") or ""),
+    }
+
+
 def build(run_root: Path, report_md: Path, backtest_new: Path | None,
           backtest_old: Path | None, backtest_mid: Path | None = None,
-          quality: Path | None = None, prices_path: str | None = None
+          quality: Path | None = None, prices_path: str | None = None,
+          account_json: Path | None = None
           ) -> tuple[str, dict]:
     rep = json.loads((run_root / "etf_analysis_report.json").read_text(encoding="utf-8"))
     rec = json.loads((run_root / "rebalance_recommendation.json").read_text(encoding="utf-8"))
-    summary = account.account_summary()
-    weights = account.current_weights()
+    # 🔴 2026-11-18（用户目标文档 §二.1）：**账户口径单一事实源**。
+    #    给了 `account_json` ⇒ 用**本轮快照的实盘口径**；读不到 ⇒ 抛错（fail-closed），
+    #    **绝不**回落到研究链 canonical 旧账户（29,854.67 / 现金 15,518.87 / 5 只持仓）。
+    if account_json is not None:
+        _acc = load_account_from_json(account_json)
+        summary = dict(_acc["summary"])
+        weights = dict(_acc["weights"])
+        acct_rows = list(_acc["rows"])
+        account_source = _acc["source"]
+        account_source_label = _acc["source_label"]
+        account_snapshot_date = _acc["snapshot_date"]
+        account_note = _acc["discrepancy_note"]
+    else:
+        summary = account.account_summary()
+        weights = account.current_weights()
+        _snap = account.load_account_snapshot()
+        acct_rows = [
+            {
+                "code": str(r["code"]),
+                "name": str(r["name"]),
+                "shares": int(r["shares"]),
+                "price": float(r["price"]),
+                "market_value": float(r["market_value"]),
+                "cost": float(r["cost"]),
+                "pnl": float(r["pnl"]),
+                "pnl_pct": float(r["pnl_pct"]),
+            }
+            for _, r in _snap.iterrows()
+        ]
+        account_source = str(getattr(account, "ACCOUNT_SNAPSHOT_CSV", "research_chain_account"))
+        account_source_label = "research_chain_canonical"
+        account_snapshot_date = str(getattr(account, "ACCOUNT_SNAPSHOT_DATE", "") or "")
+        account_note = ""
 
     lines: list[str] = []
     add = lines.append
@@ -205,16 +364,38 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
         f"（{summary['market_value_weight'] * 100:.2f}%）")
     add(f"- 持仓浮动盈亏 **{_fmt_num(summary['total_pnl'])} 元"
         f"（{summary['total_pnl_pct'] * 100:+.2f}%）**")
+    if account_json is not None:
+        # 🔴 目标结构按**本臂规则层实际输出**推导（不再用研究链 canonical 的
+        #    「5 只 × 16% ≈ 4,776 元」——那是以 29,854.67 为基数算的，对本账户无意义）。
+        _rl_holdings = rec.get("holdings") or []
+        if _rl_holdings:
+            _tw = []
+            for h in _rl_holdings:
+                try:
+                    _tw.append(float(h.get("target_weight")))
+                except (TypeError, ValueError):
+                    continue
+            _tw_mean = (sum(_tw) / len(_tw)) if _tw else 0.0
+            summary["target_positions"] = len(_rl_holdings)
+            summary["target_position_weight"] = _tw_mean
+            summary["target_position_amount"] = summary["total_assets"] * _tw_mean
+        else:
+            summary["target_positions"] = 0
+            summary["target_position_weight"] = 0.0
+            summary["target_position_amount"] = 0.0
     add(f"- 目标结构：**{summary['target_positions']} 只等权**，每只 "
         f"{summary['target_position_weight'] * 100:.0f}% ≈ "
         f"**{_fmt_num(summary['target_position_amount'])} 元**")
+    add(f"- 账户口径来源：**{account_source_label}**"
+        f"（快照日 {account_snapshot_date or '—'}｜文件 `{account_source}`）")
+    if account_note:
+        add(f"- ℹ️ 账户口径披露：{account_note}")
     add("")
     add("| 代码 | 名称 | 股数 | 现价 | 市值 | 盈亏率 | 当前权重 |")
     add("|:--|:--|--:|--:|--:|--:|--:|")
-    snap = account.load_account_snapshot()
-    for _, r in snap.iterrows():
+    for r in acct_rows:
         code = str(r["code"])
-        add(f"| {code} | {r['name']} | {int(r['shares']):,} | {r['price']:.3f} | "
+        add(f"| {code} | {r['name']} | {int(r['shares']):,} | {float(r['price']):.3f} | "
             f"{_fmt_num(r['market_value'])} | {float(r['pnl_pct']) * 100:+.2f}% | "
             f"{weights.get(code, 0.0) * 100:.2f}% |")
     add("")
@@ -401,6 +582,12 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
     # ---- 5. 回测数字（含口径变更披露） ----
     add("## 5. 回测关键数字（务必连同口径一起引用）")
     add("")
+    # 🔴 2026-11-18（用户目标文档 §二.3）：这些数字是 **11-04 缓存的静态基线**
+    #    （每日增量推理链**不跑**历史回测）⇒ **不是本臂的实时回测**，
+    #    **不参与**本轮买卖信号与仓位计算 ⇒ 引用时必须带上这个注记。
+    add("> ⚠️ **[历史参考基线，非本臂实时回测]**：以下回测数字来自 **11-04 缓存的静态回测产物**"
+        "（每日链不跑历史回测）⇒ **不参与**本轮的买卖信号与仓位计算，仅供横向参照。")
+    add("")
     if backtest_new and backtest_new.exists():
         b = json.loads(backtest_new.read_text(encoding="utf-8"))
         p, bm, ex = b["portfolio_net"], b["benchmark_510300"], b["excess_vs_510300"]
@@ -491,9 +678,11 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
     # 🔴 任务里的前提必须**从真实账户现算**（2026-11-04 夜实测：旧文案写死
     #    「当前 5 个仓位里有 3 只货币 ETF（合计 60%）」，而真实持仓里**一只货币 ETF 都没有**
     #    ⇒ LLM 花大量篇幅"纠正"一个不存在的前提，Bear 的整个方案也建立在纠正之上）。
-    _snap = account.load_account_snapshot()
-    _cur_codes = [str(r["code"]) for _, r in _snap.iterrows()]
-    _cur_names = [str(r["name"]) for _, r in _snap.iterrows()]
+    # 🔴 2026-11-18（用户目标文档 §二.1）：这里**也**必须用**同一份**账户口径
+    #    （旧口径读研究链 canonical 快照 ⇒ §1 说「1 只持仓」、§7 却说「5 只持仓」
+    #    ⇒ 上下文自相矛盾 ⇒ LLM 会拿假持仓做论据）。
+    _cur_codes = [str(r["code"]) for r in acct_rows]
+    _cur_names = [str(r["name"]) for r in acct_rows]
     _money_kw = ("货币", "日利", "添益", "现金添益")
     _money_held = [n for n in _cur_names if any(k in n for k in _money_kw)]
     _tgt_def = [h for h in rec.get("holdings", []) if h.get("is_defensive")]
@@ -552,6 +741,10 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
         "crowding_reason": _crowding_reason,
         # 🔴 2026-11-11（审查发现 3.5）：行情源必须与规则层同源（记下来便于审计）
         "prices_source": str(_prices_file),
+        # 🔴 2026-11-18（用户目标文档 §二.1）：账户口径来源（审计用）
+        "account_source": account_source,
+        "account_source_label": account_source_label,
+        "account_snapshot_date": account_snapshot_date,
     }
     return text, meta
 
@@ -572,6 +765,10 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     # 🔴 2026-11-11（审查发现 3.5）：显式指定**与规则层同源**的行情文件
     ap.add_argument("--prices", default=None)
+    # 🔴 2026-11-18（用户目标文档 §二.1）：**实盘账户口径**（每日流水线导出）
+    #    ⇒ 给了就必须用；读不到 ⇒ 抛错（**不回落到 canonical 旧账户**）。
+    ap.add_argument("--account-json", default=None,
+                    help="账户上下文 JSON（实盘口径）；给了就用它，缺失/损坏 ⇒ 报错")
     args = ap.parse_args()
 
     run_root = Path(args.run_root)
@@ -584,6 +781,7 @@ def main() -> int:
         Path(args.backtest_mid) if args.backtest_mid else run_root / "etf_rotation_backtest_v4_prefer0.json",
         Path(args.cluster_quality) if args.cluster_quality else run_root / "probe_cluster_quality.json",
         prices_path=args.prices,
+        account_json=Path(args.account_json) if args.account_json else None,
     )
     out.write_text(text, encoding="utf-8")
     (run_root / "ta_context_meta.json").write_text(

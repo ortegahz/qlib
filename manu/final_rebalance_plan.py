@@ -2039,7 +2039,86 @@ _TA_CAP_REASONS = (
     "out_of_range",        # 数字越界（不在 0~100）
     "at_or_above_base_cap",  # 建议值 ≥ 规则层硬上限 ⇒ 忽略（只许压降）
     "accepted",            # **采纳**：压降权益上限
+    # 🔴 2026-11-18（用户目标文档 §三.1）：TA **看空但没给数字上限**
+    #    ⇒ 兜底一个保守上限（**不许**当成「无限制」）。
+    "bearish_fallback_cap",
 )
+
+#: 🔴 2026-11-18（用户目标文档 §三.1）：TA 的**看空口径**关键词。
+#:    触发词只认 TA 自己的**评级**（`Rating:` 行）/ **Action** 行 / 摘要首段，
+#:    **不扫全文**（正文里出现「卖出」二字不等于宏观看空）。
+_BEARISH_MARKERS = (
+    "sell", "underweight", "卖出", "减持", "清仓", "降仓", "降低权益",
+    "看空", "避险", "防守",
+)
+_BULLISH_MARKERS = ("buy", "overweight", "买入", "增持", "加仓", "看多")
+_NEUTRAL_MARKERS = ("hold", "neutral", "持有", "中性", "观望")
+
+
+def _ta_macro_stance(llm_raw: dict | None) -> dict:
+    """判断 TA 的**宏观态度**（看空 / 看多 / 中性 / 未知）。
+
+    🔴 2026-11-18（用户目标文档 §三.1）：V1 臂实测 —— TA 喊 `Sell`
+    （`Action: Sell` / 评级看空）却**没吐出数字上限** ⇒ 旧口径判 `not_a_target`
+    ⇒ 下游**完全不压降** ⇒ 权益从 23% 暴拉到 70.53%。
+    ⇒ 本函数给「看空但没数字」提供一个**可判定的立场**，供兜底上限使用。
+
+    取值优先级（**逐级**判定，先命中先返回）：
+      ① `rating`（决策件 `Rating:` 行，结构化）⇒ bearish / neutral / bullish；
+      ② `summary`（Executive Summary 摘要）；
+      ③ 决策件里的 `**Action**: X` 行。
+    ⚠️ **没有**决策（`available` 为假）⇒ `unknown` ⇒ **不套兜底**。
+    """
+    out = {"stance": "unknown", "evidence": "", "source": ""}
+    if not isinstance(llm_raw, dict) or not llm_raw.get("available"):
+        return out
+
+    def _classify(text: str) -> str:
+        low = str(text or "").lower()
+        if not low.strip():
+            return "unknown"
+        if any(m in low for m in _BEARISH_MARKERS):
+            return "bearish"
+        if any(m in low for m in _BULLISH_MARKERS):
+            return "bullish"
+        if any(m in low for m in _NEUTRAL_MARKERS):
+            return "neutral"
+        return "unknown"
+
+    rating = str(llm_raw.get("rating") or "").strip()
+    if rating:
+        st = _classify(rating)
+        if st != "unknown":
+            out.update({"stance": st, "evidence": f"最终评级：{rating}", "source": "rating"})
+            return out
+
+    summary = str(llm_raw.get("summary") or "").strip()
+    if summary:
+        st = _classify(summary)
+        if st != "unknown":
+            out.update({"stance": st,
+                        "evidence": f"Executive Summary 摘要（首 200 字）：{summary[:200]}",
+                        "source": "summary"})
+            return out
+
+    src = str(llm_raw.get("source_file") or "")
+    if src:
+        try:
+            text = Path(src).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = ""
+        for line in text.splitlines():
+            if "Action" not in line and "action" not in line:
+                continue
+            if "**" not in line and ":" not in line:
+                continue
+            st = _classify(line)
+            if st == "bearish":
+                out.update({"stance": "bearish",
+                            "evidence": f"决策件 Action 行：{line.strip()[:200]}",
+                            "source": "decision_action"})
+                return out
+    return out
 
 
 def _resolve_ta_equity_cap(llm_raw: dict | None) -> dict:
@@ -2061,25 +2140,56 @@ def _resolve_ta_equity_cap(llm_raw: dict | None) -> dict:
         return out
     pt = llm_raw.get("post_trade") or {}
     if not isinstance(pt, dict):
-        return out
+        pt = {}
     raw_pct = pt.get("equity_target_pct")
     if raw_pct is None:
         out["reason"] = "not_a_target"
-        return out
+        return _bearish_fallback(out, llm_raw)
     try:
         pct = float(raw_pct)
     except (TypeError, ValueError):
         out["reason"] = "out_of_range"
-        return out
+        return _bearish_fallback(out, llm_raw)
     # 🔴 2026-11-11（审计缺陷 C）：**输入单位 = 百分点**（36.0 表示 36%）。
     #    小数形式（0.36）**无法与「0.36%」区分** ⇒ 一律判越界（**不许**静默压降 100 倍）。
     if not (0.0 <= pct <= 100.0) or 0.0 < pct < 1.0:
         out["reason"] = "out_of_range"
-        return out
+        return _bearish_fallback(out, llm_raw)
     out["evidence"] = str(pt.get("equity_target_pct_evidence") or "")
     cap = pct / 100.0
     out["pct"] = cap
     out["reason"] = "accepted" if cap < _EQUITY_CAP - 1e-12 else "at_or_above_base_cap"
+    return out
+
+
+def _bearish_fallback(out: dict, llm_raw: dict) -> dict:
+    """🔴 2026-11-18（用户目标文档 §三.1）：**看空但没数字上限** ⇒ 兜底一个保守上限。
+
+    【为什么必须有】
+    V1 臂实测：TA 喊 `Sell`（评级/动作看空）却**没吐出百分比上限**
+    ⇒ 旧口径判 `not_a_target` ⇒ `pct=None` ⇒ **完全不压降**
+    ⇒ 下游顺延补位把权益从 23.43% 拉到 **70.53%**（与防守初衷完全相反）。
+    ⇒ 修法：TA **看空** + **解析不出数字** ⇒ 用**带内上沿**兜底
+    （单一事实源 = `config.MACRO_DERISK_EQUITY_CAP_MAX`，默认 0.35 = 35%）。
+
+    【不套兜底的情形】
+    * **没有** TA 决策（`no_ta_advice`）⇒ 看空与否无从判断 ⇒ **不套**（保持旧行为）；
+    * TA 看多 / 中性 ⇒ **不套**（不许凭关键词压降）；
+    * TA 看空但**给出了**数字 ⇒ 走正常口径（`accepted` / `at_or_above_base_cap`）。
+    """
+    stance = _ta_macro_stance(llm_raw)
+    if stance.get("stance") != "bearish":
+        return out
+    cap = float(C.MACRO_DERISK_EQUITY_CAP_MAX)
+    out["pct"] = cap
+    out["reason"] = "bearish_fallback_cap"
+    out["evidence"] = (
+        f"TA 看空（{stance.get('evidence') or '决策件评级/动作'}）"
+        f"但**没给出数字权益上限**（原判定 {out.get('reason')}）"
+        f" ⇒ 兜底上限 {cap * 100:.0f}%"
+        f"（单一事实源 = config.MACRO_DERISK_EQUITY_CAP_MAX）"
+    )
+    out["stance"] = "bearish"
     return out
 
 
@@ -2160,6 +2270,160 @@ def _apply_macro_derisk_band(ta_pct: float | None, base_cap: float) -> tuple[flo
     info["applied"] = True
     info["reason"] = reason
     return effective, info
+
+
+def _final_theme_guard(
+    kept_actions: list[dict],
+    orphan_rows: list[dict],
+    *,
+    theme_of,
+    max_per_theme: int = 1,
+    score_of=None,
+) -> dict:
+    """🔴 2026-11-18（用户目标文档 §二.2）：**Final Theme Guard**（最终清单全局主题去重）。
+
+    【钉的是什么】
+    风控规则里 `MAX_PER_THEME = 1`（同一主题最多 1 只）本已挡在**候选池**层，
+    但「TA 否决 → 孤儿维持 → 顺延补位」这条拼接链**没有再校验最终清单** ⇒
+    实测（2026-11-18 V1 臂）：最终同时持有 `512800`（银行 23.43%）+
+    `515020`（银行 15.69%）⇒ **单一银行板块 39.1%**。
+    ⇒ 本守卫在**最终清单**上再兜一次：同一主题最终只留 1 只。
+
+    【口径（fail-closed，处置顺序固定）】
+    ① **真实持仓优先**：账户**已经持有**的行（`current_weight > 0`，含被 TA 否决的
+       「维持」行）**永远不拦** ⇒ 它的市值不许凭空蒸发（沿用 §十四.110 缺陷 A 的处置）。
+    ② **新买行可拦**：同一主题里**没持有**的行（顺延补位 / 规则层新入选）⇒
+       **拦下**（目标权重归 0 ⇒ 计划里不产生买单）。
+    ③ **同主题多只真实持仓**：账户本来就有两只同主题 ⇒ **不许替用户做卖出决策**
+       ⇒ 两只都保留，但**如实披露**集中度超限（`concentration_breaches`）。
+    ④ 同主题多只**新买**行 ⇒ 留**最终分最高**的那 1 只（并列 ⇒ 目标权重高者 ⇒ 代码序）。
+
+    返回 ``{"applied", "max_per_theme", "n_blocked", "blocked", "theme_map",
+    "concentration_breaches", "note"}``；`blocked` 逐条给
+    `{code, name, theme, kept_code, kept_kind, reason}`。
+    """
+    def _theme(code: str) -> str:
+        try:
+            t = theme_of(code)
+        except Exception:  # noqa: BLE001 —— 取不到主题 ⇒ 按「未知」单列（不合并）
+            t = ""
+        return str(t) if t else str(code)
+
+    def _score(code: str) -> float:
+        if score_of is None:
+            return 0.0
+        try:
+            v = score_of(code)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _w(row: dict, key: str) -> float:
+        try:
+            return float(row.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    #: 最终清单 = 规则层/顺延补位行（kept）+「维持」行（orphan）
+    rows: list[dict] = []
+    for a in kept_actions:
+        if _w(a, "target_weight") <= 0:
+            continue
+        code = str(a.get("code") or "").zfill(6)
+        rows.append({
+            "code": code,
+            "name": str(a.get("name") or ""),
+            "theme": _theme(code),
+            "target_weight": _w(a, "target_weight"),
+            "current_weight": _w(a, "current_weight"),
+            "kind": "held" if _w(a, "current_weight") > 0 else "new",
+            "score": _score(code),
+            "_src": a,
+        })
+    for r in orphan_rows:
+        code = str(r.get("code") or "").zfill(6)
+        rows.append({
+            "code": code,
+            "name": str(r.get("name") or ""),
+            "theme": _theme(code),
+            "target_weight": _w(r, "target_weight"),
+            "current_weight": _w(r, "current_weight"),
+            "kind": "held",
+            "score": _score(code),
+            "_src": r,
+        })
+
+    by_theme: dict[str, list[dict]] = {}
+    for r in rows:
+        by_theme.setdefault(r["theme"], []).append(r)
+
+    blocked: list[dict] = []
+    breaches: list[dict] = []
+    for theme, group in by_theme.items():
+        if len(group) <= 1:
+            continue
+        held = [r for r in group if r["kind"] == "held"]
+        new = [r for r in group if r["kind"] == "new"]
+        if held:
+            # ① 真实持仓优先：拦掉该主题下的**新买行**
+            keepers = held
+        else:
+            # ④ 全是新买 ⇒ 留最终分最高的 1 只
+            ordered = sorted(
+                group, key=lambda r: (-r["score"], -r["target_weight"], r["code"]))
+            keepers = ordered[:1]
+            new = ordered[1:]
+        keep_codes = [r["code"] for r in keepers]
+        for r in new:
+            r["_src"]["target_weight"] = 0.0
+            r["_src"]["theme_guard_blocked"] = True
+            r["_src"]["reason"] = (
+                str(r["_src"].get("reason") or "")
+                + f"；🛡️ **Final Theme Guard**：最终清单同主题「{theme}」只留 1 只"
+                + f"（保留 {', '.join(keep_codes)}）⇒ 本行**不建仓**（目标权重归 0）"
+            ).lstrip("；")
+            blocked.append({
+                "code": r["code"],
+                "name": r["name"],
+                "theme": theme,
+                "kept_code": keep_codes[0] if keep_codes else "",
+                "kept_codes": keep_codes,
+                "kept_kind": keepers[0]["kind"] if keepers else "",
+                "blocked_target_weight": round(r["target_weight"], 6),
+                "reason": (
+                    f"最终清单同主题「{theme}」已有 {', '.join(keep_codes)}"
+                    f"（{'真实持仓' if keepers and keepers[0]['kind'] == 'held' else '规则层/顺延补位'}）"
+                    f" ⇒ 依 `MAX_PER_THEME={int(max_per_theme)}` **不建仓**本行"
+                ),
+            })
+        if len(held) > 1:
+            breaches.append({
+                "theme": theme,
+                "codes": [r["code"] for r in held],
+                "weights": {r["code"]: round(r["current_weight"], 6) for r in held},
+                "reason": (
+                    f"账户**本来就持有** {len(held)} 只同主题标的（"
+                    f"{', '.join(r['code'] for r in held)}）⇒ **不许替用户做卖出决策**"
+                    " ⇒ 两只都保留，集中度**如实披露**"
+                ),
+            })
+
+    theme_map = {t: [r["code"] for r in g] for t, g in by_theme.items()}
+    return {
+        "applied": bool(blocked or breaches),
+        "max_per_theme": int(max_per_theme),
+        "n_blocked": len(blocked),
+        "blocked": blocked,
+        "theme_map": theme_map,
+        "concentration_breaches": breaches,
+        "note": (
+            "最终清单的**全局主题去重**（Final Theme Guard）：同主题最终只留 1 只；"
+            "**真实持仓优先**（不许市值凭空蒸发），只拦**新买行**"
+        ),
+    }
 
 
 def apply_ta_screening(
@@ -2433,7 +2697,14 @@ def apply_ta_screening(
         # 🔴 顺延必须是「**不同主题**的资产」：
         #    既不能与「剔除后仍入选的集合」同族，**也不能**与被否决者同族
         #    （否则否决一只银行 ETF、换来另一只银行 ETF ⇒ 否决形同虚设）。
-        sel_themes = {_theme_of(c) for c in sel_codes} | {_theme_of(code_rej)}
+        # 🔴 2026-11-18（用户目标文档 §二.2）：**「维持」行（被否决且在持仓）的主题
+        #    也要占族** ⇒ 否则顺延补位会换来**同族**的标的（实测 V1 臂：
+        #    512800 银行被否决 ⇒ 维持行占着银行族 ⇒ 顺延补位 515020 也是银行
+        #    ⇒ 最终银行合计 39.1%，绕过了 `MAX_PER_THEME=1`）。
+        _orphan_themes = {_theme_of(str(r.get("code") or "").zfill(6))
+                          for r in orphan_rows}
+        sel_themes = ({_theme_of(c) for c in sel_codes} | {_theme_of(code_rej)}
+                      | _orphan_themes)
         picked: dict | None = None
         gate_fail: list[str] = []
         for c in pool:
@@ -2554,6 +2825,30 @@ def apply_ta_screening(
             "source_section": str(r.get("source_section") or ""),
         })
 
+    # ---- 🔴 2026-11-18（用户目标文档 §二.2）：**Final Theme Guard** ----
+    #    放在**所有**维持/顺延拼接**之后** ⇒ 校验的是**最终清单**（不是中间集合）。
+    _theme_guard = _final_theme_guard(
+        kept, orphan_rows,
+        theme_of=_theme_of,
+        max_per_theme=int(C.MAX_PER_THEME),
+        score_of=lambda code: (cand_by_code.get(code) or {}).get("final_score"),
+    )
+    #: 被守卫拦下的顺延补位 ⇒ 权益合计要减回来（否则披露的权益是虚高的）
+    _blocked_sub_w = sum(
+        float(x.get("blocked_target_weight") or 0.0) for x in _theme_guard["blocked"])
+    _s_sub_eff = max(0.0, _s_sub - _blocked_sub_w)
+
+    #: 被 Final Theme Guard 拦下的**顺延补位** ⇒ 在「顺延记录」里如实标注
+    #:   （否则披露会说「补位成功」，与「最终没建仓」自相矛盾）。
+    _guard_blocked_codes = {str(x.get("code") or "") for x in _theme_guard["blocked"]}
+    for _sub_row in substituted:
+        if str(_sub_row.get("code") or "") in _guard_blocked_codes:
+            _sub_row["theme_guard_blocked"] = True
+            _sub_row["reason"] = (
+                str(_sub_row.get("reason") or "")
+                + "｜🛡️ **被 Final Theme Guard 拦下**（同主题只留 1 只）⇒ 最终**不建仓**"
+            )
+
     ta_screening = {
         "enabled": True,
         "rejected": rejected_rows,
@@ -2583,6 +2878,12 @@ def apply_ta_screening(
         #    规则层的席位预算 ⇒ 即使**一点也不顺延**，权益合计也已经突破上限
         #    （TA 一票否决 ⇒ 不许卖 ⇒ 这个超配是**事实**，不许粉饰 ⇒ 如实披露）。
         "equity_cap_breach": round(max(0.0, _s_all - _s_drop + _s_orph - _cap), 6),
+        # 🔴 2026-11-18（用户目标文档 §二.2）：**Final Theme Guard** 的披露
+        #    （拦下了哪些行、为什么拦、最终每个主题各留了谁）
+        "theme_guard": _theme_guard,
+        # 🔴 守卫拦下顺延补位后的**实际**权益合计（对照 `equity_cap` 看是否仍在线内）
+        "equity_weight_after_theme_guard": round(
+            _s_all - _s_drop + _s_orph + _s_sub_eff, 6),
     }
     return {"actions": kept, "ta_screening": ta_screening}
 
@@ -3773,16 +4074,24 @@ def render_markdown(plan: dict) -> str:
             _cap_eff = _scr.get("equity_cap_effective")
             _cap_base = _scr.get("equity_cap")
             _cap_scale = _scr.get("equity_cap_scale") or {}
-            if _cap_rec.get("reason") == "accepted":
+            # 🔴 2026-11-18（用户目标文档 §三.1）：`bearish_fallback_cap`
+            #    （TA 看空但没给数字 ⇒ 兜底上限）**同样是被采纳的压降**
+            #    ⇒ 不许落进下面的「不采纳」分支（那会把口径说反）。
+            if _cap_rec.get("reason") in ("accepted", "bearish_fallback_cap"):
                 # 🔴 兜底回 `config` 常量 ⇒ 老产物（无带字段）渲染时不出现「0.0%~0.0%」。
                 _band_min = float(_cap_rec.get("macro_band_min")
                                   or C.MACRO_DERISK_EQUITY_CAP_MIN)
                 _band_max = float(_cap_rec.get("macro_band_max")
                                   or C.MACRO_DERISK_EQUITY_CAP_MAX)
                 _band_reason = str(_cap_rec.get("macro_band_reason") or "")
+                _fallback = (_cap_rec.get("reason") == "bearish_fallback_cap")
                 lines += [
-                    "**Beta 避险（TA 建议压降组合权益上限）**：TA 建议本轮权益上限 **"
-                    f"{float(_cap_rec.get('pct') or 0.0) * 100:.1f}%** ⇒ 本轮**生效上限 = "
+                    ("**Beta 避险（TA 看空但未给数字上限 ⇒ 规则层兜底压降）**："
+                     if _fallback else
+                     "**Beta 避险（TA 建议压降组合权益上限）**：")
+                    + (f"兜底本轮权益上限 **"
+                       if _fallback else "TA 建议本轮权益上限 **")
+                    + f"{float(_cap_rec.get('pct') or 0.0) * 100:.1f}%** ⇒ 本轮**生效上限 = "
                     f"{float(_cap_eff or 0.0) * 100:.1f}%**（规则层硬上限 "
                     f"{float(_cap_base or 0.0) * 100:.1f}% = 1 − 现金预留比例；"
                     "**只许压降、不许抬高**）⇒ 席位目标权重**等比缩放**（系数 "
@@ -3872,6 +4181,32 @@ def render_markdown(plan: dict) -> str:
         elif _rej:
             lines += [f"**顺延**：本轮**没有**顺延补位 ⇒ "
                       f"{_scr.get('no_substitute_reason') or '（原因未记录）'}", ""]
+        # 🔴 2026-11-18（用户目标文档 §二.2）：Final Theme Guard 的披露
+        _guard = _scr.get("theme_guard") or {}
+        if _guard.get("applied"):
+            lines += [
+                f"🛡️ **Final Theme Guard（同主题最终只留 1 只，MAX_PER_THEME="
+                f"{int(_guard.get('max_per_theme') or 1)}）**：",
+                "",
+            ]
+            _g_blocked = _guard.get("blocked") or []
+            if _g_blocked:
+                lines += ["| 被拦下的代码 | 名称 | 主题 | 保留者 | 原因 |",
+                          "|:--|:--|:--|:--|:--|"]
+                for _b in _g_blocked:
+                    lines.append(
+                        f"| {_b.get('code')} | {_b.get('name') or '—'} | "
+                        f"{_b.get('theme') or '—'} | "
+                        f"{', '.join(_b.get('kept_codes') or []) or '—'} | "
+                        f"{_b.get('reason') or '—'} |")
+                lines += [""]
+            for _br in (_guard.get("concentration_breaches") or []):
+                lines += [
+                    f"⚠️ **不可消除的集中度**：{_br.get('reason') or ''}"
+                    f"（主题「{_br.get('theme')}」，权重 "
+                    f"{_br.get('weights') or '—'}）",
+                    "",
+                ]
         if _pairs:
             lines += ["**高重合预警对**（**更宽口径**：成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 "
                       "或同族 ⇒ **只提示**，不改变规则层判定；规则层仍按"
