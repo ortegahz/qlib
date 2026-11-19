@@ -4400,3 +4400,97 @@ cd /tmp/pycharm_project_658d3fc4
      `/mnt/data/codex-overnight/prompt_first.txt`（封版完成提示）⇒ 后续轮次只做只读复核、**不再重跑流水线**。
    - 🔴 **待 operator 修（loop 退出后）**：`PROMPT=$(cat "$PROMPT_NEXT")` 赋值必须移出短路分支
      （否则 `prompt_next.txt` 永远读不到）；另 `PROMPT` 是跨轮残留变量，需每轮显式重置。
+
+## 2026-11-19 续九 · 🔴 S 层**生产权重**全量重训 + 每日链接线 + **模型一致守卫** + **落点归位**（**未 commit**，用户明早手动提交）
+
+【一、用户问的三个问题，逐个答】
+| 问题 | 答案 | 证据 |
+| --- | --- | --- |
+| 每日流水线加载的是不是「用 2016–2026 最新行情（留 25 日隔离带）重训」的生产模型？ | **改之前不是**（加载的是 2026-11-04 训的**验证模型**，fit 只到 2021-12-31） | 阶段 2 调 `qlib_scores.py --mode infer` **不传 `--model-dir`** ⇒ 走默认值 |
+| 这个工作做了吗？ | **本轮做完并实跑验证** | 生产模型三件套 + 全量重打分 + 观察链实跑 |
+| 产物落在 `ashare_topk/` 下违反铁律？ | **是，已当场改正**（详见【四】） | `rules.md §十六` 双根落点 |
+
+【二、S 层生产权重：改了什么、怎么验的】
+1. **代码**（`manu/etf_rotation/qlib_scores.py`，活链）：
+   - `--mode prod`：**训练段 = 2016-01-01 ~ 数据末日 − 25 个交易日**；
+     🔴 `PRODUCTION_EMBARGO_DAYS = 25` ＝ V2 研究链 `v2/splits.effective_embargo_days()`
+     （＝ `max(20, LABEL_HORIZON_DAYS=25)`，**两个链同一事实源**）。
+   - `--model-dir` **默认值 = 生产目录**（`PRODUCTION_MODEL_DIR`）⇒ 每日链**不用改调用点**就换到新权重。
+   - **infer 端的归一化 fit 窗改从 `production_manifest.json` 读**（旧实现硬编码 `C.STOCK.FIT_START~FIT_END`
+     ⇒ 换模型不换统计量 ⇒ **静默劣化**）；🔴 **生产目录缺 manifest ⇒ 抛错（fail-closed）**，
+     只有**非生产目录**（旧模型）才允许回落。
+   - 产出**指纹旁挂文件** `stock_scores.fingerprint.json`（model_md5 + fit 窗）⇒ 每日链守卫的事实源。
+2. **训练（服务器，~90s）**：数据 `cn_data_live`（末日 **2026-11-18**）
+   ⇒ 训练段 **2016-01-01 ~ 2026-10-14**（末日 − 25 交易日，被隔离的 25 日 = 2026-10-15~11-18 **不进训练**）。
+   产物：`model.pkl`（md5 `39fea964…`）+ `pred_prod.pkl`（208,402 行）+ `production_manifest.json`。
+3. **🔴 最强验证（同源交叉校验）**：生产模型在**训练池 csi300** 上打 test 段的 `pred_prod.pkl`
+   vs infer 端在**全市场池**上打同一批日期 ⇒ 在 csi300 成分上的分数
+   **`n=300（1 日）spearman=1.000000、max|Δ|=0.000e+00`** ⇒ 归一化统计量转移**逐位**正确（不是「差不多」）。
+4. **全量重打分（服务器，~5 min）**：`--mode infer --start 2024-01-01 --end 2026-11-18`
+   ⇒ **70 个打分日**（2024-01-09 ~ 2026-11-18，比旧 canonical 多 1 天），
+   分数区间 `[-1.52, 1.15]` 非退化。
+
+【三、🔴 本轮新抓到的真隐患：**换权重后的「混模分数」】】
+- 每日链阶段 2 是**增量**打分（拿上一份快照/canonical 当底座，只重算增量段）。
+- 🔴 换权重 ⇒ 归一化统计量变了 ⇒ **全部分数都变了**
+  ⇒ 若还拿**旧权重的底座**增量拼接 ⇒ **一份分数里混着两套模型** ⇒ 症状是「看起来正常的坏结果」。
+- **修法（新增「模型一致守卫」）**：
+  - `qlib_scores.py` 落**指纹旁挂文件**（model_md5 + fit 窗）；
+  - `daily/agents_rebalance.py` 新增 `_scores_fingerprint` / `_current_model_fingerprint`
+    （**问 `qlib_scores.py --print-prod-fingerprint`**，不在每日链另写一份模型路径常量 ⇒ 单一事实源）
+    / `_fingerprint_matches`；
+  - **指纹对不上 ⇒ 整段作废、必须全量重算**，且**旧底座不许并进来**；
+    **指纹读不到（老底座 / 问不到当前模型）⇒ fail-closed 判为不可增量**；
+  - 指纹旁挂文件**跟着底座一起拷贝**（不拷 ⇒ 每轮都白跑全量）。
+- 🛡️ 回归：`daily/tests/test_s_layer_model_consistency_guard.py`（8 条）＋
+  `tests/test_s_layer_production_weight.py`（14 条）。
+
+【四、🔴 落点违规：当场归位、痕迹清零】
+- 违例：生产模型三件套误落 `/mnt/data/siping/runs/ashare_topk/prod_s_layer_20261119/`
+  ⇒ **两层违规**：① `ashare_topk/` 是**别人的链**（它的产物只许在**它自己的 `runs/` 下**）；
+  ② 本项目产物只许落 `<RESULTS_ROOT>`（`rules.md §十六`）⇒ 在共享目录 `siping/runs/` 下建第二个本项目目录 = 违规。
+- 处置：`mv` 到 `<RESULTS_ROOT>/prod_s_layer_20261119/`；误建目录 `rmdir`；
+  🔴 **manifest 里的 `pred_prod` 路径字段也改了**（否则 manifest 自己就是违规证据）；
+  `ashare_topk/` 根目录**恢复原状**（只剩它自己的 `runs/ mlruns/ probes/ *.log`），
+  `ashare_topk/runs/0fdde803…`（别人的验证模型）**只读、未碰**。
+- 复核：`siping/runs/` 顶层只剩**本项目唯一专属目录** `etf_rotation_results/`；
+  `/mnt/data` 根、`siping/datasets/` 顶层**无本项目文件**；临时验证产物 `/tmp/prod_infer_smoke` 已删。
+
+【五、🔴 顺手修掉的另一条真隐患：**镜像对被我改漂移了】**
+- 全仓镜像守卫（`v2/tests/test_turnover_convention_repo_guard.py::test_全仓镜像文件必须逐字一致`）
+  实测 **RED**，漂移 5 条：
+  - `manu/qlib_scores.py` ↔ `manu/etf_rotation/qlib_scores.py` 内容不一致（**本轮我改了活链、忘了同步镜像**）；
+  - `manu/tests/` 缺 4 个文件（**上一轮续八遗留 3 个** ＋ 本轮新增 1 个）。
+- 处置：镜像同步（逐字一致）；新测试的路径解析改成**认得两种位置**（活链侧 / 镜像侧）⇒ 两边都能跑。
+- ⇒ **教训**：`manu/` ↔ `manu/etf_rotation/` 是**镜像对** ⇒ 改活链必须同步镜像，
+  否则**守卫转红**（实测）——而且这条守卫**上一轮就已经是红的**，只是没人跑。
+
+【六、🔴 观察态重跑（asof 2026-11-18 · **生产权重** · 未开 `--live-trade` ⇒ 不是实盘信号）】
+- 落点：`<RESULTS_ROOT>/rerun_v2_prod_weight_20261119/`（**新目录**，未覆盖基线快照）。
+- 链路：阶段 3 `analyze.py`（11s）→ 阶段 3b `recommend.py`（规则层）→ 4a 上下文（17,743 字符）
+  → 4b TA 辩论（**signal=Underweight，耗时 1176s**）→ 5 最终计划。
+- **入选名单换了**（新权重 ⇒ 分数变了）：`159263` 价值ETF易方达 / `512800` 银行ETF华宝 /
+  `515100` 红利低波100ETF景顺 / `515450` 红利低波50ETF南方 / `563020` 红利低波ETF易方达
+  （旧权重那轮是 `512010` 医药 / `515170` 食品饮料 / `159307` / `159207` / `512800`）。
+- **TA 一票否决**：`512800`（证据不足）、`515100`、`563020`、`512820`、`512010`（拥挤/同族重复）
+  ⇒ **顺延补位**：`159207`（替 `512800`）、`515170`（替 `515100`）。
+- **最终清单 5 行**：4 只全部「**不建仓**」（金额 692~754 元 **< 新开仓门槛 3800 元**）
+  ＋ `512800` **维持** 7,700 股（TA 否决 ⇒ 不卖）。
+- **落地**：实际权益 **7,037.80 元（23.43%）**、现金 **23,367.37 元（77.80%）**、本期买卖 **0 元**；
+  `theme_guard applied=false / n_blocked=0`（**银行主题只有 512800 一只** ✅）。
+- 🔴 **门槛与账户规模不匹配（数学死锁，报告自己点出来了）**：所有新开仓都被 3800 元门槛拦下
+  ⇒ **以后再也买不进任何新 ETF** ⇒ 要么下调门槛、要么提高账户规模（**用户决策项，本轮不改**）。
+- 🔴 **TA 这次读到的是真账户**（30,035.57 / 现金 23,367.37 / 唯一持仓 512800 7,700 股 / 权重 22.20%）
+  ⇒ 续八那个「TA 读旧账户」的事故**没有复发**。
+- ⏭️ **信号日 = 2026-12-01，执行日 = 2026-12-02**（T 日收盘出信号、T+1 收盘执行，`EXECUTION_LAG_DAYS=1`）
+  ⇒ 本文件的股数/金额是按 **2026-11-18 收盘价**折算的**样例值**，
+  **12-01 收盘后必须按当日收盘价重算整手股数**，再于 12-02 收盘下单。
+
+【七、🛡️ 回归（服务器独立复核）】
+- `pytest manu/etf_rotation/{tests,daily/tests,v2/tests}` ⇒ **1359 passed / 7 skipped / 0 failed**
+  （基线 1337 ＋ 本轮新增 22 ＝ 14 + 8）。（中途有一次 `1 error`：新测试误把 `fail_closed` 写成 fixture 名
+  ⇒ 已修（改成普通参数）⇒ 复跑转绿。）
+- 🔴 **全仓镜像守卫实测由 RED 转 GREEN**（上一轮遗留 3 条 + 本轮 2 条漂移全部归位）。
+- `python3 manu/tools/check_memory_tables.py` ⇒ **缺陷 0 个**；
+  `python3 manu/tools/sync_slim_memory.py --check` ⇒ **rc=0**（四层新鲜度闸门通过）。
+- 中文 **U+FFFD 替换符** 零容忍：`rules.md` / `memory.md` / `.slim_memory.md` / `memory_compact.md` / 本轮新文件 **均为 0**。

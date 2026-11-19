@@ -57,6 +57,34 @@ import signal_policy as SP  # noqa: E402
 #: 个股线已训好的模型（控制组基准复用，不重训）
 DEFAULT_MODEL_DIR = Path("/mnt/data/siping/runs/ashare_topk/runs/0fdde80304d94becbf3b0a061c3f61c9")
 
+#: 🔴 2026-11-19：**S 层生产权重**（每日流水线真正该加载的那个）。
+#:   `DEFAULT_MODEL_DIR` 是 2026-11-04 训的**验证模型**（fit 2016-01-01~2021-12-31、
+#:   valid 2022~2023）⇒ 训练段只覆盖到 2021 年底，**不是**「用 2016~2026 全量行情
+#:   重训」的生产模型 ⇒ 实盘用它打分 = 用验证模型出实盘信号。
+#:   本目录由 ``--mode prod`` 产出（训练段 = 2016-01-01 ~ 数据末端 − 25 个交易日）。
+#:
+#: 🔴 **落点纪律**（``rules.md §十六``）：``/mnt/data/siping/runs/`` 是**共享目录**
+#:   ⇒ 本项目的产物**只许落 <RESULTS_ROOT>**（= ``C.ETF_RUN_ROOT`` =
+#:   ``/mnt/data/siping/runs/etf_rotation_results/``）。
+#:   🔴 **绝不许**在 ``siping/runs/ashare_topk/``（**别人的**项目根）下建目录 ——
+#:   那里的输出只许放它自己的 ``ashare_topk/runs/<run_id>/``；本项目**只读**那个模型。
+PRODUCTION_MODEL_DIR = C.ETF_RUN_ROOT / "prod_s_layer_20261119"
+
+#: 生产训练段的**隔离带**（交易日）：训练末日 = 数据末端 − 25 个交易日。
+#: 🔴 与 V2 研究链 ``v2/splits.effective_embargo_days() = max(20, LABEL_HORIZON_DAYS=25)``
+#:   **同口径**（单一事实源见 ``v2/splits.py``）⇒ 生产与研究两条链的隔离带一致。
+#:   理由：训练样本的标签窗口必须**完整落在数据内**（不得用到标签未成熟的末端样本）。
+PRODUCTION_EMBARGO_DAYS = 25
+
+#: 生产模型自带的切分说明（infer 端据此复现**同一套**归一化统计量）。
+PRODUCTION_MANIFEST_NAME = "production_manifest.json"
+
+#: 🔴 **分数指纹旁挂文件**（与 ``stock_scores.csv`` 同目录）：
+#:    记录「这份分数是用**哪个模型 + 哪套归一化统计量**算出来的」
+#:    ⇒ 每日链的「模型一致」守卫靠它判断「底座能不能增量拼接」
+#:    （换了权重还拿旧底座增量 ⇒ 一份分数里混着两套模型 ⇒ 静默劣化）。
+SCORES_FINGERPRINT_NAME = "stock_scores.fingerprint.json"
+
 
 def md5_of(path: Path) -> str:
     h = hashlib.md5()
@@ -68,9 +96,16 @@ def md5_of(path: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="全市场个股打分（ETF 映射层上游 S）")
-    p.add_argument("--mode", choices=["infer", "train"], default="infer",
-                   help="infer=复用个股线已训模型；train=在全市场池上重训（严格版）")
-    p.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR), help="mode=infer 时的模型目录")
+    p.add_argument("--mode", choices=["infer", "train", "prod"], default="infer",
+                   help="infer=加载已训模型；train=全市场重训；"
+                        "prod=生产全量重训（2016~数据末端-25交易日）")
+    p.add_argument("--model-dir", default=str(PRODUCTION_MODEL_DIR),
+                   help="模型目录（infer=加载 model.pkl；prod=产出目录）")
+    p.add_argument("--embargo-days", type=int, default=PRODUCTION_EMBARGO_DAYS,
+                   help="生产训练段末端隔离带（交易日）；与 V2 研究链同口径")
+    p.add_argument("--print-prod-fingerprint", action="store_true",
+                   help="只打印当前生产模型指纹（model_md5 + fit 窗）并退出；"
+                        "每日链的「模型一致」守卫用它判断底座能不能增量拼接")
     p.add_argument("--out-dir", default=str(C.ETF_RUN_ROOT), help="产物目录")
     p.add_argument("--rebalance-every", type=int, default=C.REBALANCE_EVERY_N_DAYS,
                    help=f"每 N 个交易日打分一次（默认 {C.REBALANCE_EVERY_N_DAYS}）")
@@ -87,8 +122,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--validate-pred",
-        default=str(DEFAULT_MODEL_DIR / "pred.pkl"),
-        help="个股线 pred.pkl 路径；用它交叉校验本次打分在 csi300 上是否与训练线一致",
+        default="",
+        help="交叉校验参考 pred 路径；缺省=自动（model_dir/pred_prod.pkl -> model_dir/pred.pkl）",
     )
     return p.parse_args()
 
@@ -144,7 +179,7 @@ def _frozen_norm_class():
     return FrozenZScoreNorm
 
 
-def build_fit_handler():
+def build_fit_handler(fit_start: str | None = None, fit_end: str | None = None):
     """构造**训练期** handler：股票池 / 时间窗 / 处理器与个股线训练时**逐项一致**。
 
     唯一作用：拿到与训练时**逐位相同**的 `ZScoreNorm` 统计量（`mean_train/std_train`），
@@ -154,11 +189,13 @@ def build_fit_handler():
     """
     from qlib.contrib.data.handler import Alpha158
 
+    fs = fit_start or C.STOCK.FIT_START
+    fe = fit_end or C.STOCK.FIT_END
     return Alpha158(
         start_time=C.STOCK.START_TIME,
-        end_time=C.STOCK.FIT_END,
-        fit_start_time=C.STOCK.FIT_START,
-        fit_end_time=C.STOCK.FIT_END,
+        end_time=fe,
+        fit_start_time=fs,
+        fit_end_time=fe,
         instruments=C.STOCK.INSTRUMENTS,
         label=(C.STOCK.LABEL_EXPRESSIONS, C.STOCK.LABEL_NAMES),
         infer_processors=C.STOCK.INFER_PROCESSORS,
@@ -188,7 +225,8 @@ def extract_frozen_norm(fit_handler):
     return frozen
 
 
-def build_score_handler(universe: str, frozen, end_time: str | None = None):
+def build_score_handler(universe: str, frozen, end_time: str | None = None,
+                        fit_start: str | None = None, fit_end: str | None = None):
     """构造**打分期** handler：全市场股票池 + **冻结的训练期**归一化统计量。
 
     与个股线 handler 的差异**只有股票池**（csi300 → ``universe``）；
@@ -209,8 +247,8 @@ def build_score_handler(universe: str, frozen, end_time: str | None = None):
     return Alpha158(
         start_time=C.SCORE_START_TIME,
         end_time=end_time or C.SCORE_END_TIME,
-        fit_start_time=C.STOCK.FIT_START,
-        fit_end_time=C.STOCK.FIT_END,
+        fit_start_time=fit_start or C.STOCK.FIT_START,
+        fit_end_time=fit_end or C.STOCK.FIT_END,
         instruments=universe,
         label=(C.STOCK.LABEL_EXPRESSIONS, C.STOCK.LABEL_NAMES),
         infer_processors=infer_processors,
@@ -232,6 +270,112 @@ def build_train_handler(universe: str):
         infer_processors=C.STOCK.INFER_PROCESSORS,
         learn_processors=C.STOCK.LEARN_PROCESSORS,
     )
+
+
+def production_split(dataset_max: str, embargo_days: int = PRODUCTION_EMBARGO_DAYS,
+                     calendar_dates: list[str] | None = None) -> dict:
+    """生产切分：训练段 = 2016-01-01 ~ (数据末端 - embargo_days 个交易日)。
+
+    隔离带理由（与 V2 研究链同口径，见 v2/splits.effective_embargo_days()）：
+    训练样本的标签窗口必须完整落在数据内 => 数据末端那 embargo_days 个交易日的
+    样本一律不许进训练（标签未成熟）。fit 窗 = 训练段本身 =>
+    归一化统计量只取训练段，不引入末端样本的分布信息。
+    """
+    if calendar_dates is None:
+        from qlib.data import D
+
+        cal = D.calendar(start_time="2000-01-01", end_time=dataset_max, freq="day")
+        days = [pd.Timestamp(d).date().isoformat() for d in pd.DatetimeIndex(cal)]
+    else:
+        days = [str(d) for d in calendar_dates]
+        days = [d for d in days if d <= dataset_max]
+    if len(days) <= embargo_days:
+        raise RuntimeError(
+            f"交易日历只有 {len(days)} 天（末日 {dataset_max}），"
+            f"扣 {embargo_days} 天隔离带后不足以训练 => 拒绝产出生产模型"
+        )
+    train_end = days[-1 - embargo_days]
+    return {
+        "train_start": C.STOCK.FIT_START,
+        "train_end": train_end,
+        "train_end_raw": dataset_max,
+        "embargo_days": int(embargo_days),
+        "fit_start": C.STOCK.FIT_START,
+        "fit_end": train_end,
+        "valid_start": train_end,
+        "valid_end": train_end,
+        "test_start": C.STOCK.TEST[0],
+        "test_end": dataset_max,
+    }
+
+
+def build_prod_train_handler(fit_start: str, fit_end: str, data_end: str,
+                             universe: str | None = None):
+    """生产训练 handler：训练池沿用个股线口径（csi300），窗口换全量。
+
+    与个股线 handler 的差异只有时间窗（训练段末端 -> 数据末端 - 25 交易日）
+    => 特征、标签、超参、早停关闭、股票池逐项不变。
+    """
+    from qlib.contrib.data.handler import Alpha158
+
+    return Alpha158(
+        start_time=C.STOCK.START_TIME,
+        end_time=data_end,
+        fit_start_time=fit_start,
+        fit_end_time=fit_end,
+        instruments=universe or C.STOCK.INSTRUMENTS,
+        label=(C.STOCK.LABEL_EXPRESSIONS, C.STOCK.LABEL_NAMES),
+        infer_processors=C.STOCK.INFER_PROCESSORS,
+        learn_processors=C.STOCK.LEARN_PROCESSORS,
+    )
+
+
+def resolve_fit_segment(model_dir: Path) -> tuple[str, str, dict]:
+    """infer 端的归一化 fit 窗必须与模型自己的训练段同源。
+
+    优先读生产模型自带的 production_manifest.json。
+
+    🔴 **生产目录缺 manifest ⇒ 抛错（fail-closed）**，绝不回落旧 fit 窗：
+       回落 = 拿 2021 年底的归一化统计量去配 2026 全量模型 ⇒ **静默劣化**
+       （不报错、不崩，只是分数尺度对不上 ⇒ 实盘信号是坏的）。
+    只有**非生产目录**（旧模型目录，压根没有生产 manifest）才允许回落个股线
+    FIT_START~FIT_END（旧模型兼容路径，行为与改动前逐位一致）。
+    """
+    mpath = Path(model_dir) / PRODUCTION_MANIFEST_NAME
+    if mpath.is_file():
+        info = json.loads(mpath.read_text(encoding="utf-8"))
+        seg = info.get("fit_segment") or {}
+        fs, fe = seg.get("fit_start"), seg.get("fit_end")
+        if fs and fe:
+            return str(fs), str(fe), info
+    if Path(model_dir).resolve() == Path(PRODUCTION_MODEL_DIR).resolve():
+        raise RuntimeError(
+            f"🔴 生产模型目录缺 {PRODUCTION_MANIFEST_NAME}：{mpath}"
+            " ⇒ 拒绝回落到旧 fit 窗（回落 = 拿旧归一化统计量配新模型 ⇒ 静默劣化）"
+        )
+    return C.STOCK.FIT_START, C.STOCK.FIT_END, {}
+
+
+def production_fingerprint() -> dict:
+    """**当前生产模型的指纹**（model_md5 + fit 窗）—— 每日链「模型一致」守卫的事实源。
+
+    🔴 单一事实源 = ``PRODUCTION_MODEL_DIR`` 下的 ``production_manifest.json``
+       （不许在每日链里另写一份模型路径常量 ⇒ 两处漂移 = 守卫失信）。
+    """
+    mpath = Path(PRODUCTION_MODEL_DIR) / PRODUCTION_MANIFEST_NAME
+    if not mpath.is_file():
+        raise FileNotFoundError(f"生产模型 manifest 缺失：{mpath}")
+    info = json.loads(mpath.read_text(encoding="utf-8"))
+    seg = info.get("fit_segment") or {}
+    model_path = Path(PRODUCTION_MODEL_DIR) / "model.pkl"
+    return {
+        "model_md5": info.get("model_md5") or (
+            md5_of(model_path) if model_path.is_file() else None),
+        "model_dir": str(PRODUCTION_MODEL_DIR),
+        "fit_start": seg.get("fit_start"),
+        "fit_end": seg.get("fit_end"),
+        "embargo_days": (info.get("train_segment") or {}).get("embargo_days"),
+    }
 
 
 def trading_calendar(start: str, end: str) -> pd.DatetimeIndex:
@@ -266,16 +410,20 @@ def load_or_train_model(mode: str, model_dir: Path, dataset, dataset_segments: d
             raise FileNotFoundError(f"找不到 {model_path}；请用 --mode train 或指定 --model-dir")
         with model_path.open("rb") as f:
             model = pickle.load(f)
+        fit_start, fit_end, prod_info = resolve_fit_segment(model_dir)
         meta = {
-            "source": "reuse_stock_line_model",
+            "source": "production_model" if prod_info else "reuse_stock_line_model",
             "model_path": str(model_path),
             "model_md5": md5_of(model_path),
             "trained_on_universe": f"{C.STOCK.INSTRUMENTS}（个股线）",
             "scored_on_universe": None,
             "norm_stats_source": (
                 f"训练期 handler（instruments={C.STOCK.INSTRUMENTS}, "
-                f"fit {C.STOCK.FIT_START}~{C.STOCK.FIT_END}）拟合后冻结复用"
+                f"fit {fit_start}~{fit_end}）拟合后冻结复用"
             ),
+            "fit_start": fit_start,
+            "fit_end": fit_end,
+            "production": prod_info or None,
         }
         return model, meta
 
@@ -299,13 +447,74 @@ def load_or_train_model(mode: str, model_dir: Path, dataset, dataset_segments: d
     )
     model.fit(dataset, num_boost_round=C.STOCK.NUM_BOOST_ROUND)
     meta = {
-        "source": "retrain_full_universe",
+        "source": ("production_retrain_full_history" if mode == "prod"
+                   else "retrain_full_universe"),
         "universe": dataset_segments["universe"],
         "num_boost_round": C.STOCK.NUM_BOOST_ROUND,
         "early_stopping_rounds": C.STOCK.EARLY_STOPPING_ROUNDS,
         "lgb_params": dict(C.STOCK.LGB_PARAMS),
     }
     return model, meta
+
+
+def write_production_artifacts(model, dataset, prod_split: dict, dataset_max: str,
+                                model_dir: Path) -> dict:
+    """产出生产模型三件套：model.pkl + production_manifest.json + pred_prod.pkl。
+
+    pred_prod.pkl 是**同源校验件**：用生产模型在**训练池 csi300** 上打 test 段；
+    infer 端（全市场池）打同一批日期后，两者在 csi300 成分上的分数应**逐位一致**
+    => 这是「归一化统计量转移是否做对」的最强验证。
+    """
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "model.pkl"
+    with model_path.open("wb") as f:
+        pickle.dump(model, f)
+    print(f"[OK] 已写出生产模型 {model_path}")
+
+    pred = model.predict(dataset, segment="test")
+    pred_path = model_dir / "pred_prod.pkl"
+    pd.Series(pred).to_pickle(pred_path)
+    print(f"[OK] 已写出同源校验 pred {pred_path}（{len(pred)} 行）")
+
+    info = {
+        "created_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+        "model_md5": md5_of(model_path),
+        "fit_segment": {"fit_start": prod_split["fit_start"], "fit_end": prod_split["fit_end"]},
+        "train_segment": {
+            "train_start": prod_split["train_start"],
+            "train_end": prod_split["train_end"],
+            "train_end_raw": prod_split["train_end_raw"],
+            "embargo_days": prod_split["embargo_days"],
+            "embargo_rationale": "标签窗口须完整落在数据内；与 V2 研究链同口径",
+        },
+        "instruments": C.STOCK.INSTRUMENTS,
+        "label_expressions": list(C.STOCK.LABEL_EXPRESSIONS),
+        "num_boost_round": C.STOCK.NUM_BOOST_ROUND,
+        "early_stopping_rounds": C.STOCK.EARLY_STOPPING_ROUNDS,
+        "lgb_params": dict(C.STOCK.LGB_PARAMS),
+        "dataset_max_date": dataset_max,
+        "provider_uri": provider_uri(),
+        "pred_prod": str(pred_path),
+        "note": "每日流水线用 --model-dir 指向本目录；infer 端会读本文件复现同一套归一化统计量",
+    }
+    mpath = model_dir / PRODUCTION_MANIFEST_NAME
+    mpath.write_text(json.dumps(info, ensure_ascii=False, indent=2, default=str),
+                     encoding="utf-8")
+    print(f"[OK] 已写出 {mpath}")
+    return info
+
+
+def _resolve_validate_pred(args) -> Path:
+    """交叉校验参考件路径：显式指定 > model_dir/pred_prod.pkl > model_dir/pred.pkl。"""
+    if args.validate_pred:
+        return Path(args.validate_pred)
+    md = Path(args.model_dir)
+    for name in ("pred_prod.pkl", "pred.pkl"):
+        cand = md / name
+        if cand.is_file():
+            return cand
+    return md / "pred_prod.pkl"
 
 
 def fetch_fwd_returns(dates: list[pd.Timestamp], universe: str) -> pd.DataFrame:
@@ -554,6 +763,11 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 🔴 只问指纹就退出（**不碰 qlib、不打分**）⇒ 每日链守卫的轻量探针
+    if args.print_prod_fingerprint:
+        print(json.dumps(production_fingerprint(), ensure_ascii=False, default=str))
+        return 0
+
     # 🔴 provider_uri 覆盖（默认仍是上游基座 ⇒ **默认路径零回归**）
     if args.provider_uri:
         _PROVIDER_URI_OVERRIDE = str(Path(args.provider_uri).expanduser().resolve())
@@ -596,37 +810,64 @@ def main() -> int:
     handler_end = data_max
 
     # ---- handler（与个股线同构，只改股票池；归一化统计量**冻结**自训练期）----
-    if args.mode == "train":
+    prod_split = None
+    if args.mode == "prod":
+        prod_split = production_split(dataset_max, args.embargo_days)
+        print(f"[INFO] mode=prod：生产训练切分 —— 训练段 {prod_split['train_start']} ~ "
+              f"{prod_split['train_end']}（名义末日 {prod_split['train_end_raw']}，"
+              f"embargo={prod_split['embargo_days']} 交易日）")
+        handler = build_prod_train_handler(
+            prod_split["fit_start"], prod_split["fit_end"], dataset_max,
+            universe=C.STOCK.INSTRUMENTS,
+        )
+        print(f"[INFO] 生产训练 handler 构建中（universe={C.STOCK.INSTRUMENTS}）...")
+    elif args.mode == "train":
         handler = build_train_handler(args.universe)
         print(f"[INFO] mode=train：全市场自洽重训 handler（universe={args.universe}）")
     else:
-        print("[INFO] 构建训练期 handler（复现个股线归一化统计量）...")
-        fit_handler = build_fit_handler()
+        fit_start, fit_end, _prod_info = resolve_fit_segment(Path(args.model_dir))
+        print(f"[INFO] 构建训练期 handler（复现训练期归一化统计量，fit 窗 "
+              f"{fit_start}~{fit_end}）...")
+        fit_handler = build_fit_handler(fit_start, fit_end)
         probe = [p for p in fit_handler.get_all_processors() if hasattr(p, "mean_train")]
         if not probe or getattr(probe[0], "mean_train", None) is None:
             fit_handler.fit()
         frozen = extract_frozen_norm(fit_handler)
         print(f"[INFO] 训练期 ZScoreNorm 统计量已冻结（{len(frozen.cols)} 个特征列，"
               f"fit 窗 {frozen.fit_start_time}~{frozen.fit_end_time}）")
-        handler = build_score_handler(args.universe, frozen, end_time=handler_end)
+        handler = build_score_handler(args.universe, frozen, end_time=handler_end,
+                                      fit_start=fit_start, fit_end=fit_end)
         print(f"[INFO] 打分期 handler 构建完成（universe={args.universe}，"
               f"数据窗末日={handler_end}）")
 
     from qlib.data.dataset import DatasetH
 
-    dataset = DatasetH(
-        handler=handler,
-        segments={
+    if prod_split:
+        segments = {
+            "train": (prod_split["train_start"], prod_split["train_end"]),
+            "valid": (prod_split["valid_start"], prod_split["valid_end"]),
+            "test": (prod_split["test_start"], prod_split["test_end"]),
+        }
+    else:
+        segments = {
             "train": C.STOCK.TRAIN,
             "valid": C.STOCK.VALID,
             "test": C.STOCK.TEST,
-        },
-    )
+        }
+
+    dataset = DatasetH(handler=handler, segments=segments)
 
     model, meta = load_or_train_model(
         args.mode, Path(args.model_dir), dataset, {"universe": args.universe}
     )
     print(f"[INFO] 模型来源: {meta['source']}")
+
+    # ---- mode=prod：只产出生产模型三件套，不跑打分循环 ----
+    if args.mode == "prod":
+        info = write_production_artifacts(
+            model, dataset, prod_split, dataset_max, Path(args.model_dir))
+        print("[OK] 生产模型产出完成（未打分、未改任何既有产物）")
+        return 0
 
     # ---- 逐调仓日打分 ----
     frames: list[pd.DataFrame] = []
@@ -656,7 +897,29 @@ def main() -> int:
     scores.to_csv(scores_csv, index=False, encoding="utf-8-sig")
     print(f"[OK] 已写出 {scores_csv}  ({len(scores)} 行)")
 
-    validation = validate_against_stock_line(scores, Path(args.validate_pred))
+    # ---- 指纹旁挂文件（每日链「模型一致」守卫的事实源）------------------------
+    # 🔴 为什么必须落：换了 S 层权重 ⇒ 归一化统计量变了 ⇒ **全部分数都变了**
+    #    ⇒ 每日链若还拿**旧权重的底座**做增量拼接 ⇒ 一份分数里混着两套模型
+    #    ⇒ 症状是「看起来正常的坏结果」⇒ 必须靠指纹当场拦住。
+    fingerprint = {
+        "model_md5": meta.get("model_md5"),
+        "model_dir": str(Path(args.model_dir)),
+        "model_source": meta.get("source"),
+        "fit_start": meta.get("fit_start"),
+        "fit_end": meta.get("fit_end"),
+        "provider_uri": provider_uri(),
+        "mode": args.mode,
+        "n_score_dates": len(dates),
+        "score_date_range": [str(dates[0].date()), str(dates[-1].date())],
+        "written_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+    }
+    fp_path = out_dir / SCORES_FINGERPRINT_NAME
+    fp_path.write_text(
+        json.dumps(fingerprint, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8")
+    print(f"[OK] 已写出 {fp_path}")
+
+    validation = validate_against_stock_line(scores, _resolve_validate_pred(args))
     if validation.get("available"):
         print(
             f"[CHECK] 与个股线 pred.pkl 交叉校验：n={validation['n_overlap']} "
@@ -687,7 +950,8 @@ def main() -> int:
             "manu/experiments/ashare_topk_selection/config.py（复用，未在本文件重复定义）"
         ),
         "label_expression": C.STOCK.LABEL_EXPRESSIONS,
-        "fit_window": [C.STOCK.FIT_START, C.STOCK.FIT_END],
+        "fit_window": [meta.get("fit_start", C.STOCK.FIT_START),
+                       meta.get("fit_end", C.STOCK.FIT_END)],
         "provider_uri": provider_uri(),
         "region": C.REGION,
         "ic": ic,

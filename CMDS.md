@@ -152,7 +152,22 @@ $AK manu/etf_rotation/data/fetch_etf_universe.py --stage finalize
 $AK manu/etf_rotation/data/fetch_etf_holdings.py --resume
 
 # 2) 全市场个股打分 S（上游；~35 min，产物 stock_scores.csv）
+#    ⚠️ 2026-11-19 起 `--model-dir` 默认 = **S 层生产权重**
+#       /mnt/data/siping/runs/etf_rotation_results/prod_s_layer_20261119
+#       （2016-01-01 ~ 2026-10-14 全量重训，末端留 25 交易日隔离带）
+#       ⇒ 不再默认加载 2026-11-04 那个 fit 只到 2021-12-31 的**验证模型**。
 $PY manu/etf_rotation/qlib_scores.py --mode infer --out-dir /mnt/data/siping/runs/etf_rotation_results
+
+# 2b) 🔴 S 层**生产权重**重训（重活；产出 model.pkl + production_manifest.json + pred_prod.pkl）
+#     训练段 = 2016-01-01 ~ (数据集末日 − 25 交易日)；换数据集后须重跑。
+$PY manu/etf_rotation/qlib_scores.py --mode prod \
+    --model-dir /mnt/data/siping/runs/etf_rotation_results/prod_s_layer_20261119 \
+    --provider-uri /mnt/data/siping/datasets/manu/etf_rotation/datasets/qlib/cn_data_live
+
+# 2c) 打印当前**生产模型指纹**（model_md5 + fit 窗）—— 每日链「模型一致」守卫的事实源
+$PY manu/etf_rotation/qlib_scores.py --print-prod-fingerprint
+#     ⇒ 打分产物旁挂 `stock_scores.fingerprint.json`（同一份指纹）
+#     ⇒ 每日链拿它判断「底座能不能增量拼接」（换过权重 ⇒ 必须整段重算）。
 
 # 3) 当期调仓建议（中文清单 + 金额）
 $PY manu/etf_rotation/recommend.py --asof 2026-11-03 \

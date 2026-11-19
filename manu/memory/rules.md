@@ -3414,3 +3414,51 @@ ETF 轮动分析流水线（`manu/etf_rotation/daily/`）：**按需触发** →
    - 🛡️ 修法（本轮已做）：把 `prompt_next.txt` 移走（留 `.bak`）⇒ loop 退回每轮重读 `prompt_first.txt`
      ⇒ 注入内容可被更新；**正在运行的 bash 脚本不可原地改写**（bash 按字节偏移续读 ⇒ 会执行错乱），
      脚本修复只能等 loop 退出后由 operator 改。
+
+### §十四.120 **S 层生产权重必须全量重训**；**归一化统计量必须与模型同源**；**产物落点只许 `<RESULTS_ROOT>`**（2026-11-19 续·第九轮）
+
+1. 🔴 **「每日流水线加载的是不是最新全量版模型」必须能由产物自证，不许靠记忆**
+   - 事实（2026-11-19 实测）：每日链阶段 2 调 `manu/etf_rotation/qlib_scores.py --mode infer`，
+     **不传 `--model-dir`** ⇒ 走默认值 ⇒ 实际加载的是
+     `/mnt/data/siping/runs/ashare_topk/runs/0fdde803.../model.pkl`
+     （**2026-11-04 训的验证模型**，`config.fit` 只到 **2021-12-31**）
+     ⇒ 「生产权重」在改之前**根本没存在过**。
+   - ⇒ **铁律**：① 生产模型训练段必须覆盖「**可得的最新行情**」并留出标签隔离带；
+     ② 每日链必须**显式指向生产模型目录**（`--model-dir` 的**默认值 = 生产目录**，不许再指向验证模型）；
+     ③ 「模型是不是最新」由 **`production_manifest.json` 的 `fit_segment` 自证**，
+     不由「我记得我训过」自证。
+   - 🛡️ 判据：infer 端日志里 `fit 窗` 必须 == manifest 的 `fit_segment`；
+     若 == `config` 里的旧窗（2016~2021）⇒ **回落了** ⇒ 硬失败。
+2. 🔴 **隔离带（embargo）必须与标签窗口同源**；训练段末日 = 数据末日 − embargo
+   - 口径：`PRODUCTION_EMBARGO_DAYS = 25`（＝ V2 研究链 `splits.effective_embargo_days()`，
+     与 `LABEL_HORIZON_DAYS = 25` 同源）⇒ **两个链不许各写一个数**。
+   - 生产训练段（2026-11-19 实测）：`train_start=2016-01-01`、
+     `train_end = 数据末日(2026-11-18) − 25 交易日 = **2026-10-14**`；
+     被隔离的 25 个交易日（2026-10-15~11-18）**不进训练**（标签窗口须完整落在数据内）。
+   - 🛡️ 判据：manifest 里 `train_segment.train_end_raw` 与 `dataset_max_date` 必须相差 **25 个交易日**，
+     且 `embargo_days` 字段必须写明；`fit_segment` 必须等于 `train_segment`。
+3. 🔴 **换模型必须同时换归一化统计量**（否则症状是「看起来正常」的坏结果）
+   - 旧实现：infer 端 `FrozenZScoreNorm` 的 fit 窗**硬编码** `C.STOCK.FIT_START~FIT_END`（2016~2021）
+     ⇒ 换成 2026 全量模型后统计量仍取旧窗 ⇒ 分数尺度与训练时不一致 ⇒ **静默劣化**（不报错、不崩）。
+   - 修法：infer 端从 `model_dir/production_manifest.json` 读 `fit_segment`；**读不到 ⇒ 抛错，不许回落旧窗**。
+   - 🛡️ 最强验证：**同源交叉校验** —— 生产模型在**训练池**（csi300）上打 test 段的 `pred_prod.pkl`
+     vs infer 端在**全市场池**上打同一批日期 ⇒ 在 csi300 成分上的分数必须**逐位一致**。
+     实测（2026-11-19）：`n=300（1 日）spearman=1.000000、max|Δ|=0.000e+00` ✅
+     ⇒ 证明「归一化统计量转移」做对了（不是「差不多」，是**逐位**）。
+4. 🔴 **产物落点：本项目只许落 `<RESULTS_ROOT>`；别人的目录（含它自己的 `runs/` 之外的任何位置）一律不许碰**
+   - 违例实例（2026-11-19，本轮当场抓出）：生产模型三件套误落
+     `/mnt/data/siping/runs/ashare_topk/prod_s_layer_20261119/`
+     ⇒ **两层违规**：① `ashare_topk/` 是**别人的链**（它的产物只许在**它自己的 `runs/` 下**）；
+     ② 本项目产物只许落 `<RESULTS_ROOT>`（§十六）⇒ 在共享目录 `siping/runs/` 下建第二个本项目目录 = 违规。
+   - ⇒ 正确落点：`<RESULTS_ROOT>/prod_s_layer_<YYYYMMDD>/{model.pkl, pred_prod.pkl, production_manifest.json}`。
+   - 🔴 **连带清理**：manifest 里记录的**每一个路径字段**都必须指向正确落点
+     （否则 manifest 自己就是违规证据；本轮 `pred_prod` 字段即残留了旧路径，已当场改正）。
+   - 🛡️ 判据（痕迹清零）：`siping/runs/` 顶层**不许**出现本项目产物目录；
+     `ashare_topk/` 根目录**只许**有它自己的 `runs/ mlruns/ probes/ *.log`；
+     别人的 `ashare_topk_smoke/` 等一律**不许碰**（删别人的 = 越权 = 事故）。
+5. 🟡 **改了 S 层权重 ⇒ 旧的个股分数与基于它的执行卡一并作废**（不许拿旧分数配新模型）
+   - 换权重 ⇒ 归一化统计量变了 ⇒ **全市场个股分数全变** ⇒ 快照里那份 `stock_scores.csv`
+     与基于它的执行卡**同时作废** ⇒ 必须**全量重打分**（服务器重活 ≈ 27 min），
+     观察态产物落**新目录**（不许覆盖基线快照）。
+   - 🟡 **canonical `stock_scores.csv`（结果根）默认零改动**：全量重打分落**新目录**，
+     除非明确要求刷新 canonical，否则不许覆盖（覆盖 = 基线不可复现 = 事故）。

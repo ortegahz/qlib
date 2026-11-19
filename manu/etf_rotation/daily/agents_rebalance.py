@@ -520,6 +520,66 @@ def _scores_max_date(scores_path: Path) -> str | None:
     return pd.Timestamp(dates.max()).date().isoformat()
 
 
+#: 🔴 **分数指纹旁挂文件**名（与 ``qlib_scores.py`` 写出的同名）。
+#:   单一事实源在 ``qlib_scores.py::SCORES_FINGERPRINT_NAME``（两边必须同名，
+#:   否则守卫会因为「读不到指纹」而永远判定为「不可增量」⇒ 白跑全量）。
+SCORES_FINGERPRINT_NAME = "stock_scores.fingerprint.json"
+
+
+def _scores_fingerprint(scores_path: Path) -> dict | None:
+    """读个股分数的**模型指纹**（旁挂文件）⇒ 读不到返回 ``None``。"""
+    fp = Path(scores_path).parent / SCORES_FINGERPRINT_NAME
+    if not fp.is_file():
+        return None
+    try:
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 指纹坏掉 = 读不到 = 不可增量
+        return None
+
+
+def _current_model_fingerprint() -> dict | None:
+    """问 S 层脚本要「**当前**生产模型的指纹」（单一事实源 = 它的默认模型目录）。
+
+    🔴 不许在本文件另写一份生产模型路径常量（两处漂移 = 守卫失信）：
+    ⇒ 直接问 ``qlib_scores.py --print-prod-fingerprint``。
+    """
+    try:
+        out = _run_cmd(
+            [
+                DC.QL_PY,
+                str(_RESEARCH_ROOT / "qlib_scores.py"),
+                "--print-prod-fingerprint",
+            ],
+            step=STEP_SCORES,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 问不到 ⇒ 判定为「不可增量」
+        print(f"[WARN] 读不到当前生产模型指纹：{type(exc).__name__}: {exc}")
+        return None
+    for line in reversed((out or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
+def _fingerprint_matches(base_fp: dict | None, cur_fp: dict | None) -> bool:
+    """底座指纹与当前模型指纹**是不是同一套**。
+
+    🔴 读不到任一侧 ⇒ **判为不匹配**（fail-closed）：宁可多跑一次全量，
+    也不许把两套模型的分数拼进一份文件。
+    """
+    if not base_fp or not cur_fp:
+        return False
+    return (
+        base_fp.get("model_md5") == cur_fp.get("model_md5")
+        and base_fp.get("fit_start") == cur_fp.get("fit_start")
+        and base_fp.get("fit_end") == cur_fp.get("fit_end")
+    )
+
+
 def _read_calendar(policy: Any, cal_path: Path) -> tuple[list[Any], str | None] | None:
     """读 qlib 交易日历；读不到 / 解析不出 ⇒ 返回 ``None``（由调用方换下一个候选）。"""
     try:
@@ -696,6 +756,12 @@ def _refresh_scores(*, scores_path: Path, notes: list[str],
 
     🔴 **canonical 永不被写**：本函数只**读** canonical（算 md5 前后对照做证据），
        只写 ``scores_path``（本轮快照内）。
+
+    🔴 **模型一致守卫（2026-11-19 新增）**：底座分数是**哪套权重**算出来的？
+       换了 S 层权重 ⇒ 归一化统计量变了 ⇒ **全部分数都变了**
+       ⇒ 拿旧权重的底座增量拼接 = **一份分数里混两套模型** ⇒ 静默劣化。
+       ⇒ 指纹（``stock_scores.fingerprint.json``）对不上 ⇒ **整段重算**，
+       且**旧底座不并入**（直接丢弃）；指纹读不到 ⇒ 一律判「不可增量」（fail-closed）。
     """
     import hashlib
 
@@ -707,12 +773,28 @@ def _refresh_scores(*, scores_path: Path, notes: list[str],
         hashlib.md5(canonical.read_bytes()).hexdigest() if canonical.is_file() else None
     )
 
+    # 🔴 **模型一致守卫**（2026-11-19 新增）：底座分数是**哪套权重**算出来的？
+    #   换了 S 层权重 ⇒ 归一化统计量变了 ⇒ **全部分数都变了**
+    #   ⇒ 拿旧权重的底座做增量拼接 = 一份分数里混着两套模型 ⇒ 静默劣化。
+    #   ⇒ 指纹对不上 ⇒ **整段作废、必须全量重算**（不许增量拼接）。
+    base_fp = _scores_fingerprint(scores_path) if scores_path.exists() else None
+    cur_fp = _current_model_fingerprint()
+    same_model = _fingerprint_matches(base_fp, cur_fp)
     start = _scores_max_date(scores_path) if scores_path.exists() else None
+    if not same_model:
+        start = None
+        notes.append(
+            "🔴 **S 层权重已换 ⇒ 底座分数整段作废、必须全量重算**"
+            f"（底座指纹 = {json.dumps(base_fp, ensure_ascii=False) if base_fp else '**缺失**'}；"
+            f"当前模型指纹 = {json.dumps(cur_fp, ensure_ascii=False) if cur_fp else '**读不到**'}）"
+            " ⇒ **不许**把两套模型的分数拼进一份文件"
+        )
     print("[WARN] 🔴 即将重跑 S 层：这一步约 27 分钟，属**重活**（铁律一：需用户当轮授权）。")
     notes.append(
         "🔴 **已重跑 S 层**（阶段 2，约 27 分钟的重活）：跑在临时目录 → "
-        "以**快照内底座**增量重算 → 合并落**本快照**"
-        "（🔴 **canonical `stock_scores.csv` 零改动**）"
+        + ("以**同源底座**增量重算 → 合并落**本快照**" if same_model
+           else "**全量重算**（底座整段作废）→ 落**本快照**")
+        + "（🔴 **canonical `stock_scores.csv` 零改动**）"
         + (f"；打分截止日 = {end_date}" if end_date else "")
         + (f"；底座最新打分日 = {start}" if start else "；**无底座 ⇒ 全量重算**")
     )
@@ -746,14 +828,23 @@ def _refresh_scores(*, scores_path: Path, notes: list[str],
         notes.append(f"ℹ️ 快照内底座分数已备份到 {backup}")
     old = (
         pd.read_csv(scores_path, dtype={"instrument": str})
-        if scores_path.exists() else None
+        if scores_path.exists() and same_model else None
     )
+    if scores_path.exists() and not same_model:
+        notes.append(
+            "🔴 底座分数**不并入**本次结果（它是**另一套权重**算出来的 ⇒ 整段丢弃）"
+        )
     new = pd.read_csv(produced, dtype={"instrument": str})
     merged = pd.concat([old, new], ignore_index=True) if old is not None else new
     merged["date"] = pd.to_datetime(merged["date"])
     merged = merged.drop_duplicates(subset=["date", "instrument"], keep="last")
     merged = merged.sort_values(["date", "instrument"]).reset_index(drop=True)
     merged.to_csv(scores_path, index=False)
+    # 🔴 **指纹旁挂文件**跟着走（否则下一轮读不到指纹 ⇒ 守卫会永远判「不可增量」）
+    produced_fp = tmp_dir / SCORES_FINGERPRINT_NAME
+    if produced_fp.is_file():
+        shutil.copy2(produced_fp, scores_path.parent / SCORES_FINGERPRINT_NAME)
+        notes.append(f"ℹ️ 分数指纹已写入：{scores_path.parent / SCORES_FINGERPRINT_NAME}")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     new_max = _scores_max_date(scores_path)
     after_canonical = (
@@ -1245,6 +1336,19 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
             notes.append(
                 f"✅ S 层底座已**只读拷贝**进本快照：{scores_path}（源文件零改动）"
             )
+            # 🔴 **指纹必须一起拷**（否则守卫读不到底座指纹 ⇒ 判「不可增量」
+            #    ⇒ 每轮都白跑一次全量打分；更糟：万一指纹判成「一致」就是错的口径）
+            base_fp_src = base_path.parent / SCORES_FINGERPRINT_NAME
+            if base_fp_src.is_file():
+                shutil.copy2(base_fp_src, scores_path.parent / SCORES_FINGERPRINT_NAME)
+                notes.append(
+                    f"ℹ️ 底座**模型指纹**已一并拷贝：{scores_path.parent / SCORES_FINGERPRINT_NAME}"
+                )
+            else:
+                notes.append(
+                    "⚠️ 底座**没有模型指纹**旁挂文件（老底座）⇒ 本轮会**整段重算**"
+                    "（指纹对不上 ⇒ 不许把两套模型的分数拼在一起）"
+                )
     refreshed = bool(refresh_scores)
     if refreshed:
         _refresh_scores(scores_path=scores_path, notes=notes, end_date=signal_date)
