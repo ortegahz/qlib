@@ -3353,12 +3353,33 @@ def build_plan(args) -> dict:
     #:    ② 「现金不足 ⇒ 削减买入」那条路径能**自动接手**（少卖 ⇒ 缺口 ⇒ 削减买入）。
     #: 🔴 若放在现金可行性**之后** ⇒ 被拦下的卖出会让回款对不上 ⇒ 位置错了数字就错。
     _gate_enabled = gate_mod.gate_enabled(args)
-    _gate_thresholds = gate_mod.resolve_thresholds(gate_mod.thresholds_from_args(args))
-    min_amount_gate = gate_mod.apply_min_trade_threshold(
+    #: 🔴 2026-11-19 小资金兜底（用户拍板 ·「保留 3 万元账户规模」）：
+    #:    **必须先于门槛跑** —— 它决定本轮「新开仓」档用**哪个门槛**
+    #:    （触发 ⇒ 放宽到 1,500 元；不触发 ⇒ 仍是 3,800 元）。
+    #:    ⚠️ 仍在**现金可行性之前** ⇒ 门槛层与现金流层的口径顺序不变。
+    small_account_fallback = gate_mod.apply_small_account_fallback(
         plans,
         total_assets=total_assets,
         commission_rate=(commission_bp / 1e4),
         thresholds=gate_mod.thresholds_from_args(args),
+        #: 🔴 兜底与门槛是**同一套机制的两半**（门槛关 ⇒ 没有阈值要放宽、也不会有死锁）
+        enabled=(gate_mod.gate_enabled(args)
+                 and gate_mod.small_account_fallback_enabled(args)),
+        #: 🔴 用**本轮生效**权益上限算剩余额度 ⇒ 集中买入后落地权益仍 ≤ 上限
+        equity_cap=float(_effective_cap),
+        #: 🔴 集中额度不得超过**单席上限**（5 只等权 ⇒ 20%）⇒ 免得集中变成新的超配
+        max_single_amount=(total_assets / C.TARGET_N_HOLDINGS) if total_assets else None,
+        price_basis=f"{asof} 收盘价（信号日价）",
+    )
+    _gate_thresholds = gate_mod.resolve_thresholds(gate_mod.thresholds_from_args(args))
+    if small_account_fallback.get("triggered"):
+        _gate_thresholds["新开仓"] = float(
+            small_account_fallback.get("relaxed_new_limit") or _gate_thresholds["新开仓"])
+    min_amount_gate = gate_mod.apply_min_trade_threshold(
+        plans,
+        total_assets=total_assets,
+        commission_rate=(commission_bp / 1e4),
+        thresholds=_gate_thresholds,
         enabled=_gate_enabled,
         price_basis=f"{asof} 收盘价（信号日价）",
         #: 🔴 2026-11-17（真机 P12 红灯修）：把**本轮生效**权益上限传进门槛
@@ -3711,6 +3732,8 @@ def build_plan(args) -> dict:
         "actions": plans,
         # 🔴 2026-11-13 方案一：三档门槛的**披露结构**（阈值 / 被拦明细 / 死锁风险）
         "min_amount_gate": min_amount_gate,
+        # 🔴 2026-11-19 小资金兜底的**披露结构**（触发条件 / 额度 / 集中标的 / 其余候选）
+        "small_account_fallback": small_account_fallback,
         "cash_alternatives": cash_alternatives,
         "tradingagents_view": _decision_view(args.decision),
         "llm_targets": llm_targets,
@@ -3992,6 +4015,61 @@ def render_markdown(plan: dict) -> str:
                 "",
                 "⇒ 上述减仓**照常执行**（多付的最低佣金已计入现金流）"
                 "：**省 5 元手续费不得覆盖「权益上限 / 现金预留」这条风控硬约束**。",
+                "",
+            ]
+
+    # ---- 一之三之二 · 🔴 小资金兜底（2026-11-19） ----
+    _fb = plan.get("small_account_fallback") or {}
+    if _fb:
+        lines += [
+            "",
+            "## 一之三之二、🔴 小资金兜底（额度不足 ⇒ 放宽单笔下限 / 必要时集中买入候选 #1）",
+            "",
+        ]
+        if _fb.get("triggered"):
+            _sel = _fb.get("selected") or {}
+            _others = _fb.get("others") or []
+            lines += [
+                f"> **触发**：剩余权益额度 **{float(_fb.get('allowance_amount') or 0):.2f} 元**"
+                f" ÷ 候选 **{int(_fb.get('candidate_count') or 0)}** 只 = 均分 "
+                f"**{float(_fb.get('per_candidate_amount') or 0):.2f} 元**"
+                f" < 常规「新开仓」门槛 **{float(_fb.get('normal_new_limit') or 0):.0f} 元**"
+                f" ⇒ 本轮「新开仓」单笔下限**放宽至 "
+                f"{float(_fb.get('relaxed_new_limit') or 0):.0f} 元**（只降不升）。",
+                "",
+            ]
+            if not _fb.get("concentrated"):
+                lines += [
+                    "> **不集中额度**：候选 #1 自身金额已 ≥ 放宽下限"
+                    " ⇒ 放宽门槛即可建仓 ⇒ **保持等权结构**（计划权益合计不变）。",
+                    "",
+                ]
+            else:
+                lines += [
+                    f"> **集中买入**：候选 **#1 = {_sel.get('code')} {_sel.get('name')}**"
+                    f"（`final_score` = {_sel.get('final_score')}）"
+                    f" ⇒ 承接额度 **{float(_fb.get('concentrated_amount') or 0):.2f} 元**"
+                    f"（目标权重 {float(_sel.get('target_weight') or 0) * 100:.2f}%）。",
+                    "",
+                ]
+            if _others:
+                lines += [
+                    f"其余候选 **{len(_others)}** 只本轮**不建仓**"
+                    "（额度已集中 ⇒ 落地权益不破生效上限"
+                    f" {float(_fb.get('equity_cap') or 0) * 100:.2f}%）：",
+                    "",
+                    "| 代码 | 名称 | 金额（元） | 折合门槛（元） | 作废原因 |",
+                    "|:--|:--|--:|--:|:--|",
+                ]
+                for _o in _others:
+                    lines.append(
+                        f"| {_o.get('code')} | {_o.get('name')} | "
+                        f"{float(_o.get('amount') or 0):.2f} | "
+                        f"{float(_o.get('threshold') or 0):.0f} | {_o.get('blocked_by')} |")
+                lines += [""]
+        else:
+            lines += [
+                f"> **未触发**：{_fb.get('reason') or '（无说明）'}",
                 "",
             ]
 
@@ -4394,6 +4472,11 @@ def main() -> int:
     ap.add_argument(
         "--min-amount-adjust", type=float, default=None,
         help="存量仓位微调门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_ADJUST",
+    )
+    ap.add_argument(
+        "--no-small-account-fallback",
+        action="store_true",
+        help="关闭小资金兜底（额度不足时不集中买入候选 #1；默认开）",
     )
     ap.add_argument(
         "--min-amount-liquidate", type=float, default=None,

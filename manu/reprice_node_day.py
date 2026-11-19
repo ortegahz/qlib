@@ -294,6 +294,7 @@ def _recompute(
     min_amount_enabled: bool = True,
     min_amount_thresholds: dict | None = None,
     commission_rate: float = 0.0,
+    small_account_fallback_enabled: bool = True,
 ) -> dict:
     """按节点日价重算每个 action 的股数 / 金额 / 费用，并算现金流。
 
@@ -493,11 +494,39 @@ def _recompute(
         _node_cap = float(_scr.get("equity_cap_effective") or _scr.get("equity_cap") or 0.0)
     except (TypeError, ValueError):
         _node_cap = None
-    min_amount_gate = gate_mod.apply_min_trade_threshold(
+    #: 🔴 2026-11-19 小资金兜底（与阶段 5 **同一模块、同一口径**）：
+    #:    **必须先于门槛跑** ⇒ 它决定本轮「新开仓」档用哪个门槛。
+    #:    🔴 **沿用阶段 5 的集中标的**（计划件里的 `small_account_fallback.selected.code`）
+    #:       ⇒ 保证「阶段 5 执行卡」与「阶段 6 执行卡」买的是**同一只**（否则两卡打架）。
+    _plan_fb = (plan or {}).get("small_account_fallback") or {}
+    _preferred = str((_plan_fb.get("selected") or {}).get("code") or "")
+    small_account_fallback = gate_mod.apply_small_account_fallback(
         actions,
         total_assets=total_assets,
         commission_rate=commission_rate,
         thresholds=min_amount_thresholds,
+        #: 🔴 兜底与门槛是**同一套机制的两半**（门槛关 ⇒ 没有阈值要放宽）
+        enabled=(min_amount_enabled and small_account_fallback_enabled),
+        equity_cap=_node_cap,
+        #: 🔴 集中额度不得超过**单席上限**（阶段 6 口径 = `account.TARGET_POSITION_WEIGHT`）
+        max_single_amount=(
+            total_assets * float(A.TARGET_POSITION_WEIGHT) if total_assets else None),
+        price_basis=f"{node_date} 收盘价（节点日价）",
+        preferred_code=_preferred,
+    )
+    _thr6 = gate_mod.resolve_thresholds(min_amount_thresholds)
+    #: 🔴 阶段 5 若已触发兜底 ⇒ 阶段 6 也要用**放宽后**的新开仓门槛
+    #:    （否则阶段 6 会把阶段 5 已定的集中建仓当成碎单拦掉 ⇒ 两阶段打架）
+    if small_account_fallback.get("triggered") or _plan_fb.get("triggered"):
+        _thr6["新开仓"] = min(
+            float(_thr6["新开仓"]),
+            float(small_account_fallback.get("relaxed_new_limit")
+                  or C.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT))
+    min_amount_gate = gate_mod.apply_min_trade_threshold(
+        actions,
+        total_assets=total_assets,
+        commission_rate=commission_rate,
+        thresholds=_thr6,
         enabled=min_amount_enabled,
         price_basis=f"{node_date} 收盘价（节点日价）",
         equity_cap=_node_cap,
@@ -627,6 +656,8 @@ def _recompute(
         "actions": actions,
         # 🔴 方案一：三档门槛的披露结构（与阶段5 同口径）
         "min_amount_gate": min_amount_gate,
+        # 🔴 2026-11-19 小资金兜底的**披露结构**（与阶段5 同口径）
+        "small_account_fallback": small_account_fallback,
         "cash_flow": {
             "cash_begin": round(cash, 6),
             "sell_proceeds": round(proceeds, 6),
@@ -929,6 +960,44 @@ def _render_md(payload: dict) -> str:
         else:
             add("")
             add("本轮**没有被门槛拦下的调仓动作**（所有动作金额均达标）。")
+    # ---- 一之五之二 · 🔴 小资金兜底（2026-11-19） ----
+    _fb = payload.get("small_account_fallback") or {}
+    if _fb:
+        add("")
+        add("## 一之五之二、🔴 小资金兜底（额度不足 ⇒ 放宽单笔下限 / 必要时集中买入候选 #1）")
+        add("")
+        if _fb.get("triggered"):
+            _sel = _fb.get("selected") or {}
+            add(f"> **触发**：剩余权益额度 **{float(_fb.get('allowance_amount') or 0):.2f} 元**"
+                f" ÷ 候选 **{int(_fb.get('candidate_count') or 0)}** 只 = 均分 "
+                f"**{float(_fb.get('per_candidate_amount') or 0):.2f} 元**"
+                f" < 常规「新开仓」门槛 **{float(_fb.get('normal_new_limit') or 0):.0f} 元**"
+                f" ⇒ 本轮「新开仓」单笔下限**放宽至 "
+                f"{float(_fb.get('relaxed_new_limit') or 0):.0f} 元**（只降不升）。")
+            add("")
+            if not _fb.get("concentrated"):
+                add("> **不集中额度**：候选 #1 自身金额已 ≥ 放宽下限"
+                    " ⇒ 放宽门槛即可建仓 ⇒ **保持等权结构**（计划权益合计不变）。")
+            else:
+                add(f"> **集中买入**：候选 **#1 = {_sel.get('code')} {_sel.get('name')}**"
+                    f"（`final_score` = {_sel.get('final_score')}）"
+                    f" ⇒ 承接额度 **{float(_fb.get('concentrated_amount') or 0):.2f} 元**"
+                    f"（目标权重 {float(_sel.get('target_weight') or 0) * 100:.2f}%）。")
+            _others = _fb.get("others") or []
+            if _others:
+                add("")
+                add(f"其余候选 **{len(_others)}** 只本轮**不建仓**"
+                    "（额度已集中 ⇒ 落地权益不破生效上限"
+                    f" {float(_fb.get('equity_cap') or 0) * 100:.2f}%）：")
+                add("")
+                add("| 代码 | 名称 | 金额（元） | 折合门槛（元） | 作废原因 |")
+                add("|:--|:--|--:|--:|:--|")
+                for _o in _others:
+                    add(f"| {_o.get('code')} | {_o.get('name')} | "
+                        f"{float(_o.get('amount') or 0):.2f} | "
+                        f"{float(_o.get('threshold') or 0):.0f} | {_o.get('blocked_by')} |")
+        else:
+            add(f"> **未触发**：{_fb.get('reason') or '（无说明）'}")
         add("")
     add("## 二、与计划件（信号日价）的差异")
     add("")
@@ -1073,6 +1142,8 @@ def main() -> int:
                     help="存量仓位微调门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_ADJUST")
     ap.add_argument("--min-amount-liquidate", type=float, default=None,
                     help="清仓/止损门槛（元）覆盖；缺省 = config.MIN_TRADE_AMOUNT_LIQUIDATE")
+    ap.add_argument("--no-small-account-fallback", action="store_true",
+                    help="关闭小资金兜底（额度不足时不集中买入候选 #1；默认开）")
     args = ap.parse_args()
 
     node_date = _parse_date(args.node_date)
@@ -1205,7 +1276,9 @@ def main() -> int:
                         current_shares, fee_rate, overrides=overrides,
                         min_amount_enabled=gate_mod.gate_enabled(args),
                         min_amount_thresholds=gate_mod.thresholds_from_args(args),
-                        commission_rate=(commission_bp / 10000.0))
+                        commission_rate=(commission_bp / 10000.0),
+                        small_account_fallback_enabled=(
+                            gate_mod.small_account_fallback_enabled(args)))
 
     # ---- 双口径对照（M-S5）：计划件口径 vs 节点日口径，目标股数差多少、阈值在哪 ----
     basis_rows = _basis_comparison(
@@ -1356,6 +1429,7 @@ def main() -> int:
         "landing": result["landing"],
         # 🔴 方案一：三档门槛的披露结构（阶段6 = 节点日价口径）
         "min_amount_gate": result["min_amount_gate"],
+        "small_account_fallback": result.get("small_account_fallback"),
         "actions": result["actions"],
         "diff_vs_plan": diff_vs_plan,
         "basis_comparison": basis_rows,

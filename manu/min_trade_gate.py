@@ -42,6 +42,8 @@
 
 from __future__ import annotations
 
+import math
+
 import config as C
 
 #: 三档口径的**分类键**（披露、测试、日志都用这三个字面量 ⇒ 勿随意改）
@@ -214,6 +216,7 @@ def block_row(
     min_commission: float,
     total_assets: float | None,
     reason_suffix: str = "",
+    reason_override: str = "",
 ) -> dict:
     """把一行**就地作废**（**行保留**）⇒ 返回披露记录。
 
@@ -225,6 +228,10 @@ def block_row(
       ⑤ `target_weight_effective` 按**当前市值**重算、差额记进 `weight_to_cash`
          （⇒ 「计划权益权重」与「期末现金」仍然自洽）；
       ⑥ `reason` 追加**为什么被拦**（金额 + 档位 + 门槛 + 折合 bp + 省下的最低佣金）。
+
+    🔴 ``reason_override``（2026-11-19 小资金兜底）：给了就**替换**标准那句
+    「金额 X 元 < 档位门槛 Y 元」（用于「额度集中给 #1 ⇒ 其余候选本轮不建仓」这类
+    **不是门槛不足**的作废 ⇒ 标准文案会写错事实）。
     """
     amount = float(amount)
     threshold = float(threshold)
@@ -260,11 +267,14 @@ def block_row(
     fee_now = _strict_fee(amount, commission_rate, min_commission)
     saved = fee_now
     bp = (float(min_commission) / amount * 1e4) if amount else 0.0
-    suffix = (
-        f"；🔴 **金额 {amount:.0f} 元 < {kind}门槛 {threshold:.0f} 元**"
-        f"（按 {float(min_commission):.0f} 元最低佣金折合 {bp:.1f} bp）"
-        f" ⇒ **本轮不调仓**（省最低佣金 {saved:.2f} 元）"
-    )
+    if reason_override:
+        suffix = f"；🔴 **本轮不调仓**：{reason_override}"
+    else:
+        suffix = (
+            f"；🔴 **金额 {amount:.0f} 元 < {kind}门槛 {threshold:.0f} 元**"
+            f"（按 {float(min_commission):.0f} 元最低佣金折合 {bp:.1f} bp）"
+            f" ⇒ **本轮不调仓**（省最低佣金 {saved:.2f} 元）"
+        )
     if reason_suffix:
         suffix += f"；{reason_suffix}"
     #: 🔴 2026-11-16 修（周一交付件复核发现）：**同一行可能被作废两次**
@@ -285,9 +295,304 @@ def block_row(
         "threshold": threshold,
         "min_commission_saved": round(saved, 2),
         "effective_bp": round(bp, 1),
+        #: 🔴 2026-11-19 小资金兜底：True = 这笔作废**不是**门槛不足（额度集中口径）
+        "reason_override": bool(reason_override),
         #: 🔴 2026-11-16：True = 这次**没有**重复追加披露句（同一行此前已被作废过）
         "already_disclosed": already,
     }
+
+
+def small_account_fallback_enabled(args=None) -> bool:
+    """小资金兜底总开关：`--no-small-account-fallback` ⇒ 关；默认 **开**。"""
+    if args is None:
+        return bool(C.SMALL_ACCOUNT_FALLBACK_ENABLED)
+    if getattr(args, "no_small_account_fallback", False):
+        return False
+    return bool(C.SMALL_ACCOUNT_FALLBACK_ENABLED)
+
+
+def _round_lot(shares: float, lot: int = 100) -> int:
+    """向下取整到整手（ETF 一手 = 100 股）—— 与阶段 5 / 阶段 6 同口径。"""
+    if shares is None or shares <= 0:
+        return 0
+    lot = int(lot or 1)
+    return int(math.floor(shares / lot) * lot)
+
+
+def _fallback_score(row: dict) -> float:
+    """候选排名键 = ``final_score``（缺失 ⇒ 排最后，不编分数）。"""
+    try:
+        value = row.get("final_score")
+        return float(value) if value is not None else float("-inf")
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def apply_small_account_fallback(
+    plans: list[dict],
+    *,
+    total_assets: float | None,
+    equity_cap: float | None,
+    thresholds: dict | None = None,
+    commission_rate: float = 0.0,
+    enabled: bool = True,
+    min_amount: float | None = None,
+    max_single_amount: float | None = None,
+    lot: int = 100,
+    price_basis: str = "",
+    preferred_code: str = "",
+) -> dict:
+    """🔴 小资金兜底（2026-11-19 · 用户拍板）：**额度不足 ⇒ 集中买 #1**。
+
+    【用户原话】
+    「**保留 3 万元账户规模**，让 Agent 在阶段 5 增加一条小资金兜底规则：
+      当**剩余权益额度不足以均分跨过 3,800 元**时，允许将**单笔建仓下限放宽至 1,500 元**，
+      并**集中额度优先买入排名第 1 的顺延标的**。」
+
+    【本函数干什么】
+    ① **剩余额度（金额空间、执行价口径）** = 生效权益上限 × 总资产 − Σ(非新开仓候选的目标金额)
+       ⇒ 「维持行」（TA 一票否决但仍持仓）**占额**先扣掉 ⇒ 不会因为它而多买；
+    ② **触发条件** = 均分额（额度 ÷ 候选数）< 常规「新开仓」门槛
+       **且** 集中落地金额 ≥ 放宽后的下限（1,500 元，按整手落地后仍要达标）；
+    ③ **集中**：候选里 ``final_score`` 最高者（**同分保持原序**）**独占**全部额度；
+    ④ **其余候选**：金额 < 放宽下限 ⇒ 交给**门槛层**正常拦下（口径唯一）；
+       金额 ≥ 放宽下限 ⇒ 由本函数**就地作废**（额度已集中，不许第二笔再吃额度）
+       ⇒ **无论哪种情况，落地权益都 ≤ 生效上限**。
+
+    【为什么不只改阶段 5】
+    阶段 6（节点日价）会把被拦下的碎单**重新算回来** ⇒ 门槛形同虚设
+    ⇒ 本函数与门槛**共用本模块**（单一事实源），**阶段 5 / 阶段 6 都要先跑它**。
+
+    ⇒ 返回值 = **披露结构**（挂到 ``plan["small_account_fallback"]`` ⇒ JSON 与 MD 如实呈现）。
+    """
+    thr = resolve_thresholds(thresholds)
+    normal_limit = float(thr["新开仓"])
+    relaxed = float(
+        C.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT if min_amount is None else min_amount)
+    relaxed = min(normal_limit, relaxed) if normal_limit > 0 else relaxed
+
+    base: dict = {
+        "enabled": bool(enabled),
+        "triggered": False,
+        "reason": "",
+        "normal_new_limit": round(normal_limit, 2),
+        "relaxed_new_limit": round(relaxed, 2),
+        "equity_cap": round(float(equity_cap), 6) if equity_cap is not None else None,
+        "total_assets": round(float(total_assets), 2) if total_assets is not None else None,
+        "allowance_amount": 0.0,
+        "per_candidate_amount": 0.0,
+        "concentrated_amount": 0.0,
+        "candidate_count": 0,
+        "preferred_code": str(preferred_code or ""),
+        #: 🔴 True = 额度**集中**给候选 #1；False = 只放宽门槛、**保持等权结构**
+        "concentrated": False,
+        "selected": None,
+        "others": [],
+        "notes": [],
+    }
+    if price_basis:
+        base["price_basis"] = price_basis
+
+    if not enabled:
+        base["reason"] = ("小资金兜底未启用（`--no-min-amount-gate` 或 "
+                           "`--no-small-account-fallback`）⇒ 行为与旧版一致")
+        return base
+    if total_assets is None or float(total_assets) <= 0:
+        base["reason"] = "缺总资产 ⇒ 不触发（不编数字）"
+        return base
+    if equity_cap is None:
+        base["reason"] = "缺生效权益上限 ⇒ 不触发（不编数字）"
+        return base
+
+    #: 候选 = 「新开仓」且**不是** TA 一票否决的维持行（维持行不建仓也不卖出 ⇒ 不参与）
+    cands: list[dict] = [
+        row for row in plans
+        if not row.get("ta_rejected") and classify_min_amount_kind(row) == "新开仓"
+    ]
+    base["candidate_count"] = len(cands)
+    if not cands:
+        base["reason"] = "本轮没有「新开仓」候选 ⇒ 不触发"
+        return base
+
+    #: 🔴 剩余额度 = 上限空间 − **非候选行**（维持行 / 清仓 / 存量微调）占用
+    _cand_ids = {id(row) for row in cands}
+    allowance = float(equity_cap) * float(total_assets)
+    for row in plans:
+        if id(row) in _cand_ids:
+            continue
+        value = row.get("target_amount")
+        if value is None:
+            continue
+        allowance -= float(value)
+    allowance = max(0.0, allowance)
+    per_candidate = allowance / len(cands)
+    base["allowance_amount"] = round(allowance, 2)
+    base["per_candidate_amount"] = round(per_candidate, 2)
+
+    if per_candidate >= normal_limit:
+        base["reason"] = (
+            f"额度足以均分跨过门槛（均分 {per_candidate:.2f} 元 ≥ 常规门槛 "
+            f"{normal_limit:.0f} 元）⇒ 不触发")
+        return base
+    if allowance < relaxed:
+        base["reason"] = (
+            f"剩余额度 {allowance:.2f} 元 < 放宽下限 {relaxed:.0f} 元 ⇒ 不触发"
+            "（宁可空仓也不建达不到门槛的碎单）")
+        return base
+
+    #: 🔴 排名 #1 = ``final_score`` 最高者（同分保持原序 ⇒ 稳定排序）
+    ordered = sorted(cands, key=lambda row: -_fallback_score(row))
+    selected = ordered[0]
+    #: 🔴 2026-11-19：**阶段 6 必须与阶段 5 选中同一只**（否则两阶段执行卡打架）
+    #:    ⇒ 计划件里已带「集中标的」时，优先沿用它（它若仍在候选里）。
+    _pref = str(preferred_code or "").strip()
+    if _pref:
+        _hit = next((r for r in ordered if str(r.get("code") or "").zfill(6) == _pref.zfill(6)), None)
+        if _hit is not None:
+            selected = _hit
+    price = float(selected.get("price") or 0.0)
+    if price <= 0:
+        base["reason"] = "候选 #1 无有效价格 ⇒ 不触发（不编数字）"
+        return base
+
+    #: 🔴🔴 2026-11-19 真机复盘修：**集中只在「#1 自己够不到放宽后门槛」时才做**
+    #:    · 若 #1 的**自身金额**已 ≥ 放宽下限 ⇒ 放宽门槛**已经**能让它建仓
+    #:      ⇒ **不集中**（保持计划的等权结构 ⇒ 计划权益合计仍 = 生效上限）；
+    #:    · 若 #1 也够不到 ⇒ 才把额度**集中**给它（否则额度全躺在现金里）。
+    #:    ⚠️ 真机反例（合成夹具）：2 席 × 3,000 元、常规门槛 3,800 元
+    #:       ⇒ 旧实现把 6,000 元全压给 #1（19.95%）⇒ 计划权益合计 = 29.95% ≠ 上限 20%（**结构被改坏**）。
+    selected_amount = abs(float(selected.get("est_amount") or 0.0))
+    if selected_amount >= relaxed:
+        base["triggered"] = True
+        base["concentrated"] = False
+        base["reason"] = (
+            f"额度不足均分跨过门槛（均分 {per_candidate:.2f} 元 < 常规门槛 {normal_limit:.0f} 元）"
+            f" ⇒ 本轮「新开仓」单笔下限**放宽至 {relaxed:.0f} 元**；"
+            f"候选 #1 自身金额 {selected_amount:.2f} 元**已达标** ⇒ **无需集中**（保持等权结构）")
+        base["notes"] = [
+            f"触发条件：均分额 **{per_candidate:.2f} 元** < 常规「新开仓」门槛 "
+            f"**{normal_limit:.0f} 元** ⇒ 本轮「新开仓」单笔下限**放宽至 {relaxed:.0f} 元**（只降不升）",
+            f"候选 #1 = {selected.get('code')} {selected.get('name')} 自身金额 "
+            f"**{selected_amount:.2f} 元** ≥ 放宽下限 ⇒ 放宽即可建仓 ⇒ **不集中额度**"
+            "（计划结构与权益合计不变）",
+        ]
+        return base
+
+    #: 🔴 集中额度（不得超过**单席上限** ⇒ 免得把集中变成新的超配）
+    amount_cap = allowance
+    if max_single_amount is not None:
+        amount_cap = min(amount_cap, float(max_single_amount))
+    target_shares = _round_lot(amount_cap / price, lot)
+    landed = target_shares * price
+    if landed < relaxed:
+        base["reason"] = (
+            f"集中额度 {amount_cap:.2f} 元按整手落地仅 {landed:.2f} 元 < 放宽下限 "
+            f"{relaxed:.0f} 元 ⇒ 不触发（宁可空仓也不建达不到门槛的碎单）")
+        return base
+
+    #: ---- 就地改写候选 #1：独占额度 ----
+    current = int(selected.get("current_shares") or 0)
+    delta = target_shares - current
+    est_amount = delta * price
+    selected["target_amount"] = round(landed, 6)
+    selected["target_shares"] = int(target_shares)
+    selected["delta_shares"] = int(delta)
+    selected["est_amount"] = round(est_amount, 6)
+    selected["est_fee"] = round(abs(est_amount) * float(commission_rate or 0.0), 6)
+    if total_assets:
+        selected["target_weight"] = landed / float(total_assets)
+    selected["small_account_fallback"] = True
+    selected["small_account_fallback_role"] = "集中承接额度"
+    #: 🔴🔴 2026-11-19 真机复盘修：**可达权重必须同步**
+    #:    `target_weight_effective` 是「计划权益权重」的取数口（阶段 5 `invested_weight`
+    #:    = Σ`target_weight_effective`）⇒ 只改 `target_weight` 会让**计划权益 24.76%
+    #:    与实际落地 34.97% 打架**（交付件自相矛盾）⇒ 这里一并改。
+    if "target_weight_effective" in selected:
+        selected["target_weight_effective"] = float(selected.get("target_weight") or 0.0)
+    if "weight_to_cash" in selected:
+        selected["weight_to_cash"] = 0.0
+
+    _reason = str(selected.get("reason") or "")
+    _note = (
+        f"🔴 **小资金兜底**：剩余权益额度 {allowance:.2f} 元不足以均分跨过"
+        f"「新开仓」常规门槛 {normal_limit:.0f} 元（均分 {per_candidate:.2f} 元）"
+        f" ⇒ 本行**集中承接**额度 {landed:.2f} 元"
+        f"（本轮新开仓单笔下限放宽至 {relaxed:.0f} 元，只降不升）"
+    )
+    if _note not in _reason:
+        selected["reason"] = (_reason + "；" + _note).strip("；")
+
+    #: ---- 其余候选：金额 < 放宽下限 ⇒ 交给门槛层；≥ 放宽下限 ⇒ 本函数就地作废 ----
+    others: list[dict] = []
+    for row in ordered[1:]:
+        amount = abs(float(row.get("est_amount") or 0.0))
+        by_gate = amount < relaxed
+        #: 🔴 其余候选的**席位预算已被集中给 #1** ⇒ 它们的计划目标权重归零
+        #:    （否则 Σ目标权重会**重复计**这笔预算 ⇒ 计划权益合计虚高、破上限口径失真）
+        #:    「可达权重」同步归零（它们本轮不是持仓 ⇒ 计划权益不得把它们算进去）
+        row["target_weight"] = 0.0
+        if "target_weight_effective" in row:
+            row["target_weight_effective"] = 0.0
+        if not by_gate:
+            block_row(
+                row,
+                kind="新开仓",
+                amount=amount,
+                threshold=relaxed,
+                commission_rate=commission_rate,
+                min_commission=float(C.ETF_MIN_COMMISSION_STRICT),
+                total_assets=total_assets,
+                reason_override=(
+                    f"小资金兜底：额度已集中给候选 #1（{selected.get('code')}）"
+                    f" ⇒ 本轮不建仓（避免第二笔再吃额度 ⇒ 落地权益不破生效上限）"),
+            )
+        others.append({
+            "code": row.get("code"),
+            "name": row.get("name"),
+            "amount": round(amount, 2),
+            "threshold": round(relaxed, 2),
+            "final_score": row.get("final_score"),
+            "blocked": True,
+            "blocked_by": (
+                "门槛（新开仓档放宽后）" if by_gate
+                else "集中额度（其余候选本轮不建仓）"),
+        })
+
+    base["triggered"] = True
+    base["concentrated"] = True
+    base["reason"] = (
+        f"额度不足均分跨过门槛（均分 {per_candidate:.2f} 元 < 常规门槛 {normal_limit:.0f} 元）"
+        f" ⇒ 集中额度买入候选 #1")
+    base["concentrated_amount"] = round(landed, 2)
+    base["selected"] = {
+        "code": selected.get("code"),
+        "name": selected.get("name"),
+        "final_score": selected.get("final_score"),
+        "rank_among_candidates": 1,
+        "price": round(price, 6),
+        "target_amount": round(landed, 2),
+        "target_shares": int(target_shares),
+        "delta_shares": int(delta),
+        "target_weight": round(float(selected.get("target_weight") or 0.0), 6),
+        "role": "集中承接额度",
+        #: 🔴 True = 沿用**阶段 5**已定的集中标的（保证两阶段同一只）
+        "carried_from_plan": bool(_pref),
+        #: 🔴 「顺延补位」标记：行内没有结构化字段 ⇒ 从 reason 文案识别（如实披露）
+        "is_substitution": "顺延补位" in str(selected.get("reason") or ""),
+    }
+    base["others"] = others
+    base["notes"] = [
+        f"触发条件：均分额 **{per_candidate:.2f} 元** < 常规「新开仓」门槛 "
+        f"**{normal_limit:.0f} 元**（剩余额度 {allowance:.2f} 元 ÷ 候选 {len(cands)} 只）"
+        f" ⇒ 本轮「新开仓」单笔下限**放宽至 {relaxed:.0f} 元**（只降不升）",
+        f"集中买入：候选 **#1 = {selected.get('code')} {selected.get('name')}**"
+        f"（`final_score` = {selected.get('final_score')}）⇒ 承接额度 **{landed:.2f} 元**"
+        f"（目标权重 {float(selected.get('target_weight') or 0.0) * 100:.2f}%）",
+        f"其余候选 **{len(others)}** 只本轮**不建仓**"
+        f"（额度已集中 ⇒ 落地权益不破生效上限 "
+        f"{float(equity_cap) * 100:.2f}%）",
+    ]
+    return base
 
 
 def apply_min_trade_threshold(

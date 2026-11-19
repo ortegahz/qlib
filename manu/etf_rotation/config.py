@@ -291,6 +291,16 @@ ETF_ACCOUNT = 29_854.67         # 个人量级（小资金，人工下单）
 MIN_TRADE_AMOUNT_LIQUIDATE = 0.0      # 清仓 / 止损 / 跌破 MA60 强制退出 ⇒ 无条件执行
 MIN_TRADE_AMOUNT_NEW = 3800.0          # 全新建仓（当前 0 股 → 目标权重）
 MIN_TRADE_AMOUNT_ADJUST = 2800.0       # 存量仓位微调（加仓 / 减仓）
+#: 🔴 2026-11-19 小资金兜底（用户拍板 ·「保留 3 万元账户规模」）：
+#:    **不动 TA 的宏观风控判断**，只在**门槛层**（阶段 5 / 阶段 6 共用）加一条兜底：
+#:    当**剩余权益额度不足以均分跨过「新开仓」门槛**时
+#:    ⇒ 允许把**单笔建仓下限放宽**到 1,500 元
+#:    ⇒ 并**集中额度优先买入候选排名 #1**（`final_score` 最高者）。
+#:    ⚠️ 只放宽**本轮「新开仓」档**；清仓止损 / 存量微调两档**不动**。
+#:    ⚠️ **只降不升**（`min(常规门槛, 1,500)`）⇒ 绝不把门槛抬高。
+MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT = 1500.0   # 小资金兜底下的新开仓单笔下限（元）
+#: 小资金兜底总开关（默认开）⇒ 可用 CLI `--no-small-account-fallback` 临时关掉。
+SMALL_ACCOUNT_FALLBACK_ENABLED = True
 #: 🔴 门槛总开关（默认开）⇒ 可用 CLI `--no-min-amount-gate` 临时关掉。
 MIN_AMOUNT_GATE_ENABLED = True
 
