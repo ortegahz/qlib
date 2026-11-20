@@ -2,7 +2,8 @@
 # manu/etf_rotation/run_gates.sh —— ETF 轮动线「全量闸门」一键复跑脚本
 #
 # 【是什么】
-#   把已跑通的全量闸门固化成一条可复制粘贴的命令：26 个探针阶段 + 1 个可复现性段（repro），
+#   把已跑通的全量闸门固化成一条可复制粘贴的命令：28 个阶段（`run_stage` 调用数 ＝ 单一事实源，
+#   `grep -c '^run_stage ' manu/etf_rotation/run_gates.sh` 可自证）＋ 1 个可复现性段（repro），
 #   逐项实跑、逐项记录退出码，最后打印汇总（各阶段退出码 + 断言 PASS 行数）。
 #   本脚本只做「编排 + 记账」，自身不产出任何策略结论：
 #   不联网、不调 LLM、不跑 akshare、不训练、不回测；重活都在被调用的子脚本里。
@@ -161,7 +162,7 @@ run_stage(){  # run_stage <名字> <说明> <命令...>
 }
 
 # =============================================================================
-# 27 个探针阶段（顺序与基准脚本 _run_gates_ms2.sh 完全一致；M-S5 新增第 15 个 probe_node_basis；
+# 28 个阶段（`run_stage` 调用数 ＝ 单一事实源；顺序与基准脚本 _run_gates_ms2.sh 完全一致；M-S5 新增第 15 个 probe_node_basis；
 #                       M-S6 新增第 16 个 probe_llm_stage_repro（LLM 阶段可复现闸门）、
 #                       第 17 个 check_memory_tables（memory 表格结构检查器，**只读**）、
 #                       第 18 个 probe_decision_scenarios（三项分歧组合矩阵闸门）与
@@ -296,7 +297,7 @@ run_stage probe_decision_scenarios "三项分歧组合矩阵闸门（生成器�
 run_stage probe_node_scenarios "节点日分歧情景重算闸门（默认零回归+情景一致+独立重算+非法输入硬拦）" \
   "$QL_PY" manu/etf_rotation/probes/probe_node_scenarios.py --run-root "$RUN_ROOT"
 
-### probe_rolling_increment —— 阶段 1「自建增量日」闸门（新增第 20 个探针阶段）
+### probe_rolling_increment —— 阶段 1「自建增量日」闸门（新增第 20 个探针阶段；执行位次第 22 位）
 ###   钉死五件事：① qlib bin 的**日历对齐**（追加/缺口补 NaN/跳写拒绝）；
 ###   ② **基座零改动**（派生目录是硬链接副本 ⇒ 写前必须 copy-on-write）；
 ###   ③ **守卫剔除不错位**（基准偏离的标的不写 ⇒ qlib 读出 NaN，不整体错位）；
@@ -307,7 +308,7 @@ run_stage probe_node_scenarios "节点日分歧情景重算闸门（默认零回
 run_stage probe_rolling_increment "阶段 1 自建增量日闸门（日历对齐+基座零改动+守卫+写盘配方+fail-closed）" \
   "$QL_PY" manu/etf_rotation/probes/probe_rolling_increment.py
 
-### probe_snapshot_contract —— **快照契约闸门**（第 21 个探针阶段）
+### probe_snapshot_contract —— **快照契约闸门**（新增第 21 个探针阶段；执行位次第 23 位）
 ###   钉死 **2026-11-09 架构瘦身** 的快照制不变式（单一无状态流水线 ＋ 不可变快照目录）：
 ###   ① **S1** 每次 `create_snapshot` 产生**新**目录（同一秒两次 ⇒ 后者加后缀、**绝不覆盖**；
 ###      旧快照里的件**逐字节不变**）；
@@ -329,7 +330,7 @@ run_stage probe_rolling_increment "阶段 1 自建增量日闸门（日历对齐
 run_stage probe_snapshot_contract "快照契约闸门（目录唯一+自包含+只读底座+不写全局文件+完整披露+--mode已废除+观察/实盘互斥+--full强制全流程+执行卡挂单禁用+变异反证）" \
   "$QL_PY" manu/etf_rotation/probes/probe_snapshot_contract.py
 
-### probe_qlib_provider —— **qlib provider 单一事实源闸门**（新增第 22 个探针阶段）
+### probe_qlib_provider —— **qlib provider 单一事实源闸门**（新增第 22 个探针阶段；执行位次第 24 位）
 ###   钉死**两链不分叉**：① 路径唯一性（基座 = 个股线 `PROVIDER_URI`；派生 = <root>/cn_data_live；
 ###   env 三件套覆盖）；② **谁新用谁**规则（派生末日 > 基座 ⇒ 用派生；== / < / 读不到 ⇒ 回基座）；
 ###   ③ fail-safe（空日历 / 目录缺失 ⇒ 退回基座，**不猜**）；④ `asof` 未覆盖只**告警**不换源；
@@ -339,7 +340,7 @@ run_stage probe_snapshot_contract "快照契约闸门（目录唯一+自包含+�
 run_stage probe_qlib_provider "qlib provider 单一事实源闸门（路径唯一+谁新用谁+fail-safe+每日链委托+路径对账+变异反证）" \
   "$QL_PY" manu/etf_rotation/probes/probe_qlib_provider.py
 
-### probe_score_smoothing —— **穿透分时间平滑闸门**（新增第 23 个探针阶段）
+### probe_score_smoothing —— **穿透分时间平滑闸门**（新增第 23 个探针阶段；执行位次第 25 位）
 ###   钉死**平滑语义不许漂**：① **脉冲假数据**（前 4 日平稳 + 第 5 日暴涨 3 倍 ⇒
 ###   平滑分必须显著低于裸分、且不许在首日冲上 Top 1）；② EWMA / 滚动均值**手算**逐位比对；
 ###   ③ **LOCF 阶梯**（观测点稀疏时按交易日轴前向填充 ⇒ 取最近观测）；
@@ -351,7 +352,7 @@ run_stage probe_qlib_provider "qlib provider 单一事实源闸门（路径唯�
 run_stage probe_score_smoothing "穿透分时间平滑闸门（脉冲压噪+EWMA/滚动手算+LOCF+冷启动回退+稳定性None+变异反证）" \
   "$QL_PY" manu/etf_rotation/probes/probe_score_smoothing.py
 
-### probe_ta_screening —— **TA 合规筛选闸门**（新增第 25 个探针阶段）
+### probe_ta_screening —— **TA 合规筛选闸门**（新增第 25 个探针阶段；执行位次第 26 位）
 ###   钉死「TA 只审不选」这条架构红线：① 候选池两两重合度（重叠度 / corr120 / 同族）；
 ###   ② **一票否决解析**（否定式 / 「一票否决权」/ 范围级表述 **不得**误判为否决）；
 ###   ③ 顺延补位必须满足全部合格条件（未入选 / 未破位 / 未被 MA 过滤 / 覆盖达标 /
@@ -363,7 +364,7 @@ run_stage probe_score_smoothing "穿透分时间平滑闸门（脉冲压噪+EWMA
 run_stage probe_ta_screening "TA合规筛选闸门（重合度+一票否决解析+顺延合格条件+2条变异反证+端到端）" \
   "$QL_PY" manu/etf_rotation/probes/probe_ta_screening.py
 
-### probe_ta_veto_scope —— **一票否决作用域闸门**（新增第 26 个探针阶段）
+### probe_ta_veto_scope —— **一票否决作用域闸门**（新增第 26 个探针阶段；执行位次第 27 位）
 ###   🔴 钉死「**否决（一票否决）只认权威裁决段落，分析师观点没有否决权**」：
 ###   ① 真实决策件（高保真裁剪夹具）⇒ 权威提取**恰好 13 只**、不多不少；
 ###   ② **零误伤**：TA 最终裁决明确「买 / 减」的 515450 / 515650 / 512800 不得被否；
@@ -378,7 +379,7 @@ run_stage probe_ta_screening "TA合规筛选闸门（重合度+一票否决解�
 run_stage probe_ta_veto_scope "一票否决作用域闸门（只认权威裁决段落+零误伤+变异反证+fail-safe）" \
   "$QL_PY" manu/etf_rotation/probes/probe_ta_veto_scope.py
 
-### probe_snapshot_lookahead —— **快照结构 + 无未来函数闸门**（新增第 24 个探针阶段）
+### probe_snapshot_lookahead —— **快照结构 + 无未来函数闸门**（新增第 24 个探针阶段；执行位次第 28 位）
 ###   🔴 **断言对象 = 本轮运行生成的快照目录**（不是产物根里的旧件）—— 这是用户架构正本
 ###   §三 第 2 条「把断言目标改成当前运行生成的快照目录」的直接落地：
 ###   ① 三处 asof 必须一致（manifest / report.meta / 前视审计 / inputs）；

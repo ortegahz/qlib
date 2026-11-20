@@ -360,12 +360,12 @@ S 层是全链的**唯一重活**（约 27 分钟量级）。它需要一份「�
 
 | | **研究链** `manu/etf_rotation/run_pipeline.sh` | **每日链** `manu/etf_rotation/daily/main.py` |
 |:--|:--|:--|
-| **角色** | **基线生产方** ＋ **23 阶段闸门的被测对象** | **决策链** |
+| **角色** | **基线生产方** ＋ **28 阶段闸门的被测对象**（阶段数 ＝ `run_gates.sh` 的 `run_stage` 调用数） | **决策链** |
 | **干什么** | 生产 canonical 基线产物（`stock_scores.csv`、穿透报告、决策件、规则层推荐件），供研究、复现、闸门、指纹表使用 | 现场拉数 → 内存计算 → 落一份**不可变快照**，供人读、供人 diff、供执行 |
 | **触发** | 研究/重建基线时（**重活**，需授权） | **按需**（用户在窗口喊「分析」） |
 | **写 canonical 吗** | ✅ **写**（它就是 canonical 的生产方） | ❌ **不写**（只读或不碰） |
 | **产物形态** | 根目录全局文件（**被研究链与闸门钉死**，不宜改形态） | **快照目录** `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/` |
-| **闸门** | `run_gates.sh`（23 阶段）探的是**研究链产物** | `probes/probe_snapshot_contract.py`（S1~S10）探的是**快照契约** |
+| **闸门** | `run_gates.sh`（28 阶段）探的是**研究链产物** | `probes/probe_snapshot_contract.py`（S1~S10）探的是**快照契约** |
 
 🔴 **边界要点**：
 
@@ -474,7 +474,7 @@ python manu/etf_rotation/daily/main.py --asof 2026-12-01 --mode 旧取值
    ③ `risk_disclosure` 含 `w_snapshot_bias` 且带实测数字；
    ④ 快照内**所有**日期型输入 ≤ `asof`（无未来函数）。
    ⇒ ✅ **2026-11-09 已落地**：`manu/etf_rotation/probes/probe_snapshot_lookahead.py`
-   （正例 **A1~A9** ＋ 负例自检 **N1~N5**）已接进 `run_gates.sh` 的**第 24 个探针阶段**
+   （正例 **A1~A9** ＋ 负例自检 **N1~N5**）已接进 `run_gates.sh` 的**第 28 位**（执行位次；添加序号 24）
    （`probe_snapshot_lookahead`）。🔴 判定口径做成 **asof 相对**（不写死「决策前视恰 1 项」）：
    asof 推过 W 快照日就是 0 项 ⇒ 换 asof 不会误红；**没有真实快照时该阶段退出码 2 = 不适用**（≠「通过」，不计失败）。
    ⇒ 2026-11-09 通宵自跑产出的那一份快照，就是它的**真实夹具**（本地已用两套合成夹具

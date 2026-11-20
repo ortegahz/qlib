@@ -124,6 +124,29 @@ def _snapshot_inputs(snapshot: Path, asof: str) -> dict:
     }
 
 
+def _fresh_account_snapshot(out_dir: Path) -> Path:
+    """按**当前**实盘口径生成一份账户快照 CSV（**不复用快照里那份**）。
+
+    🔴 2026-11-19 真机缺陷（探针假红）：探针原来直接用**快照里的**
+       ``account_snapshot.csv``，而 ``--total-assets`` / ``--cash`` 却来自
+       **当前** ``daily_config`` 常量 ⇒ 账户口径一换（2026-11-19 用户新截图：
+       30,035.57 → 30,385.21），两者就对不上 ⇒ ``analyze.py`` 的账户对账守卫
+       （Σ市值 + 现金 == 总资产，容差 0.01 元）直接抛异常 ⇒ **analyze rc=1**
+       ⇒ 探针整轮**假失败**（看着像「接缝坏了」）。
+    ⇒ 修法：**每次探针都按当前口径重新生成**账户快照 CSV
+       （与每日链 ``agents_rebalance.py`` **同一做法**：``account_state.write_snapshot_csv``）
+       ⇒ ① 三个档（A/B/C）用**同一份**账户 ⇒ 可比；② 永远与注入的常量自洽。
+    """
+    import account_state  # 每日链的**实盘账户单一事实源**（daily/ 下，sys.path 已就位）
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "account_snapshot.csv"
+    account_state.write_snapshot_csv(path)
+    print(f"   ↻ 账户快照按**当前口径**重生成：{path}"
+          f"（总资产 {account_state.DC.TOTAL_ASSETS:.2f} / 现金 {account_state.DC.CASH:.2f}）")
+    return path
+
+
 def _scoring_days(scores_path: Path) -> list[str]:
     """``stock_scores.csv`` 里**实际存在**的打分日（升序、去重）。
 
@@ -299,6 +322,10 @@ def main() -> int:
     out_a.mkdir(parents=True, exist_ok=True)
     out_b.mkdir(parents=True, exist_ok=True)
     out_c.mkdir(parents=True, exist_ok=True)
+
+    # 🔴 2026-11-19：账户快照必须按**当前口径**重生成（见 helper 的说明）
+    #    ⇒ 不复用快照里那份（它带着**旧账户口径**的市值/现金）
+    inp["account"] = _fresh_account_snapshot(out_root)
 
     fp = V2FP.load_frozen_params(Path(args.frozen_params))
 

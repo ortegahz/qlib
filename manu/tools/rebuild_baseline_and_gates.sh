@@ -100,7 +100,11 @@ say "=== 步骤 3/3：全量闸门（run_gates.sh --skip-repro）==="
 nice -n 10 bash manu/etf_rotation/run_gates.sh --skip-repro \
      --log "$RUN/_gates_rebuild_$RUN_TAG.log" > "$LOG_DIR/step3_gates.log" 2>&1
 RC=$?
-record "全量闸门（26 阶段）" "$RC" "step3_gates.log / _gates_rebuild_$RUN_TAG.log"
+# 🔴 2026-11-19（`rules.md §十四.127`）：阶段数**不许手写** ⇒ 从单一事实源
+#    `run_gates.sh` 的 `run_stage` 调用数**动态派生**（读不到就写「缺」，不许猜、不许写死）。
+GATES_STAGES="$(grep -c '^run_stage ' manu/etf_rotation/run_gates.sh 2>/dev/null || true)"
+[ -n "$GATES_STAGES" ] || GATES_STAGES="缺"
+record "全量闸门（${GATES_STAGES} 阶段）" "$RC" "step3_gates.log / _gates_rebuild_$RUN_TAG.log"
 say "   退出码=$RC"
 
 say "=== 结束 === 总结见 $SUMMARY"

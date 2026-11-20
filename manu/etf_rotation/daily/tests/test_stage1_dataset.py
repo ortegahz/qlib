@@ -32,6 +32,23 @@ if str(_DAILY_DIR) not in sys.path:
 
 import stage1_dataset as SD  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _isolate_production_live_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """🔴 **隔离生产派生库**：本文件的契约是「完全离线、不连服务器、不换真库」。
+
+    🔴 **2026-11-19 实测缺陷（本守卫的由来）**：
+    `run_stage1()` 在没传 `live_dir` 时会回落到 `DC.QLIB_CN_DATA_LIVE`
+    （= 服务器上**真实的** `cn_data_live` 派生库）⇒ 测试断言读到了**生产状态**：
+    真实库日历末日是 `2026-11-18`，而夹具期望 `2026-11-19`
+    ⇒ `test_run_stage1_dry_run_offline` 在生产机上**假红**（在其他机器上却是绿的）
+    ⇒ 典型的「环境依赖型假失败」，且会让修的人误以为是生产代码错报日历。
+
+    ⇒ 守卫：把 `DC.QLIB_CN_DATA_LIVE` 顶到一个**不存在的 tmp 路径**
+    ⇒ 即使将来有人忘了传 `live_dir`，也**读不到**生产库。
+    """
+    monkeypatch.setattr(SD.DC, "QLIB_CN_DATA_LIVE", tmp_path / "_prod_live_isolated")
+
 #: 现役库的模拟日历（10 个交易日）
 _CAL_OLD = [
     "2026-11-02",
@@ -463,6 +480,8 @@ def test_run_stage1_dry_run_offline(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         backup_dir=tmp_path / "backup",
         dest_dir=dest,
         do_fetch=False,
+        do_increment=False,          # 🔴 本文件契约「不联网」⇒ 不许触发自建增量日
+        live_dir=tmp_path / "live",  # 🔴 隔离：不许读生产派生库
         do_swap=True,
         dry_run=True,
     )
@@ -493,6 +512,8 @@ def test_run_stage1_swap_offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
         backup_dir=tmp_path / "backup",
         dest_dir=dest,
         do_fetch=False,
+        do_increment=False,
+        live_dir=tmp_path / "live",
         do_swap=True,
         dry_run=False,
     )
@@ -518,6 +539,8 @@ def test_run_stage1_broken_prefix_raises(monkeypatch: pytest.MonkeyPatch, tmp_pa
             backup_dir=tmp_path / "backup",
             dest_dir=dest,
             do_fetch=False,
+            do_increment=False,
+            live_dir=tmp_path / "live",
             do_swap=True,
             dry_run=False,
         )
@@ -544,6 +567,8 @@ def test_run_stage1_asof_not_covered_is_disclosed(
         backup_dir=tmp_path / "backup",
         dest_dir=dest,
         do_fetch=False,
+        do_increment=False,
+        live_dir=tmp_path / "live",
         do_swap=True,
         dry_run=True,
     )

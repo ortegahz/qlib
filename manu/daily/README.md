@@ -159,7 +159,7 @@
 - **写盘口径**（2026-11-05 实测逐位核对，最大相对误差 **7.9e-5**）：
   `close/open/high/low = 原始价 × f_new`；`volume = 原始手数 ÷ f_new`；`amount = 成交额 ÷ 1000`；
   `vwap = 成交额/(手数×100) × f_new`；`change = 原始涨跌幅`；**除权日 `f_new = f_prev × hfq(t)/hfq(t−1)`**；
-- **闸门**：`probes/probe_rolling_increment.py`（**18 项**，含 2 个真负例 + 3 个批量源不变量）⇒ `run_gates.sh` 第 20 阶段。
+- **闸门**：`probes/probe_rolling_increment.py`（**18 项**，含 2 个真负例 + 3 个批量源不变量）⇒ `run_gates.sh` 第 22 位（执行位次；添加序号 20）。
 - ✅ **真实构建与实机验收（2026-11-05 18:37 → 11-06 09:0x）**：基座末日 2026-11-03 ⇒ 补 **11-04 + 11-05**
   ⇒ 派生目录 **`cn_data_live`**（852 MB，**基座零改动**）；四项验收全过：
   ① 派生日历末日 = **2026-11-05**｜② **`D.features` qlib 真读得到 11-05**（含北交所）｜
@@ -292,6 +292,9 @@ python manu/etf_rotation/daily/main.py [选项]
 ### 用法示例
 
 ```bash
+#    ⬇ 本块所有命令的前提：cwd ＝ 工程根（服务器工作副本 /tmp/pycharm_project_658d3fc4）
+#    解释器 ＝ /home/huangzhe/anaconda3/envs/ql/bin/python（下面写 'python' 只是简写，**别用系统 python3**）
+
 # ① 完整跑（缺省 = 观察态）：现场拉数 → 内存计算 → 落一个快照目录
 #    副作用：无（执行卡挂单禁用、不发信）
 python manu/etf_rotation/daily/main.py --asof 2026-12-01
@@ -312,11 +315,12 @@ python manu/etf_rotation/daily/main.py --asof 2026-12-01 --full --live-trade
 # ⑤ 指定快照根（默认 daily_config.SNAPSHOT_ROOT）
 python manu/etf_rotation/daily/main.py --asof 2026-12-01 --snapshot-root <结果根>/snapshots
 
-# ⑥ 显式发邮件（默认不发；按需）
-python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-email
+# ⑥ 显式发邮件（默认不发；🔴 属实盘副作用 ⇒ **必须**配合 --live-trade）
+#    🔴 不带 --live-trade ⇒ 退出码 2（实测：`main.py:1249` 的硬前置，不发信、不下单）
+python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-email --live-trade
 
-# ⑦ 只发已持久化的邮件草稿，不重跑任何计算
-python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only
+# ⑦ 只发已持久化的邮件草稿，不重跑任何计算（🔴 同样**必须**配合 --live-trade，否则退出码 2）
+python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only --live-trade
 ```
 
 🔴 **老命令会被拒**：`--mode`（连参数本身都已删除，旧取值一并作废）一律**退出码 2** ＋ stderr 迁移提示。

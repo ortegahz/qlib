@@ -2,7 +2,9 @@
 r"""只读检查 memory 主档里 markdown 表格的**结构**完整性。
 
 用途
-    `manu/memory/memory.md` / `manu/memory/memory_compact.md` 是大量 markdown 表格的主档。
+    `manu/memory/` 下的 **memory 四层**（`memory.md` / `memory_compact.md` / `rules.md` /
+    `.slim_memory.md`）与**逐日 record 载体**（`records/*.md`）都是大量 markdown 表格的主档
+    ⇒ **默认全部受检**（`records/` 用 glob ⇒ 每天新增的自动纳入）。
     表格行里如果出现**未转义**的 `|`（例如正文里的 `` `ls | true` ``），markdown 会把它当成
     **单元格分隔符** ⇒ 那一行被切成比表头更多的单元格 ⇒ **表格渲染错位**（列整体错列）。
     本脚本按**结构**逐表块统计未转义竖线数，把「列数与表头不一致」的行报成缺陷。
@@ -56,7 +58,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
-DEFAULT_MEMORY_FILES = ("manu/memory/memory.md", "manu/memory/memory_compact.md")
+#: memory **四层** ＋ 逐日 record 目录（相对工程根）
+#: 🔴 2026-11-20 起：**四层全部纳入默认集**（此前只有 memory.md ＋ memory_compact.md）
+#:    ⇒ rules.md（铁律层）＋ .slim_memory.md（精简层）＋ records/*.md（逐日记录层）**此前不受检**。
+DEFAULT_MEMORY_FILES = (
+    "manu/memory/memory.md",
+    "manu/memory/memory_compact.md",
+    "manu/memory/rules.md",
+    "manu/memory/.slim_memory.md",
+)
+#: 逐日 record 载体目录（相对工程根）：`README.md` ＋ 每个交易日一份 `YYYYMMDD.md`
+RECORDS_DIR_REL = "manu/memory/records"
 
 # 分隔行单元格：规范形式（`:--` / `:--:` / `--` / `---`，两侧可各带一个对齐冒号）
 SEPARATOR_CELL_RE = re.compile(r"^:?-{2,}:?$")
@@ -381,7 +393,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "待检查的 markdown 文件，可重复传入"
-            f"（默认：{'、'.join(DEFAULT_MEMORY_FILES)}；相对路径按 --project-dir 解析）"
+            "（默认：memory 四层（memory.md / memory_compact.md / rules.md / .slim_memory.md）"
+            "＋ manu/memory/records/*.md（逐日 record 载体）；相对路径按 --project-dir 解析）"
         ),
     )
     parser.add_argument(
@@ -393,9 +406,30 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def default_targets(project_dir: str) -> list[str]:
+    """默认待检文件集 = 两份 memory 主档 ＋ `manu/memory/records/*.md`（逐日 record 载体）。
+
+    🔴 **为什么四层 + records 都要进默认集**（2026-11-20 reviewer NIT 9 实测的复发点）：
+    `run_gates.sh` 第 17 阶段只调本工具的**默认集**（不传 `--files`）⇒
+    此前 `rules.md` / `.slim_memory.md` / `records/*.md` **不在任何闸门覆盖内**
+    ⇒ 将来这些文件的表格列数错位，常规闸门**跑不到** ⇒ 缺口复发点。
+    🔴 这里对 records 用 **glob 扫目录**而不是写死文件名 ⇒ **未来每天新增的 record 自动受检**，不需要改代码。
+    🔴 `*.md.bak.*` 这类备份**不被匹配**（后缀不是 `.md`）⇒ 不误伤。
+    """
+    targets = list(DEFAULT_MEMORY_FILES)
+    records_dir = os.path.join(project_dir, RECORDS_DIR_REL)
+    try:
+        names = sorted(name for name in os.listdir(records_dir) if name.endswith(".md"))
+    except OSError:
+        names = []
+    for name in names:
+        targets.append(f"{RECORDS_DIR_REL}/{name}")
+    return targets
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    targets = args.files if args.files else list(DEFAULT_MEMORY_FILES)
+    targets = list(args.files) if args.files else default_targets(args.project_dir)
     try:
         reports = []
         for target in targets:

@@ -1,1 +1,6 @@
 manu/etf_rotation/data/account_snapshot.csv -text
+# 🔴 镜像对的另一侧同样要 -text（两侧都保持字节原样 ⇒ 指纹可逐字对）
+manu/data/account_snapshot.csv -text
+# 🔴 逐日事实台账同理：`-text` 关掉行尾归一化 ⇒ 台账字节原样入库，md5/sha1 指纹稳定
+#    （否则 CRLF 转换会让「产物 ↔ 台账」的指纹对不上）。
+manu/memory/records/*.csv -text

@@ -256,7 +256,11 @@ say "=== 步骤 4/5：全量闸门（run_gates.sh --skip-repro）==="
 nice -n 10 bash manu/etf_rotation/run_gates.sh --skip-repro \
      --log "$RUN/_gates_full_$RUN_TAG.log" > "$LOG_DIR/step4_gates.log" 2>&1
 RC=$?
-record "全量闸门（26 阶段）" "$RC" "step4_gates.log / _gates_full_$RUN_TAG.log"
+# 🔴 2026-11-19（`rules.md §十四.127`）：阶段数**不许手写** ⇒ 从单一事实源
+#    `run_gates.sh` 的 `run_stage` 调用数**动态派生**（读不到就写「缺」，不许猜、不许写死）。
+GATES_STAGES="$(grep -c '^run_stage ' manu/etf_rotation/run_gates.sh 2>/dev/null || true)"
+[ -n "$GATES_STAGES" ] || GATES_STAGES="缺"
+record "全量闸门（${GATES_STAGES} 阶段）" "$RC" "step4_gates.log / _gates_full_$RUN_TAG.log"
 say "   退出码=$RC"
 
 # ---- 步骤 5：产物留在结果根 + 清理本项目临时/中间产物 ----------------------
@@ -290,7 +294,13 @@ CLEANED=0
 #:    ⇒ 守卫：**流水线实例锁**（`daily_config.LOCK_FILE` = `$RUN_ROOT/.lock`，内核 flock）
 #:    **被持有** ⇒ 说明还有活实例在用 `_work/` ⇒ **一律不许清 `_work`**。
 #:    （本步骤跑在步骤 2 之后 ⇒ 自己这一轮早退出 ⇒ 锁空闲 ⇒ 正常清理不受影响。）
-INSTANCE_LOCK="${ETF_ROTATION_LOCK_FILE:-$RUN/.lock}"
+#: 🔴 2026-11-19 真缺陷修复：这里原来写的是 ``$RUN/.lock``（= ``<RESULTS_ROOT>/.lock``），
+#:    而每日链的**实例锁**实际在 ``<RESULTS_ROOT>/daily/.lock``（见 ``daily_config.LOCK_FILE``）
+#:    ⇒ 守卫**恒判空闲** ⇒ 并发跑时会把**另一个活实例正在用的 ``_work/``** 删掉
+#:    ⇒ 复现 2026-11-16 那次事故（``ak`` 子进程落盘失败 → 整条链 rc=1）。
+#:    ⇒ 现在**按每日链的真实路径**取（与 ``daily_config`` 同口径，支持环境变量覆盖）。
+DAILY_RUN_ROOT="${ETF_ROTATION_RUN_ROOT:-$RESULTS_ROOT/daily}"
+INSTANCE_LOCK="${ETF_ROTATION_LOCK_FILE:-$DAILY_RUN_ROOT/.lock}"
 SKIP_WORK_CLEAN=0
 if flock -n "$INSTANCE_LOCK" -c true 2>/dev/null; then
   say "   ℹ️ 流水线实例锁空闲（$INSTANCE_LOCK）⇒ 可清理 _work"

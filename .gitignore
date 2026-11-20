@@ -87,6 +87,17 @@ _probe*/
 # 账户快照是**输入真值**（analyze.py / account.py 的默认账户口径），
 # 上游 .gitignore 的全局 *.csv 会把它误忽略 ⇒ 这里显式白名单放行。
 !manu/etf_rotation/data/account_snapshot.csv
+# 🔴 2026-11-19：**镜像对的另一侧必须一起放行**（铁律「manu/ ↔ manu/etf_rotation/ 逐字一致」）
+#    `manu/data/account_snapshot.csv` 与 `manu/etf_rotation/data/account_snapshot.csv` 是**同一对镜像**（逐字一致）
+#    ⇒ 只放行一侧 ⇒ **提交后镜像对只剩一半** ⇒ 新克隆的仓库缺一侧 ⇒ 镜像纪律在版本库里就断了。
+!manu/data/account_snapshot.csv
+# 🔴 2026-11-19（铁律 §十四.122 的载体）：逐日事实台账
+#    `manu/memory/records/etf_rotation_daily_ledger.csv` 是「**几个月后复盘**」的唯一结构化载体
+#    （一行 = 一只 ETF 一天：目标权重 / 金额 / 股数 / 是否成交 / 否决理由 / 权益上限 / 失败环节），
+#    而这些**开源数据接口拿不到**（akshare / qlib 只有行情与基本面）。
+#    🔴 上游全局 `*.csv`（第 15 行）会把它**静默忽略** ⇒ 提交时台账直接消失 ⇒ 复盘材料随工作区清理一起没了。
+#    ⇒ 必须显式白名单放行（同 `account_snapshot.csv` 的道理），**顺序要紧：放在 *.csv 之后才生效**。
+!manu/memory/records/*.csv
 
 # ---- 报告产物（权威副本在服务器 /mnt/data/siping/runs/etf_rotation/）----
 # 🔴 按铁律 §十四.93 第 3 条：「权威产物（报告 / 决策 / 计划 / 指纹表）不入库，
