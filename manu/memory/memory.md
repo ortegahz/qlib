@@ -7429,6 +7429,15 @@ CSV 台账（30 列）已装「当前/目标权重、动作、否决理由、顺
     ⇒ 与日历一致，但比节奏**提前 1 个交易日**。
 - 🔴 改常量前**还要一并看** `manu/etf_rotation/daily/calendar_gate.py:289-300`
   —— 它把 `NEXT_SIGNAL_DATE` / `NEXT_EXECUTION_DATE` 当**锁定的下一正式调仓日**处理。
+- 🔴 **另两条同源实测（务必与上面一起看，缺一条就会误判）**：
+  - **静默防守窗口**：`daily_config.py:282-283` ⇒ `SILENT_DEFENSE_START="2026-11-06"` / `SILENT_DEFENSE_END="2026-11-30"`
+    （**含端点**）⇒ **11-30 本身落在窗口内** ⇒ 按用户锁死口径「期间**严禁**生成任何买入指令」。
+    🟡 **代码层面不拦**：`is_silent_defense_window` / `describe_day` 只出现在 `calendar_gate.py` 内部与测试里
+    （`main.py` 的 calendar_gate 阶段只查 `is_trading_day`）⇒ 这是**策略口径**问题，不是代码拦截问题。
+  - **盘口差异**：研究链 `manu/etf_rotation/config.py:122`（`EXECUTION_LAG_DAYS=1`）在每日链注释里被写明是
+    「**T+1 收盘**」（`daily_config.py:278`）⇒ 信号 11-30 收盘 ⇒ **12-01 尾盘**执行，**与用户日历一致**；
+    而每日链 `NEXT_EXECUTION_DATE` 用的是「**T+1 开盘**」⇒ 信号 12-01 ⇒ 12-02 开盘
+    ⇒ **两条链差一个盘口**，且 `daily_config.py:278` 原文要求「执行卡里**必须显式标注**这个差异，不许混称」。
 
 ### ⑥ 📏 新铁律 `rules.md §十四.136`（**6 条** · 2026-11-25 续·第三十一轮）
 
