@@ -8,14 +8,14 @@
 #   本脚本只做「编排 + 记账」，自身不产出任何策略结论：
 #   不联网、不调 LLM、不跑 akshare、不训练、不回测；重活都在被调用的子脚本里。
 #
-# 【怎么跑】（服务器工作副本 /tmp/pycharm_project_658d3fc4）
+# 【怎么跑】（服务器工作副本 /tmp/pycharm_project_3b68a403）
 #   bash manu/etf_rotation/run_gates.sh                     # 全量（含 repro 段，耗时数分钟）
 #   bash manu/etf_rotation/run_gates.sh --skip-repro         # 轻量版：跳过最重的 repro 段
 #   bash manu/etf_rotation/run_gates.sh --run-root DIR --log FILE
 #   bash manu/etf_rotation/run_gates.sh --help
 #
 # 【参数】
-#   --repo-root PATH  仓库根（默认 /tmp/pycharm_project_658d3fc4）
+#   --repo-root PATH  仓库根（默认 /tmp/pycharm_project_3b68a403）
 #   --run-root PATH   产物根（默认 <结果根> = /mnt/data/siping/runs/etf_rotation_results）
 #   --artifact-root PATH  闸门断言对象（交付件根）；缺省 = 最新完整快照，没有则回落 canonical
 #   --log PATH        日志路径（默认 $RUN_ROOT/_gates_latest.log）
@@ -36,7 +36,7 @@
 
 set -uo pipefail
 
-REPO_ROOT="/tmp/pycharm_project_658d3fc4"
+REPO_ROOT="/tmp/pycharm_project_3b68a403"
 #: 🔴 **结果落点根**（可被环境变量 `ETF_ROTATION_RESULTS_ROOT` 覆盖 ⇒ 整棵树可搬家）
 #:    产物根 = 结果根本身（与 `daily_config.RESEARCH_RUN_ROOT` 同口径）
 RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-/mnt/data/siping/runs/etf_rotation_results}"

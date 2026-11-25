@@ -184,7 +184,8 @@ def build_portfolio(
     cand = momentum_score(cand)
 
     # ---- 个股映射分 E = W × S ----
-    alpha = map_scores_to_etfs(holdings, scores, asof)
+    # 🔴 coverage 阈值**显式传参**（口径 ≡ config.MIN_E_COVERAGE ≡ V2 回测同值）。
+    alpha = map_scores_to_etfs(holdings, scores, asof, min_coverage=C.MIN_E_COVERAGE)
     alpha_cols = ["etf_code", "alpha_score", "coverage", "coverage_ok", "n_stocks_scored"]
     cand = cand.merge(alpha[alpha_cols].rename(columns={"etf_code": "code"}), on="code", how="left")
     cand["alpha_score"] = cand["alpha_score"].astype(float)

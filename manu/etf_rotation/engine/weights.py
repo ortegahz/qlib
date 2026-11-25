@@ -26,6 +26,23 @@ import config as C  # noqa: E402
 #: akshare 的「市场代码」→ qlib 的交易所前缀
 _MARKET_TO_PREFIX = {"101": "SH", "102": "SZ", "103": "BJ"}
 
+#: 🔴 **coverage 过滤阈值（``map_scores_to_etfs`` 的默认值）**。
+#:
+#: 【口径对齐铁律】本值必须 ≡ ``config.MIN_E_COVERAGE``（实盘入池口径）
+#: ≡ ``v2/config_v2.MIN_COVERAGE``（**V2 冻结回测实际使用的阈值**）——
+#: 三者**同值**才允许入池。机器守卫 = ``tests/test_min_coverage_alignment.py``，
+#: 任一漂移即**红灯**（不许靠「默认值刚好一样」蒙混过关）。
+#:
+#: 🔴 2026-11-25 取证结论：V2 冻结回测走 ``v2/run_v2.py`` → ``min_coverage=float(C.MIN_COVERAGE)``
+#:    （C = ``v2/config_v2``）⇒ 回测阈值 **0.5**；实盘 ``config.MIN_E_COVERAGE`` **0.5**
+#:    ⇒ **两链本就同口径**，此前只是靠「函数默认值」隐式生效、来源不唯一。
+#:    本次改为**显式传参 + 常量化**，**不改变入池、不改紧池子**。
+#:
+#: （刻意写**字面量**而非运行期引用 ``config``：``v2/`` 目录不在镜像树内 ⇒
+#:   两棵镜像树无法在运行期同时取到回测口径；锁字面量 + 等值守卫测试，
+#:   比运行期耦合更能证明「实盘口径 == 回测口径」，且 import 期零意外依赖。）
+DEFAULT_MIN_COVERAGE = 0.5
+
 
 def to_qlib_instrument(code: str, market: str | None = None) -> str | None:
     """把 akshare 的股票代码转成 qlib 的 instrument 形式（``SH600000``）。
@@ -96,7 +113,7 @@ def map_scores_to_etfs(
     holdings: pd.DataFrame,
     scores: pd.DataFrame,
     date: pd.Timestamp,
-    min_coverage: float = 0.5,
+    min_coverage: float = DEFAULT_MIN_COVERAGE,
 ) -> pd.DataFrame:
     """算出某一天的 ETF 映射分 ``E``。
 
@@ -105,7 +122,9 @@ def map_scores_to_etfs(
     holdings : W 的原料（load_holdings 的输出）
     scores   : 个股分数，列 date, instrument, score（**已按 date 过滤为单日**）
     date     : 调仓日
-    min_coverage : 覆盖率下限；低于此值的 ETF 标 ``coverage_ok=False``（不参与选股）
+    min_coverage : 覆盖率下限；低于此值的 ETF 标 ``coverage_ok=False``（不参与选股）。
+        默认 = :data:`DEFAULT_MIN_COVERAGE`（≡ ``config.MIN_E_COVERAGE``
+        ≡ ``v2/config_v2.MIN_COVERAGE``）；调用方**应当显式传参**以免口径漂移。
 
     返回：etf_code, etf_name, alpha_score(=E), coverage, n_stocks_scored, weight_scored
     """

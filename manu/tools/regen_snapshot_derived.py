@@ -31,6 +31,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -285,9 +286,21 @@ def main(argv: list[str] | None = None) -> int:
     markdown = _render(new_result, account=account, asof=asof)
     report_md_path.write_text(markdown, encoding="utf-8")
 
+    #: 🔴 2026-11-23：读回**原** `created_at`（快照身份）⇒ 重生成不改写创建时刻
+    _created_at: datetime | None = None
+    _raw_created = str(manifest.get("created_at") or "")
+    if _raw_created:
+        try:
+            _created_at = datetime.fromisoformat(_raw_created)
+        except ValueError:
+            _created_at = None
     snap = snap_mod.Snapshot(snap_dir.parent, asof=asof,
                              run_id=str(manifest.get("run_id") or snap_dir.name),
-                             live_trade=bool(manifest.get("live_trade", False)))
+                             live_trade=bool(manifest.get("live_trade", False)),
+                             #: 🔴 2026-11-23：**派生层重生成不得改写快照的「创建时刻」**
+                             #:    （`created_at` 是快照**身份**的一部分 ⇒ 重生成只该刷新
+                             #:    `finalized_at` ⇒ 否则一份 11-20 的快照会被标成 11-23 创建）
+                             created_at=_created_at)
     snap._stages = list(manifest.get("stages") or [])
     snap._skipped = list(manifest.get("skipped") or [])
     snap._notes = list(manifest.get("notes") or [])

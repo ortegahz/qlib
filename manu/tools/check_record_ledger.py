@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 
 #: 台账默认落点（相对工程根）
 LEDGER_REL = "manu/memory/records/etf_rotation_daily_ledger.csv"

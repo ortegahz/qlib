@@ -45,7 +45,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 
 RUN_GATES_REL = "manu/etf_rotation/run_gates.sh"
 TOOLS_DIR_REL = "manu/tools"

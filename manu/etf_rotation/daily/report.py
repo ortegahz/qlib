@@ -549,9 +549,20 @@ def _render_pipeline(result: Mapping, account: object,
         if isinstance(_guard, Mapping) and _get(_guard, "applied"):
             _g_blocked = _get(_guard, "blocked") or []
             _g_breach = _get(_guard, "concentration_breaches") or []
+            # 🔴 2026-11-25：`int(... or 1)` 会把 **0（不限同族）** 吞成 1 ⇒ 口径说谎
+            #    （V2 冻结件 `allow_theme_cap=false` ⇒ 生效同族上限 = 0）⇒ 显式判空。
+            _g_mpt = _get(_guard, "max_per_theme")
+            _g_mpt = None if _g_mpt is None else int(_g_mpt)
+            _g_mpt_txt = (
+                "不限（0）" if _g_mpt == 0
+                else (f"{_g_mpt}" if _g_mpt is not None else "缺省（回落 1）")
+            )
+            _g_head_txt = (
+                "同主题数量不限（生效同族上限 = 0）" if _g_mpt == 0
+                else f"同主题最终只留 {(_g_mpt if _g_mpt is not None else 1)} 只"
+            )
             lines.append(
-                f"**Final Theme Guard（同主题最终只留 1 只，MAX_PER_THEME="
-                f"{int(_get(_guard, 'max_per_theme') or 1)}）**"
+                f"**Final Theme Guard（{_g_head_txt}，MAX_PER_THEME={_g_mpt_txt}）**"
                 + (f"：拦下 {len(_g_blocked)} 行新买"
                    + ("（" + "、".join(
                        f"{str(_get(b, 'code'))}（主题 {_get(b, 'theme')}）"

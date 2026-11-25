@@ -43,7 +43,7 @@ V2_DIR_CANDIDATES = (
     if os.environ.get("ETF_ROTATION_REPO_ROOT")
     else None,
     Path(__file__).resolve().parents[2] / "manu" / "etf_rotation" / "v2",
-    Path("/tmp/pycharm_project_658d3fc4/manu/etf_rotation/v2"),
+    Path("/tmp/pycharm_project_3b68a403/manu/etf_rotation/v2"),
 )
 V2_DIR = next((p for p in V2_DIR_CANDIDATES if p and (p / "config_v2.py").exists()), None)
 if V2_DIR is None:  # pragma: no cover - 环境兜底

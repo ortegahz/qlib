@@ -25,7 +25,7 @@ Qlib 穿透打分 → 组合映射 → 邮件推送）。它与 `manu/etf_rotati
       * `ETF_ROTATION_RESULTS_ROOT` **结果根**（默认 /mnt/data/siping/runs/etf_rotation_results）
         ⇒ 产物/快照/报告/日志（研究链 canonical、每日链 `daily/`、`snapshots/`、`logs/`）
     🔴 **所有路径都可被环境变量覆盖**（服务器上 cron 的环境极简 ⇒ 必须能注入）
-    ETF_ROTATION_REPO_ROOT   工程根（默认 /tmp/pycharm_project_658d3fc4）
+    ETF_ROTATION_REPO_ROOT   工程根（默认 /tmp/pycharm_project_3b68a403）
     ETF_ROTATION_RUN_ROOT    每日产物根（默认 <RESULTS_ROOT>/daily）
     ETF_ROTATION_LOG_DIR     日志目录（默认 <RESULTS_ROOT>/logs）
     ETF_ROTATION_QL_PY       量化层解释器（默认 /home/huangzhe/anaconda3/envs/ql/bin/python）
@@ -74,7 +74,7 @@ ETF_ROTATION_RESULTS_ROOT = Path(
     )
 ).expanduser()
 #: 工程根（服务器工作副本）
-REPO_ROOT = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_658d3fc4"))
+REPO_ROOT = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_3b68a403"))
 #: 研究链产物根（每日链路**只读**参照，不写）
 #:    落点 `<RESULTS_ROOT>`（研究链交付件 + 每日链的父目录）
 RESEARCH_RUN_ROOT = ETF_ROTATION_RESULTS_ROOT
@@ -135,7 +135,7 @@ QLIB_DATASET_ROOT = Path(
 QLIB_CN_DATA = QLIB_DATASET_ROOT / "cn_data"
 
 #: TradingAgents 工作副本（llm env 侧）
-TRADINGAGENTS_DIR = Path(os.environ.get("ETF_ROTATION_TA_DIR", str(REPO_ROOT / "TradingAgents")))
+TRADINGAGENTS_DIR = Path(os.environ.get("ETF_ROTATION_TA_DIR", "/tmp/pycharm_project_59a2a4f0"))
 
 #: SMTP 授权码 env 文件（🔴 **不进仓库**；须 0600）
 SMTP_SECRETS_FILE = Path(
@@ -168,18 +168,20 @@ LOCK_FILE_SEND = Path(
 )
 
 # =============================================================================
-# 2. 实盘账户（2026-11-19 用户口径；**推导值见 account_state.py**）
+# 2. 实盘账户（2026-11-23 用户口径；**推导值见 account_state.py**）
 # =============================================================================
-#: 总资产（元）= 现金 23,370.51 + 持仓市值 7,014.70
-#: 🔴 2026-11-19 换口径（用户 11-19 收盘后给的两张券商截图）：旧口径
-#:    （2026-11-05：30,035.57 / 23,367.37 / 6,668.20）**整体作废**。
-TOTAL_ASSETS = 30_385.21
+#: 总资产（元）= 现金 23,371.80 + 持仓市值 7,053.20
+#: 🔴 2026-11-23 换口径（用户 11-23 收盘后给的券商首页截图，单一现价口径，截图时刻 15:41）：
+#:    **2026-11-20 口径整体作废**（30,501.07 / 23,370.87 / 7,130.20）。
+#:    ⚠️ 11-20 那份披露**随本次换口径作废**（不是被抹平，是被**新的一份自洽快照取代**）
+#:    （11-23 截图只有一个现价口径，且三项金额可精确对账）⇒ 新披露见 `account_state.py`。
+TOTAL_ASSETS = 30_425.00
 #: 可用现金（元）
-CASH = 23_370.51
+CASH = 23_371.80
 #: ETF 持仓市值（元）
-MARKET_VALUE = 7_014.70
+MARKET_VALUE = 7_053.20
 #: 账户快照日（用户持仓截图日）
-ACCOUNT_SNAPSHOT_DATE = "2026-11-19"
+ACCOUNT_SNAPSHOT_DATE = "2026-11-23"
 #: 唯一在保底仓
 PRIMARY_HOLDING_CODE = "512800"
 PRIMARY_HOLDING_NAME = "银行ETF华宝"
@@ -199,14 +201,14 @@ CASH_RESERVE_RATIO = 0.20
 #:   —— 与研究链 `config.MAX_SINGLE_WEIGHT` **同值**（每日链独立复制，避免跨链传导）。
 MAX_SINGLE_WEIGHT = 0.20
 #: 单只标的**金额上限**（元）—— = 权重上限 × 总资产（**随账户缩放**，不再是写死的 6,000）
-#:   ⇒ 与文档「单标的 20% 上限」同源；当前总资产下 = 6,007.11 元。
+#:   ⇒ 与文档「单标的 20% 上限」同源；当前总资产下 = 6,085.00 元（0.20 × 30,425.00）。
 MAX_POSITION_AMOUNT = round(MAX_SINGLE_WEIGHT * TOTAL_ASSETS, 2)
 #: 最小交易单位（手）；**必须向下取整**到它的整数倍
 LOT_SIZE = 100
 #: 调仓后**必须保留**的现金缓冲下限 / 上限（元）
 #: 🔴 2026-11-11（文档 §二.4「保留 >= 400 元现金缓冲」）：绝对下限由 200 ⇒ **400**。
 #:    ⚠️ 实际生效下限 = max(绝对下限, 比例下限=总资产×20%) ⇒ 本账户（总资产约 3 万）下
-#:    **比例下限（6,007 元）压倒绝对下限** ⇒ **本轮判定结果不变**（口径对齐，不是行为变更）。
+#:    **比例下限（6,085 元）压倒绝对下限** ⇒ **本轮判定结果不变**（口径对齐，不是行为变更）。
 CASH_BUFFER_MIN = 400.0
 CASH_BUFFER_MAX = 400.0
 #: 🔴 2026-11-18（用户目标文档 §三.2 + 审计缺陷 `no_drawdown_brake` · high 级）：
@@ -319,7 +321,7 @@ QLIB_INCREMENT_LEDGER = Path(
 #: 文件名带**分析日期**（`report_<YYYYMMDD>.md`）⇒ 便于回看与版本化。
 #: 🔴 2026-11-10 铁律十六（落点双根化）：报告**也是「结果」** ⇒ 必须落
 #:    **结果根** `<RESULTS_ROOT>/reports/`，**不许**再落仓库内 `manu/report/`
-#:    （服务器上那是 `/tmp/pycharm_project_658d3fc4/manu/report` ⇒ 既不在项目
+#:    （服务器上那是 `/tmp/pycharm_project_3b68a403/manu/report` ⇒ 既不在项目
 #:    专属根之下，又会把工程目录变成产物堆放点）。
 #:    ⇒ 报告与快照 / canonical 同属结果根，**默认不回传 host**。
 REPORT_DIR = Path(

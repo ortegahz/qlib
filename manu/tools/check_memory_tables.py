@@ -12,7 +12,7 @@ r"""只读检查 memory 主档里 markdown 表格的**结构**完整性。
 用法
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/check_memory_tables.py
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/check_memory_tables.py \
-        --project-dir /tmp/pycharm_project_658d3fc4 \
+        --project-dir /tmp/pycharm_project_3b68a403 \
         --files manu/memory/memory.md --files manu/memory/memory_compact.md \
         --json-out <落点根>/runs/_memtbl_check/result.json
     （`--files` 可重复传入；相对路径按 `--project-dir` 解析，找不到再按当前工作目录解析。）
@@ -57,7 +57,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 #: memory **四层** ＋ 逐日 record 目录（相对工程根）
 #: 🔴 2026-11-20 起：**四层全部纳入默认集**（此前只有 memory.md ＋ memory_compact.md）
 #:    ⇒ rules.md（铁律层）＋ .slim_memory.md（精简层）＋ records/*.md（逐日记录层）**此前不受检**。

@@ -18,7 +18,7 @@
 
 ```bash
 ssh -F /dev/null -o StrictHostKeyChecking=no -p 32222 huangzhe@192.168.99.40
-# 工程目录  : /tmp/pycharm_project_658d3fc4
+# 工程目录  : /tmp/pycharm_project_3b68a403
 # 产物根    : /mnt/data/siping/runs/etf_rotation
 # 日志目录  : /mnt/data/siping/runs/etf_rotation/_overnight_20261109/
 # ql 解释器 : /home/huangzhe/anaconda3/envs/ql/bin/python
@@ -66,7 +66,7 @@ cat /mnt/data/siping/runs/etf_rotation/_overnight_20261109/summary.md
 |---|---|---|
 | 步骤 1 | `bash manu/etf_rotation/rebuild_baseline.sh --asof 2026-11-03 --out-dir <run_root>`（自带备份，幂等） | 10–90 分钟（取决于 LLM） |
 | 步骤 1（**LLM 已成功、后续步骤 FAIL**） | 🔴 **加 `--reuse-decision`**：`run_pipeline.sh --reuse-decision` —— 复用本轮已落盘决策，**不重跑 25 分钟 LLM**（决策件已落盘，重跑会换一代意见；前置校验「决策比上下文新 + 报告内容指纹与登记一致」保证三环同代） | 2–8 分钟 |
-| 步骤 2 | `cd /tmp/pycharm_project_658d3fc4 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 --full` | 10–40 分钟 |
+| 步骤 2 | `cd /tmp/pycharm_project_3b68a403 && /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-05 --full` | 10–40 分钟 |
 | 步骤 3 | `python manu/tools/regen_fingerprint_table.py --artifact-root <run_root>` 再 `--dry-run` 复验 | <1 分钟 |
 | 步骤 4 | `nice -n 10 bash manu/etf_rotation/run_gates.sh --skip-repro` | 10–25 分钟 |
 
@@ -176,7 +176,7 @@ LLM 单次硬上限 5400s（90 分钟）；超时则该步判红并自动降级�
 ### 重跑方式（**不要重跑 25 分钟 LLM**）
 本轮 LLM **已成功**（`tradingagents_decision.md` / `.json` 已落盘且有 sha1）⇒
 ```bash
-cd /tmp/pycharm_project_658d3fc4
+cd /tmp/pycharm_project_3b68a403
 bash manu/etf_rotation/run_pipeline.sh --asof 2026-11-03 --reuse-decision   # 不重跑 LLM
 # 之后重跑重建收尾：指纹表重生成 + --dry-run 复验
 ```

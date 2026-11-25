@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-REPO = Path("/tmp/pycharm_project_658d3fc4")
+REPO = Path("/tmp/pycharm_project_3b68a403")
 sys.path.insert(0, str(REPO / "manu" / "etf_rotation" / "daily"))
 import daily_config as DC  # noqa: E402  （落点常量单一事实源）
 import stage1_rolling_increment as SRI  # noqa: E402

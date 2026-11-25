@@ -300,6 +300,30 @@ def load_account_from_json(path: str | Path) -> dict:
     }
 
 
+def _same_theme_cap_off(rep: dict) -> bool:
+    """报告里的「同族上限」是否**已关**（``max_per_theme == 0`` ⇒ 同族数量不限）。
+
+    🔴 2026-11-25（提示词 vs V2 冻结参数打架的修法）：
+    V2 冻结件 `frozen_params_wf.json` 里 ``allow_theme_cap=false`` ⇒ **同族上限=关**
+    （回测里「不限制同族数量」最优）；`analyze.py` 已把它写成
+    ``report["meta"]["params"]["max_per_theme"] = 0`` ⇒ 本函数与规则层**同一事实源**。
+
+    🔴 **必须用 `is None` 判空**：`0` 是**合法值**（「不限」）⇒ 用 `or` / `if not`
+    会被吞掉（把「不限」误当成「字段缺失」）⇒ 提示词就会继续架空 V2 硬参数。
+    🔴 字段缺失 / 读不出数字 ⇒ ``False`` ⇒ 提示词**逐字节保持现状**（fail-safe）。
+    """
+    params = (rep.get("meta") or {}).get("params")
+    if not isinstance(params, dict):
+        return False
+    raw = params.get("max_per_theme")
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        return int(raw) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def build(run_root: Path, report_md: Path, backtest_new: Path | None,
           backtest_old: Path | None, backtest_mid: Path | None = None,
           quality: Path | None = None, prices_path: str | None = None,
@@ -483,20 +507,44 @@ def build(run_root: Path, report_md: Path, backtest_new: Path | None,
         _ov_available = False
         _ov_reason = f"重合度计算异常：{type(exc).__name__}"
         _ov_pairs = []
+    # 🔴 2026-11-25：3.5 引言的**同族口径**必须跟着 V2 冻结参数走。
+    #    事实源 = 报告 `meta.params.max_per_theme`（`analyze.py` 写入口，与规则层同源）。
+    #    `==0` ⇒ 同族上限=关（V2 `allow_theme_cap=false`）⇒ 同族**不构成**一票否决依据
+    #    （否则提示词的软约束会架空 V2 回测出的硬参数）；字段缺失 / >0 ⇒ 默认口径
+    #    ⇒ 提示词**逐字节保持现状**（fail-safe）。
+    _theme_cap_off = _same_theme_cap_off(rep)
     if _ov_available:
         add("## 3.5. 候选池重合度筛查（一票否决依据）")
         add("")
-        add("> 规则层已按「**成分重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95**」逐对拦截"
-            "（冲突对不共存）；下表是**更宽口径**的预警"
-            "（成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 或同族）——"
-            "**这张表就是你行使一票否决权的合法依据**："
-            "凡表中**同族**、或成分重叠/相关性明显偏高的候选对，"
-            "你都可以据此**否决**其中一只"
-            "（否决 ⇒ 该标的从候选池剔除 ⇒ 规则层顺延补位）。"
-            "**否决后的确定性后果**：规则层会**顺延挑选下一个不同主题的资产**"
-            "（等权口径不变：顺延者沿用被否决者的目标权重；"
-            "顺延者必须与已入选集合**不同族**，且不构成规则层冲突对）；"
-            "候选池里没有合格顺延者时**不强行补**（宁缺毋滥）。")
+        if _theme_cap_off:
+            # 🔴 同族上限=关 ⇒ **同族不是否决依据**：宽口径预警里也只留成分/相关性两条。
+            add("> ℹ️ **本轮同族上限=关（V2 冻结参数 `allow_theme_cap=false`）** ⇒ "
+                "**同族不构成一票否决依据**；"
+                "只有规则层硬拦口径（成分重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95）"
+                "才可据此否决。")
+            add("> 规则层已按「**成分重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95**」逐对拦截"
+                "（冲突对不共存）；下表是**更宽口径**的预警"
+                "（成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80）——"
+                "**这张表就是你行使一票否决权的合法依据**："
+                "凡表中成分重叠/相关性明显偏高的候选对，"
+                "你都可以据此**否决**其中一只"
+                "（否决 ⇒ 该标的从候选池剔除 ⇒ 规则层顺延补位）。"
+                "**否决后的确定性后果**：规则层会**顺延挑选下一个不同主题的资产**"
+                "（等权口径不变：顺延者沿用被否决者的目标权重；"
+                "顺延者必须与已入选集合**不同族**，且不构成规则层冲突对）；"
+                "候选池里没有合格顺延者时**不强行补**（宁缺毋滥）。")
+        else:
+            add("> 规则层已按「**成分重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95**」逐对拦截"
+                "（冲突对不共存）；下表是**更宽口径**的预警"
+                "（成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 或同族）——"
+                "**这张表就是你行使一票否决权的合法依据**："
+                "凡表中**同族**、或成分重叠/相关性明显偏高的候选对，"
+                "你都可以据此**否决**其中一只"
+                "（否决 ⇒ 该标的从候选池剔除 ⇒ 规则层顺延补位）。"
+                "**否决后的确定性后果**：规则层会**顺延挑选下一个不同主题的资产**"
+                "（等权口径不变：顺延者沿用被否决者的目标权重；"
+                "顺延者必须与已入选集合**不同族**，且不构成规则层冲突对）；"
+                "候选池里没有合格顺延者时**不强行补**（宁缺毋滥）。")
         add("")
         _flagged = [p for p in _ov_pairs if p.get("screen_flag")]
         if not _flagged:

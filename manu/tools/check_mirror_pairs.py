@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 
 #: 镜像根：活链在 `manu/etf_rotation/`，镜像在 `manu/`（同相对路径）
 MIRROR_ROOT_REL = "manu/etf_rotation"

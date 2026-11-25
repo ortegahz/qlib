@@ -1,0 +1,14 @@
+{
+  "_comment": "V1 冻结件 md5 基线清单（B1 闸门**主判据**）。\n【为什么用它当判据】mtime 会被 checkout / rsync 刷新；git 内容口径在服务器上天然显示 ` M`（服务器检出落后于开发仓）⇒ 两者都会**常年红**。\nmd5 基线清单**对环境免疫**：不需要 git、不看 mtime ⇒ 服务器没 git 也有牙齿。\n【冻结集】manu/etf_rotation/{config,backtest,qlib_scores}.py ＋ manu/etf_rotation/engine/ 下**全部** .py（V2 绝不许就地改写 V1）。\n🔴 manu/etf_rotation/analyze.py 属「每日链分析层」（允许演进）⇒ **不在冻结集**，只披露不判红。\n【路径口径】files 的键相对**项目根**（ETF_V2_PROJECT_ROOT，默认 /tmp/pycharm_project_3b68a403）。\n【重新生成】改完冻结件后**必须显式**执行下面这行（不许让清单与磁盘漂移 ⇒ 测试会红）：\ncd <项目根> && python3 -c \"import hashlib,json,pathlib,datetime;base=pathlib.Path('manu/etf_rotation');ps=[base/n for n in ('config.py','backtest.py','qlib_scores.py')]+sorted((base/'engine').glob('*.py'));p=base/'v2/probes/v1_frozen_md5.json';m=json.loads(p.read_text(encoding='utf-8'));m['files']={str(x):hashlib.md5(x.read_bytes()).hexdigest() for x in ps};m['generated_at']=datetime.datetime.now().astimezone().isoformat(timespec='seconds');p.write_text(json.dumps(m,ensure_ascii=False,indent=2)+chr(10),encoding='utf-8')\"\n【只读核对】\ncd <项目根> && md5sum manu/etf_rotation/config.py manu/etf_rotation/backtest.py manu/etf_rotation/qlib_scores.py manu/etf_rotation/engine/*.py\n【怎么改】只改 files 里的 md5 值（路径集合不许增删），其余字段保持不动。",
+  "generated_at": "2026-11-25T10:38:00+08:00",
+  "frozen_set_note": "V1 核心 ETF 层（config / backtest / qlib_scores / engine）——V2 绝不许就地改写。analyze.py 属每日链分析层，允许演进，只披露不判红。",
+  "files": {
+    "manu/etf_rotation/config.py": "324d75caa94176ac45bc3bff5da1dfcf",
+    "manu/etf_rotation/backtest.py": "b4b34f3d89c5ecc8bcc5002c8d8a0201",
+    "manu/etf_rotation/qlib_scores.py": "9fe2a022f5570c774a5241b343c27528",
+    "manu/etf_rotation/engine/features.py": "14b0ebd8fcc512b0fa4d076bd0b8b8ef",
+    "manu/etf_rotation/engine/filters.py": "37869082a13933338c2fc825a5e56d80",
+    "manu/etf_rotation/engine/portfolio.py": "de71549326e624600257f7ea3a20681f",
+    "manu/etf_rotation/engine/weights.py": "fd9c461d96241adb5c545ad9e6c5e1c8"
+  }
+}

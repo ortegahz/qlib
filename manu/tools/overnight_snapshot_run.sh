@@ -24,7 +24,7 @@
 # ============================================================
 set -uo pipefail
 
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 #: 🔴 **结果落点根**（单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
 #:    `ETF_ROTATION_RESULTS_ROOT`）⇒ 产物 / 快照 / 报告 / 日志**留在服务器**，
 #:    全部落在这棵树下（**不再拷回 host**）。

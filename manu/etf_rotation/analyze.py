@@ -1014,7 +1014,10 @@ def _rebuild_chain(
     cand = momentum_score(cand)
 
     # ---- E = W × S（复用 engine/weights.map_scores_to_etfs）----
-    alpha = map_scores_to_etfs(holdings, scores, asof)
+    # 🔴 coverage 阈值**显式传参**：口径唯一事实源 = ``config.MIN_E_COVERAGE``
+    #    ≡ ``v2/config_v2.MIN_COVERAGE``（**V2 冻结回测同值 0.5**）
+    #    ⇒ 实盘与回测**同口径**（此前靠函数默认值隐式生效、来源不唯一）。
+    alpha = map_scores_to_etfs(holdings, scores, asof, min_coverage=C.MIN_E_COVERAGE)
     alpha_cols = ["etf_code", "alpha_score", "coverage", "coverage_ok", "n_stocks_scored"]
     cand = cand.merge(
         alpha[alpha_cols].rename(columns={"etf_code": "code"}), on="code", how="left"
@@ -1883,6 +1886,8 @@ def _risk_disclosure(
     micro: dict | None = None,
     lookahead: dict | None = None,
     ma_windows: tuple[int, int] | None = None,
+    nav_state: dict | None = None,
+    filter_stats: dict | None = None,
 ) -> list[dict]:
     """逐条风险披露（**禁止空数组**；数字只来自实测产物，缺产物就明说「产物不可得」）。
 
@@ -1898,6 +1903,79 @@ def _risk_disclosure(
     bt = backtest["data"] if backtest else None
     bt_path = backtest["path"] if backtest else None
     items: list[dict] = []
+    # 🔴 2026-11-25（点 3 口径归位）：**过滤链的真实分解**（实测产物，不是推断）。
+    #    背景：披露此前写「候选池文件共 1664 行，经流动性/属性过滤后剩 18 只 ⇒ 选股范围被人为收窄」
+    #    ⇒ 把**三道网**（流动性 / coverage 闸门 / 绝对动量）混写成两道，
+    #    并且把锅甩给 coverage 闸门（e_covered）。实测真因是**绝对动量闸门**（190→18）。
+    #    ⇒ 这里按 ``filter_stats.stages`` 逐道取实测 n_in/n_out，**不许编**；
+    #      拿不到 filter_stats ⇒ 回落成旧表述（fail-safe，不编数字）。
+    _fs = filter_stats or {}
+    _stages = [st for st in (_fs.get("stages") or []) if isinstance(st, dict)]
+    #: 逐道分解文本（例：1664→292（流动性）、292→190（标的池属性）、190→18（绝对动量）…）
+    _chain_parts: list[str] = []
+    #: 流动性网（第一刀）：它的淘汰**大部分是「行情数据覆盖缺口」**，不是筛选 ⇒ 不算「瓶颈」
+    _liq_stage = next(
+        (st for st in _stages if str(st.get("stage")) == "filter_1_liquidity"), None)
+    #: 砍得最多的那一道（= 真正的瓶颈）—— **只看流动性网之后的各道**
+    _bottleneck: tuple[dict, int] | None = None
+    for _st in _stages:
+        _n_in = int(_st.get("n_in", 0) or 0)
+        _n_out = int(_st.get("n_out", 0) or 0)
+        _label = str(_st.get("title") or _st.get("stage") or "")
+        _chain_parts.append(f"{_n_in}→{_n_out}（{_label}）")
+        _drop = _n_in - _n_out
+        if _liq_stage is not None and _st is _liq_stage:
+            continue
+        if _bottleneck is None or _drop > _bottleneck[1]:
+            _bottleneck = (_st, _drop)
+    _chain_txt = "、".join(_chain_parts)
+    #: 🔴 2026-11-25 审计修正：结论句**必须随实测瓶颈派生** ——
+    #:    恒定写「动量风控」⇒ 某轮瓶颈若是 coverage / 去重网时仍然说动量
+    #:    ⇒ 正是本轮要修的「披露说假话」那一类问题。
+    _bottleneck_stage = str(_bottleneck[0].get("stage") or "") if _bottleneck else ""
+    _bottleneck_title = str(
+        (_bottleneck[0].get("title") or _bottleneck[0].get("stage") or "")
+    ) if _bottleneck else ""
+    if _bottleneck_stage == "extra_absolute_momentum":
+        _bottleneck_conclusion = (
+            " ⇒ 结论：候选池窄是**动量风控**的结果（跨类资产被剔只是其中一环，不是主因）；"
+            "要更宽的池子只能动**选股口径**（绝对动量阈值 / MIN_N_HOLDINGS 放宽）"
+            "⇒ 属**回测口径**（V2 冻结件）⇒ 本轮不动。"
+        )
+    else:
+        _bottleneck_conclusion = (
+            " ⇒ 结论：候选池窄的主因是**实测点名的瓶颈**"
+            f"（{_bottleneck_title or '过滤链后段'}）；"
+            "要更宽的池子必须动**对应的选股 / 过滤口径**"
+            "⇒ 属**回测口径**（V2 冻结件）⇒ 本轮不动。"
+        )
+    #: 流动性网的淘汰要**分因**：「有行情数据但阈值不合格」vs「压根没行情数据（覆盖缺口）」
+    #: （判据 = 淘汰行的 detail.n_days 是否可算 ⇒ 可算 = 当时有行情数据）
+    _liq_real_drop: int | None = None
+    _liq_gap: int | None = None
+    if _liq_stage is not None:
+        _liq_elim = _liq_stage.get("eliminated") or []
+        _liq_measured = sum(
+            1 for _r in _liq_elim
+            if (((_r or {}).get("detail") or {}).get("n_days")) is not None)
+        _liq_real_drop = _liq_measured
+        _liq_gap = len(_liq_elim) - _liq_measured
+    _n_with_px = _fs.get("n_with_price_data")
+    _n_without_px = _fs.get("n_without_price_data")
+    #: coverage 闸门（extra_pool_attribute）真实淘汰数 + 分因（数据缺口 / 穿透不足）
+    _attr_stage = next(
+        (st for st in _stages if str(st.get("stage")) == "extra_pool_attribute"), None)
+    _attr_drop: int | None = None
+    _n_gap = 0
+    _n_thin = 0
+    if _attr_stage is not None:
+        _attr_drop = int(_attr_stage.get("n_in", 0) or 0) - int(_attr_stage.get("n_out", 0) or 0)
+        for _row in (_attr_stage.get("eliminated") or []):
+            _det = ((_row or {}).get("detail") or {})
+            if _det.get("has_holdings_record") is False:
+                _n_gap += 1
+            else:
+                _n_thin += 1
     #: 🔴 2026-11-18：本轮实际的 MA 窗口（V2 冻结臂 = 0/0 ⇒ 无均线层缓解）
     _ma_in, _ma_out = (int(ma_windows[0]), int(ma_windows[1])) if ma_windows else (0, 0)
 
@@ -2122,11 +2200,40 @@ def _risk_disclosure(
                 + ("（**或**属防守资产＝v1 旧口径）"
                    if getattr(C, "POOL_ALLOW_DEFENSIVE_BYPASS", False)
                    else "（**严格口径：防守资产也不旁路**）")
-                + f"；候选池文件共 {n_universe_rows} 行，"
-                f"经流动性/属性过滤后剩 {n_pool} 只 ⇒ **选股范围被人为收窄**，"
-                f"跨类资产（商品 / 跨境 / 货币）的分散收益被系统性放弃。"
+                + f"；候选池文件共 {n_universe_rows} 行"
+                + (
+                    f"（其中只有 {_n_with_px} 只有行情数据，{_n_without_px} 只不在行情抓取覆盖内"
+                    "⇒ 那是**覆盖缺口**、不是阈值淘汰）"
+                    if (_n_with_px is not None and _n_without_px is not None) else ""
+                )
+                + (
+                    f"；过滤链实测分解 {_chain_txt} ⇒ 候选池 {n_pool} 只；"
+                    + (
+                        f"**真正把池压窄的是「{_bottleneck[0].get('title') or _bottleneck[0].get('stage')}」"
+                        f"（{int(_bottleneck[0].get('n_in', 0))}→{int(_bottleneck[0].get('n_out', 0))}"
+                        f"，砍掉 {_bottleneck[1]} 只）**"
+                        + (
+                            f"（流动性 / 规模 / 历史长度网里，**有行情数据但阈值不合格**只 "
+                            f"{_liq_real_drop} 只；其余 {_liq_gap} 只属**行情覆盖缺口**、不是筛选淘汰）"
+                            if (_liq_real_drop is not None and _liq_gap is not None) else ""
+                        )
+                        + f"，coverage 闸门只砍掉 {_attr_drop} 只"
+                        if (_bottleneck is not None and _attr_drop is not None) else
+                        "**池的收窄主要来自过滤链后段（见上分解）**"
+                    )
+                    + _bottleneck_conclusion
+                    if _chain_parts else
+                    f"；经流动性/属性过滤后剩 {n_pool} 只 ⇒ **选股范围被人为收窄**，"
+                    "跨类资产（商品 / 跨境 / 货币）的分散收益被系统性放弃。"
+                )
             ),
         }
+    )
+    #: 🔴 2026-11-25 审计修正：新分支**别把 `n_etfs_no_e` 整段丢掉**；
+    #:    但 **0 只不许写成句子**（「共 0 只 … 已全部被剔除」= 自相矛盾的伪计数口径）。
+    _n_no_e_note = (
+        f"（全市场 coverage 不足 {C.MIN_E_COVERAGE:.0%} 的 ETF 共 {n_etfs_no_e} 只）"
+        if n_etfs_no_e else ""
     )
     items.append(
         {
@@ -2134,8 +2241,15 @@ def _risk_disclosure(
             "title": "ETF 不可穿透：无 A 股成分的品种算不出 E",
             "severity": "high",
             "detail": (
-                f"本次共 {n_etfs_no_e} 只 ETF 的 coverage < {C.MIN_E_COVERAGE:.0%}"
-                f"（美股 / 港股通 / 实物金 / 商品期货 / 货币等）⇒ 它们的 E = W×S **算不出来**，"
+                (
+                    f"coverage 闸门（≥{C.MIN_E_COVERAGE:.0%}）本轮**真实淘汰 {_attr_drop} 只**"
+                    f"（成分数据缺失 {_n_gap} 只 / 有成分记录但穿透不足 {_n_thin} 只）"
+                    f"{_n_no_e_note}"
+                    "⇒ 这些标的的 E = W×S **算不出来**，"
+                    if _attr_drop is not None else
+                    f"本次共 {n_etfs_no_e} 只 ETF 的 coverage < {C.MIN_E_COVERAGE:.0%}"
+                    f"（美股 / 港股通 / 实物金 / 商品期货 / 货币等）⇒ 它们的 E = W×S **算不出来**，"
+                )
                 + (
                     "在 v1 旧口径下只能靠**自身动量**入选 ⇒ 等于绕过了个股层建模；"
                     "报告里已逐只标注 coverage，请人工核对是否接受。"
@@ -2226,21 +2340,55 @@ def _risk_disclosure(
             ),
         }
     )
+    # 🔴 2026-11-25（点 4b）：组合级回撤刹车**已实装**（`daily/nav_state.py` + `daily/daily_config.py`
+    #    `DRAWDOWN_BRAKE_THRESHOLD=0.15`）⇒ 旧的**静态**文案「仍**没有组合级硬止损**」
+    #    与事实打架 ⇒ 改成**按 nav_state 派生**：
+    #    * 有 nav_state ⇒ 标题「组合级回撤刹车已接线（急跌不再裸奔）」+ severity=medium，
+    #      detail 写出净值 / 峰值 / 回撤% / 阈值 / 是否触发；
+    #    * 无 nav_state（研究链单跑、净值不可得）⇒ **保留旧诚实文案**（severity=high）。
+    #    🔴 `id` 保持 `no_drawdown_brake` 不变（探针按 id 取值：probe_microstructure /
+    #    probe_lookahead / probe_snapshot_lookahead）。
+    _ns = nav_state or {}
+    _nav = _ns.get("nav")
+    _peak = _ns.get("peak")
+    _dd = _ns.get("drawdown")
+    _thr = _ns.get("threshold")
+    if _thr is None:
+        _thr = C.DRAWDOWN_BRAKE_THRESHOLD
+    _ma_txt = (
+        f"本轮入场 MA{_ma_in} 破位过滤 + 持仓 MA{_ma_out} 强制退出**部分缓解**"
+        if (_ma_in > 0 or _ma_out > 0) else
+        f"🔴 **本轮 MA 入/出 = {_ma_in}/{_ma_out}**（V2 冻结臂口径）"
+        "⇒ **没有任何均线层缓解**"
+    )
+    if _nav is not None and _peak is not None:
+        _dd_txt = f"{float(_dd):+.2%}" if _dd is not None else "不可得"
+        _brake_state = (
+            "🚨 **已触发** ⇒ 规则层整个组合切防守资产"
+            if _ns.get("in_brake") else "**未触发**"
+        )
+        _title = "组合级回撤刹车已接线（急跌不再裸奔）"
+        _severity = "medium"
+        _detail = (
+            f"🔴 **组合级回撤刹车已实装**：账户净值 {float(_nav):.2f} / 历史峰值 {float(_peak):.2f}"
+            f" ⇒ 回撤 {_dd_txt}（阈值 -{float(_thr):.0%}）⇒ {_brake_state}；"
+            "120 日动量在急跌段仍可能为正 ⇒ 该过滤**本身仍不是**回撤保护；"
+            + _ma_txt + "。"
+        )
+    else:
+        _title = "急跌无刹车：绝对动量过滤（mom120>0）在急跌里常常不触发"
+        _severity = "high"
+        _detail = (
+            "120 日动量在急跌段仍可能为正 ⇒ 该过滤**不是**回撤保护；"
+            + _ma_txt
+            + "，但仍**没有组合级硬止损** ⇒ 极端行情下回撤可能再次显著扩大。"
+        )
     items.append(
         {
             "id": "no_drawdown_brake",
-            "title": "急跌无刹车：绝对动量过滤（mom120>0）在急跌里常常不触发",
-            "severity": "high",
-            "detail": (
-                "120 日动量在急跌段仍可能为正 ⇒ 该过滤**不是**回撤保护；"
-                + (
-                    f"本轮入场 MA{_ma_in} 破位过滤 + 持仓 MA{_ma_out} 强制退出**部分缓解**"
-                    if (_ma_in > 0 or _ma_out > 0) else
-                    f"🔴 **本轮 MA 入/出 = {_ma_in}/{_ma_out}**（V2 冻结臂口径）"
-                    "⇒ **没有任何均线层缓解**"
-                )
-                + "，但仍**没有组合级硬止损** ⇒ 极端行情下回撤可能再次显著扩大。"
-            ),
+            "title": _title,
+            "severity": _severity,
+            "detail": _detail,
         }
     )
     items.append(
@@ -2372,9 +2520,28 @@ def _render_markdown(rep: dict) -> str:
         f" ⇒ 等权上限 {int((1.0 - C.CASH_RESERVE_RATIO) / max(C.TARGET_N_HOLDINGS, 1) * 100)}%，单只 ≤ 40%），"
         f"候选池 {rep['filter_stats']['n_candidate_pool']} 只 ⇒ 明细见 §六。"
     )
+    # 🔴 2026-11-25（点 4b）：高等级清单**改成按 severity 派生** ⇒
+    #    `no_drawdown_brake` 降为 medium 后，摘要里不许再把它算进「高等级」。
+    _HIGH_LABEL = {
+        "in_sample_selection_bias": "样本内选择偏差",
+        "current_drawdown_position": "当前回撤仓位",
+        "w_snapshot_bias": "W 快照偏差",
+        "non_lookthrough_etf": "无 A 股成分 ETF 算不出 E",
+        "survivorship_bias": "幸存者偏差",
+        "holding_without_price_data": "持仓缺价格数据",
+        "segment_instability": "分段不稳定",
+        "no_drawdown_brake": "急跌无刹车",
+        "upstream_degradation": "上游退化",
+    }
+    _high_labels = [
+        _HIGH_LABEL.get(str((it or {}).get("id") or ""), str((it or {}).get("id") or ""))
+        for it in (rep["risk_disclosure"] or [])
+        if str((it or {}).get("severity") or "") == "high"
+    ]
+    _high_txt = " / ".join(_high_labels) if _high_labels else "（本轮无高等级条目）"
     add(
         f"5. **风险不可忽略**：{len(rep['risk_disclosure'])} 条已逐条披露（§九），"
-        f"其中「样本内选择偏差 / W 快照偏差 / 无 A 股成分 ETF 算不出 E / 急跌无刹车」"
+        f"其中「{_high_txt}」"
         f"为高等级 ⇒ **本报告不构成投资建议**。"
     )
     add("")
@@ -3174,6 +3341,8 @@ def main() -> int:
         nav_state = {
             "nav": nav,
             "peak": peak,
+            "drawdown": dd,
+            "threshold": float(C.DRAWDOWN_BRAKE_THRESHOLD),
             "in_brake": dd <= -C.DRAWDOWN_BRAKE_THRESHOLD,
             "cooldown_left": 0,
         }
@@ -3300,6 +3469,8 @@ def main() -> int:
         "definition": "E = W × S：W = ETF 成分股权重快照，S = 个股层分数的截面 z-score（复用 engine/weights.map_scores_to_etfs）",
         "w_snapshot_date": w_snapshot_date,
         "w_source": str(holdings_path),
+        # 🔴 与 V2 冻结回测 ``v2/config_v2.MIN_COVERAGE`` **同值**（当前 0.5）
+        #    ⇒ 实盘入池口径 == 回测口径（机器守卫：tests/test_min_coverage_alignment.py）。
         "min_coverage": C.MIN_E_COVERAGE,
         "n_etfs_with_e": int(sum(1 for r in pool_rows if r["coverage_ok"])),
         "n_etfs_without_e": int(sum(1 for r in pool_rows if not r["coverage_ok"])),
@@ -3542,6 +3713,8 @@ def main() -> int:
         micro=micro,
         lookahead=lookahead,
         ma_windows=(_entry_ma_window, _exit_ma_window),
+        nav_state=nav_state,
+        filter_stats=filter_stats,
     )
     if not risk_disclosure:
         raise RuntimeError("风险披露为空 ⇒ 违反「禁止空数组」，拒绝出报告")

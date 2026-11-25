@@ -1688,6 +1688,101 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             })
             continue
 
+        # 🔴 2026-11-25（口径归位：**被最低佣金门槛作废的新开仓** ⇒ 「不可建仓」，不许「维持」）
+        #     研究链（`min_trade_gate.py`）已把这一行**就地作废**：
+        #     `min_amount_skipped=True` / `min_amount_kind="新开仓"` /
+        #     `action="不建仓"`（0 股时）/ `target_shares=0` / `delta_shares=0`。
+        #     但执行卡**从不读 `act["action"]`** ⇒ 旧口径只按 `delta_shares` 重写成「持有」
+        #     ⇒ 被门槛作废的席位被印进《无动作（维持）》表 ⇒ 读起来像「维持原仓」，
+        #        实际是「本轮根本买不进」⇒ **口径说谎**。
+        #     ⇒ 修法：命中「**0 股 + 门槛作废 + 新开仓**」⇒ **不进下单清单**，
+        #       归入 `cash_flow.unbuildable_slots`（碎屑归现金），
+        #       并把**披露**（阈值 / 被作废金额 / 门槛档位 / 原有 `lot_note`）原样带走。
+        #     ⚠️ 硬不变量：
+        #        ① 现金 / 权益 / 目标权重**零变化**（该行股数差本就为 0、金额为 0
+        #           ⇒ 归现金 ⇒ 现金守恒；`shares=0` ⇒ 权益不变）；
+        #        ② 「买不进」的标的**不得**出现在 `orders` 里；
+        #        ③ `current_shares > 0` 的「持有」行（门槛作废但**有持仓** ⇒ 维持）
+        #           **不得**被误分类（判据里的 `current_shares == 0` 就是这条）。
+        _min_kind = str(act.get("min_amount_kind") or "")
+        #: 判据里的 `delta_shares == 0`：此处股数差**还没算** ⇒ 用等价式
+        #: 「目标股数 == 当前股数 == 0」（研究链作废时把 `target_shares` 回退到
+        #: `current_shares`，两者都是 0 ⇒ 股数差必为 0）
+        _zero_position = (current_shares == 0 and target_shares == 0)
+        if (act.get("min_amount_skipped") is True and _min_kind == "新开仓"
+                and _zero_position):
+            _threshold = _f(act.get("min_amount_threshold"))
+            _skipped_amount = _f(act.get("min_amount_skipped_amount"))
+            _lot_note = str(act.get("lot_note") or "").strip()
+            _why = (
+                f"金额 {_skipped_amount:.2f} 元 < 门槛 {_threshold:.2f} 元"
+                if (_skipped_amount is not None and _threshold is not None) else ""
+            )
+            _reason = "；".join([p for p in [
+                f"🔴 最低佣金门槛作废（档位：{_min_kind}）",
+                _why,
+                "⇒ 本轮买不进（0 股建仓）⇒ 该席位归现金躺平（**不下单**）",
+                _lot_note,
+            ] if p])
+            unbuildable.append({
+                "code": code,
+                "name": name,
+                "action": "不可建仓",
+                "target_shares": 0,
+                "current_shares": current_shares,
+                "price": price,
+                "price_date": price_date,
+                "one_lot_amount": round(one_lot_amount, 2),
+                "max_amount": max_amt,
+                #: 🔴 **披露不许丢**：门槛阈值 / 被作废金额 / 门槛档位 / 原有 `lot_note`
+                "min_amount_threshold": _threshold,
+                "min_amount_skipped_amount": _skipped_amount,
+                "min_amount_kind": _min_kind,
+                "lot_note": _lot_note,
+                "reason": _reason,
+            })
+            continue
+
+        # 🔴 2026-11-25（口径归位：**研究链自判「整手买不起」** ⇒ 「不可建仓」，不许「维持」）
+        #     计划件（`final_rebalance_plan.py`）对「目标金额 < 一手金额」的席位**自己**判定：
+        #       `action="不可建仓"` / `target_shares=0` / 权重归现金 / `lot_note` 写明原因。
+        #     但执行卡**从不读 `act["action"]`** ⇒ 旧口径只按 `delta_shares` 把这一行
+        #     重写成「持有」⇒ 被印进《无动作（维持）》表 ⇒ 读起来像「维持原仓」，
+        #        实际是「本轮整手都买不起」⇒ **口径说谎**。
+        #     ⇒ 修法：命中「**计划件标签=不可建仓 + 0 股 + 目标股数=0 + 有 lot_note**」
+        #       ⇒ **不进下单清单**，归入 `cash_flow.unbuildable_slots`（碎屑归现金），
+        #       并把**披露**（`lot_note` / 一手金额 / 单只上限）原样带走。
+        #     ⚠️ 硬不变量：
+        #        ① 现金 / 权益 / 目标权重**零变化**（该行股数差本就为 0、金额为 0
+        #           ⇒ 归现金 ⇒ 现金守恒；`shares=0` ⇒ 权益不变）；
+        #        ② 「买不进」的标的**不得**出现在 `orders` 里；
+        #        ③ `current_shares > 0` 的真实持仓行**不得**被误分类
+        #           （判据里的 `current_shares == 0` 就是这条）；
+        #        ④ 与分支 A（单只金额上限）/ 分支 B（最低佣金门槛）**互斥**：本分支排在
+        #           二者**之后** ⇒ A / B 命中即 `continue` ⇒ 互不覆盖。
+        _plan_action = str(act.get("action") or "").strip()
+        _lot_note = str(act.get("lot_note") or "").strip()
+        if (_plan_action == "不可建仓" and current_shares == 0
+                and target_shares == 0 and _lot_note):
+            _reason = "；".join([p for p in [
+                f"🔴 计划件判定「整手买不起」：{_lot_note}",
+                "⇒ 整手口径下本轮买不进 ⇒ 该席位归现金躺平（**不下单**）",
+            ] if p])
+            unbuildable.append({
+                "code": code,
+                "name": name,
+                "action": "不可建仓",
+                "target_shares": 0,
+                "current_shares": current_shares,
+                "price": price,
+                "price_date": price_date,
+                "one_lot_amount": round(one_lot_amount, 2),
+                "max_amount": max_amt,
+                "lot_note": _lot_note,
+                "reason": _reason,
+            })
+            continue
+
         delta_shares = (target_shares - current_shares) if target_shares is not None else None
         est_amount = delta_shares * price if delta_shares is not None else None
         if delta_shares is None:

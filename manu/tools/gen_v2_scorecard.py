@@ -29,7 +29,7 @@ from pathlib import Path
 #: 🔴 工程根：**优先**读环境变量 ``ETF_ROTATION_REPO_ROOT``（换 checkout 路径也能跑）
 #:    ⇒ 缺省值保持既有服务器路径**不变**（行为兼容，不许改默认值）。
 #:    同一约定见 ``manu/etf_rotation/daily/daily_config.py::REPO_ROOT``。
-PROJ = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_658d3fc4"))
+PROJ = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_3b68a403"))
 DEFAULT_V2_ROOT = Path("/mnt/data/siping/runs/etf_rotation_results/v2")
 
 

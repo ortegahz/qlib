@@ -88,10 +88,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 QL_PY="${QL_PY:-/home/huangzhe/anaconda3/envs/ql/bin/python}"
 LLM_PY="${LLM_PY:-/home/huangzhe/anaconda3/envs/llm/bin/python}"
-TA_DIR="$PROJ/TradingAgents"
+TA_DIR="${TA_DIR:-/tmp/pycharm_project_59a2a4f0}"
 LOG="$OUT_DIR/pipeline.log"
 mkdir -p "$OUT_DIR"
 

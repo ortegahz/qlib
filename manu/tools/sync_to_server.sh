@@ -10,7 +10,7 @@
 #     bash manu/tools/sync_to_server.sh --check      # 只做 md5 双侧比对,不同步
 #
 #   为什么不用 SSHFS 镜像:
-#     本机 SSHFS 挂载 /home/manu/mnt/pycharm_project_658d3fc4 是【只读 ro】(实测),
+#     本机 SSHFS 挂载 /home/manu/mnt/pycharm_project_3b68a403 是【只读 ro】(实测),
 #     写不进去 => 它只能【读服务器】,不能【推服务器】。
 #     推送通道 = 本脚本的 rsync over ssh。
 #
@@ -22,10 +22,14 @@
 set -euo pipefail
 
 # ---------- 环境（本工程实测值）----------
-SRC_REPO="${SRC_REPO:-/media/manu/1TB-Volume/workspace/qlib}"
+#: 🔴 2026-11-20：本地工程盘路径已变（旧 `/media/manu/1TB-Volume/workspace/qlib` **不再存在**）
+#:    ⇒ 默认值改为**从脚本自身位置反推仓库根**（本文件在 `<repo>/manu/tools/` ⇒ 上溯两级到 `<repo>`）
+#:    ⇒ 挂载点/盘符再变也不用改脚本；仍可用 env `SRC_REPO` 显式覆盖。
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_REPO="${SRC_REPO:-$(cd "$_SCRIPT_DIR/../.." && pwd)}"
 SSH_HOST="${SSH_HOST:-huangzhe@192.168.99.40}"
 SSH_PORT="${SSH_PORT:-32222}"     # 服务器 sshd 在 32222;22 端口是关闭的
-REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_658d3fc4}"
+REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_3b68a403}"
 # 本机 /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf 权限不对,
 # 直接跑 ssh 会报 "Bad owner or permissions" => 必须 -F /dev/null 绕过系统 ssh_config。
 SSH_BASE=(-F /dev/null -p "$SSH_PORT" -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
@@ -83,7 +87,11 @@ EXCLUDES=(--exclude='__pycache__/' --exclude='*.pyc' --exclude='.pytest_cache/'
           # 🔴 manu/report/ **一律不推送**：报告的**真值在服务器**（流水线在服务器跑），
           #    host 上的那份是用 `manu/tools/pull_reports.sh` **拉回来**的 ⇒
           #    推送方向会把 host 的旧副本覆盖到服务器 ⇒ 丢报告。
-          --exclude='manu/report/')
+          --exclude='manu/report/'
+          # 🔴 2026-11-20：**备份目录**（`_host_backup_*` / `_backup_pre*`）本地有 40MB，
+          #    服务器不需要 ⇒ 不推送。
+          #    ⚠️ **必须与下方两侧 find 的排除规则逐字一致** ⇒ 样本集才一致（否则 md5 比对假漂移）。
+          --exclude='*_backup*')
 
 # ---------- md5 清单（本地侧） ----------
 md5_local() {
@@ -96,7 +104,7 @@ md5_local() {
   ( cd "$SRC_REPO" && find "$rel" -type f \
       ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path '*/.pytest_cache/*' \
       ! -path '*/.ipynb_checkpoints/*' ! -name '*.swp' ! -name '.DS_Store' \
-      ! -path 'manu/report/*' ! -path '*/manu/report/*' \
+      ! -path 'manu/report/*' ! -path '*/manu/report/*' ! -path '*_backup*' \
       -print0 | LC_ALL=C sort -z | xargs -0 -r md5sum )
 }
 
@@ -133,7 +141,7 @@ for p in "${PATHS[@]}"; do
   remote_sum=$(ssh "${SSH_BASE[@]}" "$SSH_HOST" "cd '$REMOTE_ROOT' && find '$p' -type f \
       ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path '*/.pytest_cache/*' \
       ! -path '*/.ipynb_checkpoints/*' ! -name '*.swp' ! -name '.DS_Store' \
-      ! -path 'manu/report/*' ! -path '*/manu/report/*' \
+      ! -path 'manu/report/*' ! -path '*/manu/report/*' ! -path '*_backup*' \
       -print0 | LC_ALL=C sort -z | xargs -0 -r md5sum" 2>/dev/null | grep -vE 'WARNING|store now|openssh.com|hostfile_replace|update_known')
 
   n_local=$(echo "$local_sum" | grep -c . || true)

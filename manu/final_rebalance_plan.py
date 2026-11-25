@@ -50,7 +50,7 @@ LOT = 100  # ETF 最小交易单位：100 股（一手）
 def _ACCOUNT_SNAPSHOT_CSV_DEFAULT():
     """账户基准 CSV 的缺省路径（**账户模块自己的口径**，不写死服务器绝对路径）。
 
-    🔴 2026-11-10：原先 CLI 缺省写死 `/tmp/pycharm_project_658d3fc4/manu/etf_rotation/
+    🔴 2026-11-10：原先 CLI 缺省写死 `/tmp/pycharm_project_3b68a403/manu/etf_rotation/
     data/account_snapshot.csv` ⇒ 换机器 / 换目录就找不到账户基准（静默退化成空仓）。
     ⇒ 改读 `account.ACCOUNT_SNAPSHOT_CSV`（与 `analyze.py` 同源、同口径）。
     模块缺失时退回「脚本同目录 `data/account_snapshot.csv`」。
@@ -2272,12 +2272,236 @@ def _apply_macro_derisk_band(ta_pct: float | None, base_cap: float) -> tuple[flo
     return effective, info
 
 
+# =============================================================================
+# 🔴 2026-11-25（V2 冻结件接缝）：**生效的同族上限**（单一事实源 = 报告 `meta.params`）
+# =============================================================================
+
+def _report_max_per_theme(report: dict | None) -> int | None:
+    """报告侧的**同族上限**（原始值）：`report["meta"]["params"]["max_per_theme"]`。
+
+    🔴 **0 是合法值**（V2 冻结件 `allow_theme_cap=false` ⇒ 同族上限＝**不限**）
+    ⇒ 判空**必须**用 `is None`（**不许**用 `or`：`or` 会把 0 当成「缺失」吞掉）。
+    🔴 字段缺失 / 不可解析 ⇒ 返回 ``None``（调用方回落 `config.MAX_PER_THEME`）。
+    """
+    try:
+        params = ((report or {}).get("meta") or {}).get("params") or {}
+    except AttributeError:
+        return None
+    if not isinstance(params, dict):
+        return None
+    raw = params.get("max_per_theme")
+    if raw is None:
+        return None
+    value = _f(raw)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _effective_max_per_theme(report: dict | None) -> int:
+    """**本轮生效的同族上限**（V2 冻结件 → plan 端的接缝口径）。
+
+    单一事实源 = ``report["meta"]["params"]["max_per_theme"]``
+    （V2 跑批时 `analyze.py` 把**生效值**写进报告的 `meta.params`）；
+    报告里没有该字段 ⇒ 回落 `config.MAX_PER_THEME`（**旧行为逐字不变**）。
+    🔴 `0` ＝ **不限**（合法值，**不是**缺失）⇒ 同族可占第二槽。
+    """
+    raw = _report_max_per_theme(report)
+    if raw is None:
+        return int(C.MAX_PER_THEME)
+    return int(raw)
+
+
+def _max_per_theme_source(report: dict | None) -> str:
+    """生效同族上限的**来源**（披露用）：报告口径 or config 回落。"""
+    return ("report.meta.params.max_per_theme"
+            if _report_max_per_theme(report) is not None
+            else "config.MAX_PER_THEME")
+
+
+# =============================================================================
+# 🔴 2026-11-25：防御态「**有效槽位**」——解开「压降 ⇒ 席位碎屑 < 新开仓门槛」的死锁
+# =============================================================================
+
+def _defensive_effective_slots(
+    seat_rows: list[dict],
+    *,
+    effective_cap: float,
+    equity_cap: float,
+    orphan_weight: float,
+    total_assets: float | None,
+    current_weights: dict[str, float] | None = None,
+    min_trade_amount_new: float | None = None,
+    max_single_weight: float | None = None,
+) -> tuple[list[dict], dict]:
+    """🔴 防御态「**有效槽位**」：把席位预算**重新分配**到少数几只**够大**的持仓上。
+
+    🔴 **必须在 TA 合规筛选之后调用**（2026-11-25 实测坐实，见下）。
+
+    【钉的是什么（数学死锁 · 两条叠加）】
+    ① **等比摊薄**：旧口径把席位预算**等比**摊到 N 席（实测 5 席各 16% ＝ 80%），
+       压降态（生效权益上限 35%）下每席只剩 7%（30,425 × 7% ≈ **2,130 元**）
+       ⇒ **低于新开仓门槛 3,800 元** ⇒ 一只都买不进 ⇒ 碎屑全归现金
+       （实测当夜：计划权益只剩 **6.98%**、现金 **93.19%**）。
+    ② 🔴 **预算摊给了「随后会被 TA 剔除」的标的**（实测 2026-11-24 真机复跑）：
+       规则层 **5 席**（515450/159547/159307/512800/515180）⇒ TA 否决其中 **3 席**
+       ⇒ **存活只有 2 席**，但那 2 席**仍各只分到 7%**（预算被 3 个已死席位摊掉）
+       ⇒ 存活席位依旧 **2,130 元 < 3,800 元** ⇒ **死锁不解**
+       ⇒ 更糟：槽位按「持仓优先 + 目标权重降序 + 代码升序」挑人时，
+         **被 TA 否决的 159307 反而抢到槽位**、把**池内第一名 515450 挤掉**。
+    ⇒ 修法：**在 TA 筛选之后**、按**存活席位**重分配：
+      ``n_slots = min(存活席位数, max(1, floor(total_assets × 席位预算 / 新开仓门槛)))``
+      其中**席位预算 = 生效上限 − 维持行占额**（🔴 门槛数学必须用**席位预算**，
+      用「生效上限」会在维持行占额大时把槽位数高估 ⇒ 每席 < 门槛 ⇒ 死锁复发）。
+      （实测 30,425 × 35% / 3,800 ＝ 2.80 ⇒ floor 2 ⇒ **只留 2 席**
+        ⇒ 每席 35% / 2 ＝ 17.5% ≈ **5,324 元** ≥ 3,800 ✔ 门槛不再拦；
+        **该算例的前提是维持行占额 = 0** ⇒ 有维持行时按席位预算折算。）
+
+    【保留哪几只（确定性排序，不许随机）】
+      ① **当前有持仓的优先**（`current_shares > 0` 或当前权重表命中）；
+      ② 其余按目标权重 **降序**；③ 同优先级按 `code` **升序**。
+
+    【权重怎么给】
+      每席 = ``席位预算 / n_slots``，再按单只上限 ``config.MAX_SINGLE_WEIGHT`` **截断**
+      （n_slots=1 时 35% > 20% ⇒ 截到 20%，**差额归现金**，不许外借）。
+      被剔除的席位：``target_weight = 0.0`` ＋ `reason` 追加中文说明。
+
+    【不变式】
+      ① 非压降态 / 缺 `total_assets` / 缺门槛 / 无存活席位 ⇒ **原样返回**
+         ⇒ **本功能对产物零影响**（既有金标不许动；点 ② 的同族上限披露
+         另会新增 2 个 key，那是点 ② 的预期变化、与本功能无关）；
+      ② **现金守恒不变**（只重分配席位权重，**不新增任何费用**）；
+      ③ ``sum(席位权重) ≤ 生效上限 − 维持行占额``；
+      ④ **维持行**（被 TA 否决但仍持仓）**不在**本函数内
+         （它们的目标权重 = 当前权重，不许动）。
+
+    返回 ``(rows, facts)``；``facts["effective_slots"] is None``
+    ⇒ **新口径没启用**（调用方据此**不写任何新披露字段** ⇒ 产物逐字节不变）。
+    """
+    def _tw(r: dict) -> float:
+        return float(_f(r.get("target_weight"), 0.0) or 0.0)
+
+    def _code(r: dict) -> str:
+        return str(r.get("code") or "").zfill(6)
+
+    def _held(r: dict) -> bool:
+        """该席位**当前有持仓**吗？（`current_shares > 0` 或当前权重表命中）"""
+        shares = _f(r.get("current_shares"))
+        if shares is not None and float(shares) > 0:
+            return True
+        if not current_weights:
+            return False
+        return _code(r) in current_weights
+
+    rows = [dict(r) for r in (seat_rows or [])]
+    facts: dict = {"effective_slots": None}
+    _cap = float(effective_cap)
+    _base_cap = float(equity_cap)
+    _orphan = float(orphan_weight or 0.0)
+    #: 席位预算 = 生效上限 − 维持行占额（维持行**不在**这里，权重不许动）
+    seat_cap = max(0.0, _cap - _orphan)
+
+    # ---- 触发条件（缺一不可；缺任一项 ⇒ 原样返回 ⇒ 产物逐字节不变）----
+    if not (_cap < _base_cap - 1e-12):
+        return rows, facts
+    if total_assets is None or float(total_assets) <= 0:
+        return rows, facts
+    if min_trade_amount_new is None or float(min_trade_amount_new) <= 0:
+        return rows, facts
+
+    #: **席位** = 目标权重 > 0 的行（目标权重 0 的行 = 卖出 / 不建仓 ⇒ 不是席位）
+    seat_idx = [i for i, r in enumerate(rows) if _tw(r) > 0]
+    if not seat_idx:
+        return rows, facts
+
+    assets = float(total_assets)
+    threshold = float(min_trade_amount_new)
+    #: 🔴 2026-11-25 审计修正（**阻断级**）：门槛数学必须用**席位预算** `seat_cap`
+    #:    （= 生效上限 − 维持行占额），**不能**用生效上限 `_cap` ——
+    #:    否则「维持行占额一大」时槽位数被高估 ⇒ 每席金额 < 门槛 ⇒ **死锁原样复发**。
+    #:    实测（30,425 / 生效上限 35% / 门槛 3,800）：维持行占额 11.17%
+    #:    ⇒ 用 `_cap` 得 2 席 × 3,557 元（< 门槛 ⇒ 两席全被作废 ⇒ 权益 0%）；
+    #:    用 `seat_cap` 得 1 席 × 7,114 元（≥ 门槛 ✔ 真实建仓）。
+    raw_floor = math.floor(assets * seat_cap / threshold)
+    #: 槽位数 = **存活席位数** 与「门槛数学允许的席位数」取小
+    #:    （存活席位比允许的少 ⇒ 全部保留，每个分到的更多 ⇒ 仍 ≥ 门槛）
+    n_slots = min(len(seat_idx), max(1, raw_floor))
+
+    order = sorted(
+        seat_idx,
+        key=lambda i: (0 if _held(rows[i]) else 1, -_tw(rows[i]), _code(rows[i])),
+    )
+    keep_idx = set(order[:n_slots])
+    drop_idx = order[n_slots:]
+
+    per_slot = seat_cap / n_slots
+    cap_single = None if max_single_weight is None else float(max_single_weight)
+    slot_weight = per_slot if cap_single is None else min(per_slot, cap_single)
+    cash_gap = max(0.0, seat_cap - slot_weight * n_slots)
+
+    math_note = (
+        f"floor({assets:.0f} × {seat_cap:.2%} / {threshold:.0f})={raw_floor}"
+        + (f"；席位数上限截到 {n_slots}" if n_slots != raw_floor else "")
+    )
+    drop_note = (
+        f"🧮 防御态有效槽位 {n_slots}（门槛数学：{math_note}）"
+        "⇒ 本席位本轮不配权重（归现金）"
+    )
+
+    out: list[dict] = []
+    kept_codes: list[str] = []
+    dropped_codes: list[str] = []
+    for i, r in enumerate(rows):
+        row = dict(r)
+        if i in keep_idx:
+            row["target_weight"] = slot_weight
+            kept_codes.append(_code(r))
+        elif i in drop_idx:
+            row["target_weight"] = 0.0
+            row["reason"] = (str(r.get("reason") or "") + "｜" + drop_note).lstrip("｜")
+            dropped_codes.append(_code(r))
+        out.append(row)
+
+    facts["effective_slots"] = {
+        "n_slots": int(n_slots),
+        "raw_slots_floor": int(raw_floor),
+        "n_rule_seats": len(seat_idx),
+        "n_seat_rows": len(rows),
+        "equity_cap": round(_cap, 6),
+        "total_assets": round(assets, 6),
+        "min_trade_amount_new": round(threshold, 6),
+        "max_single_weight": (None if cap_single is None else round(cap_single, 6)),
+        "seat_cap_weight": round(seat_cap, 6),
+        "slot_weight": round(slot_weight, 6),
+        "slot_amount": round(slot_weight * assets, 2),
+        "cash_gap_weight": round(cash_gap, 6),
+        "kept_codes": kept_codes,
+        "dropped_codes": dropped_codes,
+        "formula": (
+            "n_slots = min(n_surviving_seats, "
+            "max(1, floor(total_assets × seat_cap / min_trade_amount_new))), "
+            "seat_cap = equity_cap_effective − orphan_weight"
+        ),
+        "note": (
+            f"防御态**有效槽位**（TA 筛选**之后**在存活席位上重分配）：生效上限 {_cap:.0%}、"
+            f"总资产 {assets:.0f} 元、新开仓门槛 {threshold:.0f} 元 ⇒ {math_note} ⇒ "
+            f"**存活 {len(seat_idx)} 席只保留 {n_slots} 席**"
+            f"（每席 {slot_weight:.2%} ≈ {slot_weight * assets:.0f} 元"
+            + (f"；单只上限 {cap_single:.0%} 截断" if cap_single is not None
+               and per_slot > cap_single else "")
+            + (f"；差额 {cash_gap:.2%} **归现金**" if cash_gap > 1e-12 else "")
+            + "）｜被剔除的席位目标权重归 0（**归现金**，差额不外借）"
+        ),
+    }
+    return out, facts
+
+
 def _final_theme_guard(
     kept_actions: list[dict],
     orphan_rows: list[dict],
     *,
     theme_of,
-    max_per_theme: int = 1,
+    max_per_theme: int | None = None,
     score_of=None,
 ) -> dict:
     """🔴 2026-11-18（用户目标文档 §二.2）：**Final Theme Guard**（最终清单全局主题去重）。
@@ -2298,10 +2522,15 @@ def _final_theme_guard(
        ⇒ 两只都保留，但**如实披露**集中度超限（`concentration_breaches`）。
     ④ 同主题多只**新买**行 ⇒ 留**最终分最高**的那 1 只（并列 ⇒ 目标权重高者 ⇒ 代码序）。
 
+    🔴 2026-11-25（V2 冻结件接缝）：``max_per_theme`` = **本轮生效**的同族上限
+       （``None`` ⇒ 回落 `config.MAX_PER_THEME`；**0 ＝ 不限** ⇒ 同族可占多槽 ⇒ 全留）。
+
     返回 ``{"applied", "max_per_theme", "n_blocked", "blocked", "theme_map",
     "concentration_breaches", "note"}``；`blocked` 逐条给
     `{code, name, theme, kept_code, kept_kind, reason}`。
     """
+    #: 本轮**生效**的同族上限（`None` ⇒ config 回落；**0 ＝ 不限**）
+    _max_per_theme = int(C.MAX_PER_THEME) if max_per_theme is None else int(max_per_theme)
     def _theme(code: str) -> str:
         try:
             t = theme_of(code)
@@ -2365,24 +2594,36 @@ def _final_theme_guard(
     for theme, group in by_theme.items():
         if len(group) <= 1:
             continue
+        # 🔴 2026-11-25（V2 接缝）：按**生效**的同族上限判
+        #    - 生效值 **0 ＝ 不限** ⇒ 同族可占多槽 ⇒ **全留**（不拦、不算超限）；
+        #    - 生效值 > 0 且组内行数 ≤ 上限 ⇒ 无需拦（真实持仓优先的语义不变）。
+        if _max_per_theme <= 0 or len(group) <= _max_per_theme:
+            continue
         held = [r for r in group if r["kind"] == "held"]
         new = [r for r in group if r["kind"] == "new"]
         if held:
             # ① 真实持仓优先：拦掉该主题下的**新买行**
-            keepers = held
+            #    （生效上限 > 1 时可再留若干只**最终分最高**的新买行）
+            keepers = list(held)
+            _ordered_new = sorted(
+                new, key=lambda r: (-r["score"], -r["target_weight"], r["code"]))
+            _room = max(0, _max_per_theme - len(held))
+            keepers += _ordered_new[:_room]
+            new = _ordered_new[_room:]
         else:
-            # ④ 全是新买 ⇒ 留最终分最高的 1 只
+            # ④ 全是新买 ⇒ 留最终分最高的（上限 1 只时 = 旧行为）
             ordered = sorted(
                 group, key=lambda r: (-r["score"], -r["target_weight"], r["code"]))
-            keepers = ordered[:1]
-            new = ordered[1:]
+            keepers = ordered[:_max_per_theme]
+            new = ordered[_max_per_theme:]
         keep_codes = [r["code"] for r in keepers]
         for r in new:
             r["_src"]["target_weight"] = 0.0
             r["_src"]["theme_guard_blocked"] = True
             r["_src"]["reason"] = (
                 str(r["_src"].get("reason") or "")
-                + f"；🛡️ **Final Theme Guard**：最终清单同主题「{theme}」只留 1 只"
+                + f"；🛡️ **Final Theme Guard**：最终清单同主题「{theme}」"
+                + f"最多留 {_max_per_theme} 只"
                 + f"（保留 {', '.join(keep_codes)}）⇒ 本行**不建仓**（目标权重归 0）"
             ).lstrip("；")
             blocked.append({
@@ -2396,7 +2637,7 @@ def _final_theme_guard(
                 "reason": (
                     f"最终清单同主题「{theme}」已有 {', '.join(keep_codes)}"
                     f"（{'真实持仓' if keepers and keepers[0]['kind'] == 'held' else '规则层/顺延补位'}）"
-                    f" ⇒ 依 `MAX_PER_THEME={int(max_per_theme)}` **不建仓**本行"
+                    f" ⇒ 依生效同族上限 `MAX_PER_THEME={int(_max_per_theme)}` **不建仓**本行"
                 ),
             })
         if len(held) > 1:
@@ -2414,14 +2655,16 @@ def _final_theme_guard(
     theme_map = {t: [r["code"] for r in g] for t, g in by_theme.items()}
     return {
         "applied": bool(blocked or breaches),
-        "max_per_theme": int(max_per_theme),
+        "max_per_theme": int(_max_per_theme),
         "n_blocked": len(blocked),
         "blocked": blocked,
         "theme_map": theme_map,
         "concentration_breaches": breaches,
         "note": (
-            "最终清单的**全局主题去重**（Final Theme Guard）：同主题最终只留 1 只；"
-            "**真实持仓优先**（不许市值凭空蒸发），只拦**新买行**"
+            "最终清单的**全局主题去重**（Final Theme Guard）：同主题最终最多留 "
+            + ("**不限**（生效同族上限 = 0）" if _max_per_theme <= 0
+               else f"{int(_max_per_theme)} 只")
+            + "；**真实持仓优先**（不许市值凭空蒸发），只拦**新买行**"
         ),
     }
 
@@ -2438,6 +2681,7 @@ def apply_ta_screening(
     asof=None,
     names: dict[str, str] | None = None,
     equity_cap: float | None = None,
+    max_per_theme: int | None = None,
     universe_codes: set[str] | None = None,
     official_names: dict[str, str] | None = None,
 ) -> dict:
@@ -2477,7 +2721,9 @@ def apply_ta_screening(
          - 与「剔除后仍入选的集合」**不同族**（`theme_id` 相同 ⇒ 跳过），
            **且**与**被否决者**也不同族（否则「否决一只银行 ETF、换来另一只银行 ETF」
            ⇒ 否决形同虚设）；
-         - 该族未达 `C.MAX_PER_THEME`；
+         - 该族未达**生效**同族上限（`max_per_theme`；**0 ＝ 不限** ⇒ 本条不生效）。
+           🔴 2026-11-25（审计修正）：上面那条「与被否决者也不同族」是**替换纪律**、
+             **恒生效**（**不受**同族上限影响 ⇒ `max_per_theme=0` **不放开**它）；
          - 🔴 2026-11-11（缺陷 A · 席位交互）：补位后**权益合计不得突破**
            `1 − CASH_RESERVE_RATIO`（被否决且在持仓者**仍占席位** ⇒ 再补一席 = 多一席）。
     ③ 顺延者的**目标权重 = 被否决者的目标权重**（保持等权口径）。
@@ -2488,6 +2734,17 @@ def apply_ta_screening(
         🔴 2026-11-11（Beta 避险）：当 TA 明确建议压降组合权益时，调用方把
         ``min(规则层上限, TA 建议)`` 传进来 ⇒ 顺延补位也必须过这道闸
         ⇒ **不许**出现「上限被压到 36%，却顺延补位到 80%」的自相矛盾。
+
+    参数 ``max_per_theme``
+        🔴 2026-11-25（V2 冻结件接缝）：**本轮生效**的同族上限
+        （``None`` ⇒ 回落 ``config.MAX_PER_THEME`` ⇒ **行为与今天逐字相同**；
+        **0 ＝ 不限** ⇒ ① 最终清单的同族配额**不拦**（`_final_theme_guard`）
+        ② 顺延的**同族计数闸门**不生效 ⇒ **只有同族配额**受影响）。
+        ⚠️ **不受**它影响的（🔴 2026-11-25 审计修正）：
+        - **冲突对**（成分重叠 ≥ 0.90 / 120 日相关性 ≥ 0.95）**照拦**；
+        - **顺延的同族替换纪律**（顺延者须与已入选集合**及被否决者**不同族）**恒生效**
+          ⇒ `max_per_theme=0` **不放开**它（docstring / 探针 A3 / 提示词 3.5 小节三处钉死）。
+        （V2 冻结件 caveat：``allow_theme_cap=False`` 只关「同族去重」）。
 
     参数 ``universe_codes`` / ``official_names``
         🔴 2026-11-11（真机缺陷 ①②）：
@@ -2503,6 +2760,9 @@ def apply_ta_screening(
     """
     #: 本轮**生效**的权益上限（Beta 避险 ⇒ 可低于规则层硬上限；**永不低于**调用方给的硬上限口径）
     _cap = float(equity_cap) if equity_cap is not None else _EQUITY_CAP
+    #: 🔴 2026-11-25（V2 接缝）：本轮**生效**的同族上限
+    #:    （`None` ⇒ 回落 config ⇒ 行为与今天逐字相同；**0 ＝ 不限**）。
+    _max_per_theme = int(C.MAX_PER_THEME) if max_per_theme is None else int(max_per_theme)
     acts = [dict(a) for a in (actions or [])]
     cands = [dict(c) for c in (candidates or [])]
     # 🔴 2026-11-11（真机缺陷 ①）：**池外代码剔除**（fail-closed + 如实披露）
@@ -2675,6 +2935,9 @@ def apply_ta_screening(
             overlap_ready = False
 
     substituted: list[dict] = []
+    #: 🔴 2026-11-23：顺延补位**复用已有行动行**的逐条明细（披露用）
+    #:    ⇒ 审计看得见「哪一行被就地改写了终态」（而不是凭空多出一行）。
+    substituted_over_existing: list[dict] = []
     used: set[str] = set()
     no_reason: str | None = None
     #: 因「权益合计超上限」而**放弃**的顺延补位（披露用）
@@ -2719,9 +2982,20 @@ def apply_ta_screening(
                     gate_fail.append(f"{code}（{_why}）")
                 continue
             theme = _theme_of(code)
+            #: 🔴 2026-11-25（V2 接缝 · 审计修正）：**顺延的「同族跳过」是无条件的** ——
+            #:    它是**替换纪律**（「否决一只银行 ETF、换来另一只银行 ETF」⇒ 否决形同虚设），
+            #:    **不是**「同族上限」的一部分 ⇒ **不受 `max_per_theme` 影响**。
+            #:    证据三处钉死：① 本函数 docstring「与被否决者也不同族」；
+            #:    ② 探针 A3「顺延结果必须与已入选集合…不同族」（A5 变异负例钉开关恒为真）；
+            #:    ③ 提示词 3.5 小节（`max_per_theme == 0` 分支**仍**要求
+            #:    「顺延者必须与已入选集合**不同族**」⇒ `test_ta_context_duties.py` 钉死）。
+            #:    ⇒ `max_per_theme = 0`（同族上限不限）**只放开**下面那道
+            #:    「该族未达生效同族上限」闸门，**不放开**本行。
             if _SKIP_SAME_THEME_ON_SUBSTITUTE and theme in sel_themes:
                 continue      # 同族 ⇒ 跳过（文档口径：「顺延挑选下一个**不同主题**的资产」）
-            if sum(1 for x in sel_codes if _theme_of(x) == theme) >= C.MAX_PER_THEME:
+            if (_max_per_theme > 0
+                    and sum(1 for x in sel_codes if _theme_of(x) == theme)
+                    >= _max_per_theme):
                 continue
             if _SKIP_CONFLICT_ON_SUBSTITUTE:
                 if not overlap_ready:
@@ -2732,12 +3006,28 @@ def apply_ta_screening(
             break
         if picked is None:
             if no_reason is None:
+                #: 🔴 2026-11-25（V2 接缝 · 审计修正）：条件清单**按生效设置派生** ——
+                #:    「与已入选集合及被否决者均不同族」是**替换纪律**（恒生效）；
+                #:    「该族未达生效同族上限（N）」才是**同族上限**那一条
+                #:    ⇒ 生效值 0（不限）时**不许**再列它（列了就是「0 只上限」的自相矛盾说法），
+                #:    也不许让人以为「上限=0 ⇒ 同族顺延放行」（**代码里没放行**）。
+                _sub_cond = [
+                    "原本未入选 / 未破位 / 未被 MA 过滤 / 覆盖达标（coverage "
+                    f"≥ {float(C.MIN_E_COVERAGE):.0%}，缺失按不达标）",
+                    "与已入选集合及被否决者均不同族（**替换纪律**："
+                    "否则「否决一只银行 ETF、换来另一只银行 ETF」⇒ 否决形同虚设）",
+                    "与已入选集合不构成规则层冲突对",
+                ]
+                if _max_per_theme > 0:
+                    _sub_cond.append(f"该族未达生效同族上限（{int(_max_per_theme)}）")
+                else:
+                    _sub_cond.append(
+                        "同族上限=0（不限）**只放开**最终清单的同族配额，"
+                        "**不放开**顺延的同族替换纪律"
+                    )
                 no_reason = (
                     f"候选池里**没有合格的顺延者**（{code_rej} {name_rej} 被 TA 否决）："
-                    "合格条件 = 原本未入选 / 未破位 / 未被 MA 过滤 / 覆盖达标（coverage "
-                    f"≥ {float(C.MIN_E_COVERAGE):.0%}，缺失按不达标）/ "
-                    "与已入选集合及被否决者均不同族 / 与已入选集合不构成规则层冲突对 / "
-                    "该族未达 MAX_PER_THEME"
+                    "合格条件 = " + " / ".join(_sub_cond)
                     + ("（且成分权重数据不可得 ⇒ 无法核验冲突对）" if not overlap_ready else "")
                     + ("；被闸门挡下的候选：" + "、".join(gate_fail) if gate_fail else "")
                 )
@@ -2746,7 +3036,29 @@ def apply_ta_screening(
         #    （保留为『维持』行）⇒ 再顺延一个补位者 = **多出一席** ⇒ 权益可能超配。
         #    ⇒ 补位前必须过「权益合计 ≤ 1 − 现金预留比例」这道闸；过不了 ⇒ **不补位**
         #      （宁缺毋滥），并在 `no_substitute_reason` 写明原因。
-        _s_after = _s_all - _s_drop + _s_orph + _s_sub + tw
+        code = str(picked.get("code") or "").zfill(6)
+        name = _official_name(code, official,
+                              picked.get("name") or name_map.get(code) or "")
+        #: 🔴 2026-11-23（真机缺陷：**同标的双行冲突**）：顺延补位**可能挑中一个
+        #:    **已经有行动行**的代码**（典型场景：它本来在持仓、但被规则层踢出目标名额
+        #:    ⇒ 规则层已给它定过「目标 0 股」；若此时再把它当作顺延补位者**追加**一行
+        #:    ⇒ **同一 ticker 两行并存**（一行目标 0 股、一行目标 N 股）⇒ 下游按行折算
+        #:    ⇒ 合计卖出 **超过期初持仓** ⇒ 调仓后现金虚增（可超过总资产）。
+        #:    实测（2026-11-20 真机）：512800 两行并存 ⇒ 卖 14,400 股 > 持仓 7,700 股
+        #:    ⇒ `cash_end=36,680.60` **超过**总资产 `30,501.07`（虚增 6,179.53 元）
+        #:    ⇒ 执行卡 `post_trade.positions` 里 512800 也重复两次
+        #:    ⇒ 逐日台账 (日期,代码) 主键碰撞 ⇒ 重跑不幂等。
+        #:    ⇒ 修法（**后序合法覆盖前序**）：顺延补位**复用已有行**（就地改写终态）
+        #:      ⇒ 同一 ticker **只有一行**；权益账**只加增量**（不新增席位）。
+        _existing_pos = next(
+            (i for i, _a in enumerate(kept)
+             if str(_a.get("code") or "").zfill(6) == code), None)
+        _old_tw = 0.0
+        if _existing_pos is not None:
+            _old_tw = float(_f(kept[_existing_pos].get("target_weight"), 0.0) or 0.0)
+        #: 本次补位给权益账带来的**真实增量**（复用已有行时 = 新目标 − 旧目标）
+        _inc = tw - _old_tw
+        _s_after = _s_all - _s_drop + _s_orph + _s_sub + _inc
         if _s_after > _cap + 1e-9:
             cap_skipped.append({
                 "code": str(picked.get("code") or "").zfill(6),
@@ -2769,22 +3081,46 @@ def apply_ta_screening(
                     "（本轮生效的权益上限）⇒ **不补位**（宁缺毋滥，避免多出一席、权益超配）"
                 )
             continue
-        code = str(picked.get("code") or "").zfill(6)
-        name = _official_name(code, official,
-                              picked.get("name") or name_map.get(code) or "")
-        kept.append({
-            "code": code,
-            "name": name,
-            "action": "买入",
-            "target_weight": tw,
-            "current_weight": cw.get(code, 0.0),
-            "reason": (f"🛡️ TA 合规筛选**顺延补位**（替补被否决的 {code_rej} {name_rej}；"
-                       "目标权重沿用被否决者，保持等权口径）"),
-            "ta_substitute": True,
-            "ta_substituted_for": code_rej,
-        })
+        _sub_reason = (f"🛡️ TA 合规筛选**顺延补位**（替补被否决的 {code_rej} {name_rej}；"
+                       "目标权重沿用被否决者，保持等权口径）")
+        if _existing_pos is None:
+            kept.append({
+                "code": code,
+                "name": name,
+                "action": "买入",
+                "target_weight": tw,
+                "current_weight": cw.get(code, 0.0),
+                "reason": _sub_reason,
+                "ta_substitute": True,
+                "ta_substituted_for": code_rej,
+            })
+        else:
+            #: 🔴 2026-11-23：**复用已有行**（不新增第二行）⇒ 同一 ticker 唯一终态
+            _row = kept[_existing_pos]
+            _old_reason = str(_row.get("reason") or "")
+            _row["action"] = "买入"
+            _row["target_weight"] = tw
+            _row["reason"] = (
+                (_old_reason + "｜" + _sub_reason) if _old_reason else _sub_reason)
+            _row["ta_substitute"] = True
+            _row["ta_substituted_for"] = code_rej
+            _row["ta_substitute_over_existing_row"] = True
+            substituted_over_existing.append({
+                "code": code,
+                "name": name,
+                "previous_target_weight": round(_old_tw, 6),
+                "new_target_weight": round(tw, 6),
+                "previous_reason": _old_reason,
+                "substituted_for": code_rej,
+                "substituted_for_name": name_rej,
+                "reason": (
+                    "该代码**已有行动行**（规则层已给它定过终态）⇒ 顺延补位**复用该行**"
+                    "（后序合法覆盖前序）⇒ **不新增第二行**"
+                    "（否则同一 ticker 两行并存 ⇒ 下游按行折算 ⇒ 合计卖出超过期初持仓）"
+                ),
+            })
         used.add(code)
-        _s_sub += tw
+        _s_sub += _inc
         substituted.append({
             "code": code,
             "name": name,
@@ -2793,7 +3129,9 @@ def apply_ta_screening(
             "substituted_for": code_rej,
             "substituted_for_name": name_rej,
             "reason": (f"原候选 {code_rej} {name_rej} 被 TA 否决 ⇒ 顺延挑选下一个"
-                       f"**不同主题**的资产（最终分 {_f(picked.get('final_score'))}）"),
+                       "**不同主题**的资产"
+                       + "（替换纪律：同族上限=0 也不放开）"
+                       + f"（最终分 {_f(picked.get('final_score'))}）"),
         })
 
     # ---- 披露用：候选池里被**更宽口径**标记为高重合的对 ----
@@ -2830,7 +3168,7 @@ def apply_ta_screening(
     _theme_guard = _final_theme_guard(
         kept, orphan_rows,
         theme_of=_theme_of,
-        max_per_theme=int(C.MAX_PER_THEME),
+        max_per_theme=int(_max_per_theme),
         score_of=lambda code: (cand_by_code.get(code) or {}).get("final_score"),
     )
     #: 被守卫拦下的顺延补位 ⇒ 权益合计要减回来（否则披露的权益是虚高的）
@@ -2858,6 +3196,9 @@ def apply_ta_screening(
         #      ⇒ 但**如实留痕**，供审计对账。
         "rejected_out_of_universe": rejected_out_of_universe,
         "substituted": substituted,
+        # 🔴 2026-11-23：**顺延补位复用已有行动行**的明细（同一 ticker 唯一终态）
+        #    ⇒ 非空 ⇒ 说明本轮发生过「就地改写终态」⇒ 必须披露（不许静默）
+        "substituted_over_existing_row": substituted_over_existing,
         "no_substitute_reason": no_reason,
         "screen_pairs": screen_pairs,
         # 🔴 被否决的标的**若本来就在持仓里** ⇒ 只剔除候选、**不动持仓**
@@ -2881,6 +3222,11 @@ def apply_ta_screening(
         # 🔴 2026-11-18（用户目标文档 §二.2）：**Final Theme Guard** 的披露
         #    （拦下了哪些行、为什么拦、最终每个主题各留了谁）
         "theme_guard": _theme_guard,
+        # 🔴 2026-11-25（V2 冻结件接缝）：**生效**的同族上限 + 来源
+        #    （0 ＝ 不限；`None` ⇒ 回落 config.MAX_PER_THEME）
+        "max_per_theme_effective": int(_max_per_theme),
+        "max_per_theme_source": (
+            "caller" if max_per_theme is not None else "config.MAX_PER_THEME"),
         # 🔴 守卫拦下顺延补位后的**实际**权益合计（对照 `equity_cap` 看是否仍在线内）
         "equity_weight_after_theme_guard": round(
             _s_all - _s_drop + _s_orph + _s_sub_eff, 6),
@@ -3032,8 +3378,13 @@ def build_plan(args) -> dict:
         for r in _rejections
         if str(r.get("code") or "").zfill(6) in _screen_cw
     )
-    #: 🔴 席位等比缩放：把规则层席位预算压到「本轮生效上限 − 维持行占额」。
-    #:    ⚠️ 无 TA 建议 ⇒ `_scale == 1.0` ⇒ **产物逐字节不变**（既有金标不动）。
+    #: 席位**等比缩放**：把规则层席位预算压到「本轮生效上限 − 维持行占额」。
+    #:    ⚠️ 无 TA 建议 ⇒ 缩放系数 = 1.0 ⇒ **产物逐字节不变**（既有金标不动）。
+    #: 🔴 2026-11-25：**这一步只做等比缩放**（TA 合规筛选**内部**的权益上限闸门
+    #:    要看这个数）；「有效槽位」的重分配在**筛选之后**做
+    #:    （见 `_defensive_effective_slots` 与调用点）—— 否则预算会被
+    #:    **随后被 TA 剔除的席位**摊薄（实测 11-24 真机复跑：5 席被否 3 席
+    #:    ⇒ 存活 2 席仍各只分到 7% ⇒ 每席 2,130 元 < 3,800 元门槛 ⇒ 死锁不解）。
     _rule_actions = list(rec.get("actions") or [])
     _seat_base = sum(float(_f(a.get("target_weight"), 0.0) or 0.0) for a in _rule_actions)
     _seat_cap = max(0.0, _effective_cap - _orphan_weight)
@@ -3044,6 +3395,8 @@ def build_plan(args) -> dict:
         {**a, "target_weight": float(_f(a.get("target_weight"), 0.0) or 0.0) * _scale}
         for a in _rule_actions
     ]
+    #: 新口径的生效信息（``None`` ⇒ 没启用 ⇒ 产物逐字节不变）
+    _effective_slots = None
     _ta_screen = apply_ta_screening(
         actions=_scaled_actions,
         candidates=report.get("candidates") or [],
@@ -3057,11 +3410,15 @@ def build_plan(args) -> dict:
         prices=_ov_prices,
         asof=asof,
         equity_cap=_effective_cap,
+        max_per_theme=_effective_max_per_theme(report),
         universe_codes=_pool_codes,
         official_names=_official_names,
     )
     _screen_actions = list(_ta_screen["actions"])
     _ta_screening = _ta_screen["ta_screening"]
+    #: 🔴 2026-11-25（V2 冻结件接缝）：**生效**的同族上限 + 来源（如实披露）
+    _ta_screening["max_per_theme_effective"] = _effective_max_per_theme(report)
+    _ta_screening["max_per_theme_source"] = _max_per_theme_source(report)
 
     # 🔴 2026-11-11（真机缺陷 ①）：把「池内白名单的来源 / 规模」**写进披露**
     #    （审计要看得见：本轮的「池」到底是哪份文件 / 多少个代码）。
@@ -3129,6 +3486,48 @@ def build_plan(args) -> dict:
             "ta_rejected": True,
             "held_not_touched": True,
         })
+
+    # 🔴 2026-11-25（防御态「有效槽位」）：**必须在 TA 合规筛选之后**做 ——
+    #    否则席位预算会被「随后被剔除的标的」摊薄 ⇒ 存活席位仍只分到 7%
+    #    ⇒ 每席 2,130 元 < 3,800 元门槛 ⇒ **死锁不解**（实测 11-24 真机复跑）。
+    _hold_rows = [a for a in _screen_actions if a.get("held_not_touched")]
+    _seat_rows = [a for a in _screen_actions if not a.get("held_not_touched")]
+    _seat_rows, _slot_facts = _defensive_effective_slots(
+        _seat_rows,
+        effective_cap=_effective_cap,
+        equity_cap=_EQUITY_CAP,
+        orphan_weight=_orphan_weight,
+        total_assets=total_assets,
+        current_weights=_screen_cw,
+        min_trade_amount_new=C.MIN_TRADE_AMOUNT_NEW,
+        max_single_weight=C.MAX_SINGLE_WEIGHT,
+    )
+    _screen_actions = _seat_rows + _hold_rows
+    _effective_slots = _slot_facts["effective_slots"]
+
+    #: 「防御态有效槽位」的**中文说明**（数字全部实算，不许写死）
+    _effective_slots_note = ""
+    if _effective_slots:
+        _es = _effective_slots
+        _effective_slots_note = (
+            f"🧮 **防御态有效槽位**（TA 筛选**之后**在存活席位上重分配）：本轮生效上限 "
+            f"{float(_es['equity_cap']):.1%}、"
+            f"总资产 {float(_es['total_assets']):,.2f} 元、新开仓门槛 "
+            f"{float(_es['min_trade_amount_new']):,.2f} 元 ⇒ "
+            f"floor({float(_es['total_assets']):,.0f} × {float(_es['seat_cap_weight']):.2%} / "
+            f"{float(_es['min_trade_amount_new']):,.0f}) = {int(_es['raw_slots_floor'])} ⇒ "
+            f"**存活 {int(_es['n_rule_seats'])} 席只保留 {int(_es['n_slots'])} 席**"
+            f"（每席 {float(_es['slot_weight']):.2%} ≈ {float(_es['slot_amount']):,.2f} 元"
+            + (f"；被单只上限 {float(_es['max_single_weight']):.0%} 截断"
+               if _es.get("max_single_weight") is not None
+               and float(_es["seat_cap_weight"]) / max(1, int(_es["n_slots"]))
+               > float(_es["max_single_weight"]) + 1e-12 else "")
+            + (f"；差额 {float(_es['cash_gap_weight']):.2%} **归现金**"
+               if float(_es["cash_gap_weight"]) > 1e-12 else "")
+            + "）｜被剔除 "
+            + ("、".join(str(c) for c in (_es["dropped_codes"] or [])) or "无")
+            + " **目标权重归 0**（归现金，差额不外借）"
+        )
 
     plans = []
     for act in _screen_actions:
@@ -3789,8 +4188,14 @@ def build_plan(args) -> dict:
                 "（" + "；".join(stale_info.get("reasons", [])) + "）⇒ **冲突表里的 LLM 目标权重不可作数**，"
                 "以规则层为准；需要 LLM 意见请重跑第 5~6 步。"
             )
-        ] if stale_info.get("stale") else []),
+        ] if stale_info.get("stale") else []) + ([
+            _effective_slots_note,
+        ] if _effective_slots else []),
     }
+    #: 🔴 2026-11-25：防御态「有效槽位」的**生效信息**（只在新口径**真的启用**时写
+    #:    ⇒ 非压降态 / 总资产缺失 ⇒ **产物逐字节不变**（既有金标不许动））
+    if _effective_slots:
+        plan["meta"]["effective_slots"] = _effective_slots
     return plan
 
 
@@ -4262,9 +4667,12 @@ def render_markdown(plan: dict) -> str:
         # 🔴 2026-11-18（用户目标文档 §二.2）：Final Theme Guard 的披露
         _guard = _scr.get("theme_guard") or {}
         if _guard.get("applied"):
+            _mpt = _guard.get("max_per_theme")
+            _mpt = 1 if _mpt is None else int(_mpt)
             lines += [
-                f"🛡️ **Final Theme Guard（同主题最终只留 1 只，MAX_PER_THEME="
-                f"{int(_guard.get('max_per_theme') or 1)}）**：",
+                "🛡️ **Final Theme Guard（同主题最终最多留 "
+                + ("**不限**（生效同族上限 = 0）" if _mpt <= 0 else f"{_mpt} 只")
+                + f"，生效同族上限 MAX_PER_THEME={_mpt}）**：",
                 "",
             ]
             _g_blocked = _guard.get("blocked") or []

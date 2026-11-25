@@ -22,6 +22,20 @@
 ④ context 全文**不含 "None"**（prompt 终检铁律：None 会被 LLM 当成「上游退化」）；
 ⑤ **变异负例**：抽掉新增的授权引言 / 7.1 小节 ⇒ 对应断言**必须转红**（证明测试有牙）。
 
+🔴 2026-11-25 新增钉子（**提示词 vs V2 冻结参数打架**）
+V2 冻结件 `frozen_params_wf.json` 里 `allow_theme_cap=false` ⇒ 运行时**同族上限=关**
+（回测里「不限制同族数量」最优）⇒ `analyze.py` 把 `max_per_theme=0` 写进
+`report["meta"]["params"]`。但 3.5 引言仍把「同族」写成**可否决依据**
+⇒ LLM 阶段的**软约束**架空了 V2 回测出的硬参数。本测试钉死：
+⑥ `max_per_theme == 0` ⇒ 3.5 小节**不许**再把「同族」列为否决依据
+   （「凡表中**同族**、…」与「…或同族）」两个旧枚举必须消失），
+   且**必须**出现「同族不构成一票否决依据」的显式表述；
+   阈值事实（成分重叠 ≥ 0.90 / 相关性 ≥ 0.95 / 成分重叠 ≥ 0.50 / 相关性 ≥ 0.80）
+   与「顺延者必须与已入选集合**不同族**」**一个都不许丢**；
+⑦ `max_per_theme` **缺失** / `== 1` ⇒ 上下文与**改动前逐字节一致**（默认口径文案原样保留）；
+⑧ **变异负例**：事实源判定短路成「永远不关」/ 抽掉「同族不构成一票否决依据」句
+   ⇒ ⑥ 的断言**必须转红**（证明测试有牙）。
+
 【「改写前 / 改写后」怎么比】
 用 `ast` 在**内存里**把模块源码**改回改写前的样子**（3.5 引言换回旧文案 +
 7.1 小节整块删掉）⇒ exec 出「旧实现」⇒ 同一夹具下渲染两遍上下文
@@ -61,6 +75,26 @@ _OLD_OVERLAP_INTRO = (
     "（成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 或同族），"
     "**只供你审查参考**，**不改变规则层判定**。"
 )
+
+#: 默认口径（``max_per_theme`` **缺失** 或 ``> 0``）的 3.5 引言**逐字金标准**。
+#:    🔴 它同时是「源码手术」的**唯一定位锚点**：宽口径预警里带「或同族」
+#:    ⇒ 不会误命中「同族上限=关」分支的引言（否则变异会打到错的分支上 ⇒ 测试空过）。
+_DEFAULT_OVERLAP_INTRO = (
+    "> 规则层已按「**成分重叠 ≥ 0.90 或 120 日相关性 ≥ 0.95**」逐对拦截"
+    "（冲突对不共存）；下表是**更宽口径**的预警"
+    "（成分重叠 ≥ 0.50 或 120 日相关性 ≥ 0.80 或同族）——"
+    "**这张表就是你行使一票否决权的合法依据**："
+    "凡表中**同族**、或成分重叠/相关性明显偏高的候选对，"
+    "你都可以据此**否决**其中一只"
+    "（否决 ⇒ 该标的从候选池剔除 ⇒ 规则层顺延补位）。"
+    "**否决后的确定性后果**：规则层会**顺延挑选下一个不同主题的资产**"
+    "（等权口径不变：顺延者沿用被否决者的目标权重；"
+    "顺延者必须与已入选集合**不同族**，且不构成规则层冲突对）；"
+    "候选池里没有合格顺延者时**不强行补**（宁缺毋滥）。"
+)
+
+#: 哨兵：「``meta.params`` 里**没有** ``max_per_theme`` 这个键」（≠ 值为 None）
+_MISSING = object()
 
 #: 改写前 3.5 表格的**表头 + 数据行**（金标准：改写只许动引言与新增小节，表格一字不许改）
 _EXPECTED_TABLE_ROWS = [
@@ -103,6 +137,32 @@ def _assert_task_duties(section: str) -> None:
     for kw in ("合规陪审团", "不是操盘手", "一票否决", "候选池之外", "买多少股",
                "权益敞口", "数值与依据", "3.5"):
         assert kw in section, f"任务节缺少关键语义：{kw!r}"
+
+
+def _assert_theme_cap_off(section: str) -> None:
+    """同族上限=关（``max_per_theme == 0``）⇒ 3.5 小节的**同族口径**钉死。
+
+    🔴 2026-11-25：V2 冻结件 ``allow_theme_cap=false`` ⇒ 运行时**同族上限=关**
+    ⇒ 提示词**不许**再把「同族」写成可否决依据（否则 LLM 软约束架空 V2 硬参数）。
+    """
+    # ① 显式豁免句必须在（Trader 要看得懂「同族不是否决依据」）
+    assert "同族不构成一票否决依据" in section, (
+        "3.5 小节没有「同族不构成一票否决依据」的显式表述（LLM 会继续拿同族否决）"
+    )
+    # ② 旧的「同族」枚举（可否决依据 / 宽口径预警）必须消失
+    for bad in ("凡表中**同族**、", "或同族）"):
+        assert bad not in section, f"3.5 小节仍把「同族」列为否决依据：{bad!r}"
+    # ③ 阈值事实一个都不许丢（0.90 成分重叠 / 0.95 相关性 / 0.50 / 0.80 宽口径）
+    for fact in ("成分重叠 ≥ 0.90", "相关性 ≥ 0.95",
+                 "成分重叠 ≥ 0.50", "相关性 ≥ 0.80"):
+        assert fact in section, f"3.5 小节丢了阈值事实：{fact!r}"
+    # ④ 顺延规则（约束的是**顺延补位**，不是否决依据）保留
+    assert "顺延者必须与已入选集合**不同族**" in section, (
+        "3.5 小节丢了「顺延者必须与已入选集合不同族」的顺延规则"
+    )
+    # ⑤ 授权语义不许被顺手删掉
+    for good in ("一票否决", "否决", "顺延", "不同主题"):
+        assert good in section, f"3.5 小节缺少授权语义：{good!r}"
 
 
 # ---------------------------------------------------------------- 文本工具
@@ -173,7 +233,9 @@ def _find_add(stmts: list[ast.stmt], prefix: str):
 
 def _replace_intro(body: list[ast.stmt]) -> None:
     """把 3.5 引言换回「改写前」的文案（**表格与其它小节一字不动**）。"""
-    lst, at = _find_add(body, "> 规则层已按")
+    # 🔴 锚点用**默认口径引言的逐字金标准**（带「或同族）」）
+    #    ⇒ 只命中默认分支 ⇒ 不会打到「同族上限=关」分支上（否则变异空过）。
+    lst, at = _find_add(body, _DEFAULT_OVERLAP_INTRO)
     assert lst is not None, "找不到 3.5 引言（实现变了 ⇒ 本测试要跟着改）"
     lst[at] = ast.Expr(value=ast.Call(
         func=ast.Name(id="add", ctx=ast.Load()),
@@ -217,6 +279,57 @@ def _source_without_task_duties() -> str:
     return ast.unparse(tree)
 
 
+def _find_if(stmts: list[ast.stmt], name: str):
+    """找 `if <name>:` 这条语句 ⇒ 返回 (所在列表, 下标)；找不到 ⇒ (None, None)。"""
+    for lst in _iter_stmt_lists(stmts):
+        for i, stmt in enumerate(lst):
+            if (isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Name)
+                    and stmt.test.id == name):
+                return lst, i
+    return None, None
+
+
+def _source_before_theme_cap_fix() -> str:
+    """「同族上限接缝」**改动前**的源码：摘掉 `if _theme_cap_off:` 分支
+
+    ⇒ 一律走默认口径文案（3.5 引言仍把「同族」写成可否决依据）
+    ⇒ 用来证明「字段缺失 / max_per_theme==1 ⇒ 上下文**逐字节不变**」。
+    """
+    tree = _parse()
+    body = _build_body(tree)
+    lst, at = _find_if(body, "_theme_cap_off")
+    assert lst is not None and at is not None, (
+        "找不到 `_theme_cap_off` 分支（实现变了 ⇒ 本测试要跟着改）"
+    )
+    node = lst[at]
+    assert node.orelse, "`_theme_cap_off` 分支必须有 else（默认口径文案）"
+    lst[at:at + 1] = node.orelse      # 只留 else（默认口径）⇒ 等价于「改动前」
+    return ast.unparse(tree)
+
+
+def _source_theme_cap_never_off() -> str:
+    """变异体 C：把事实源判定短路成「永远不关」⇒ 「同族豁免」断言必须转红。"""
+    tree = _parse()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_same_theme_cap_off":
+            node.body = [ast.Return(value=ast.Constant(value=False))]
+            break
+    else:
+        raise AssertionError(
+            "找不到 `_same_theme_cap_off`（实现变了 ⇒ 本测试要跟着改）")
+    return ast.unparse(tree)
+
+
+def _source_without_theme_cap_exemption() -> str:
+    """变异体 D：抽掉「同族不构成一票否决依据」那句 ⇒ 豁免断言必须转红。"""
+    src = _current_source()
+    mutated = src.replace("**同族不构成一票否决依据**", "**同族可作参考**")
+    assert mutated != src, (
+        "没找到「同族不构成一票否决依据」这句（实现变了 ⇒ 本测试要跟着改）"
+    )
+    return mutated
+
+
 def _exec_source(source: str, name: str) -> types.ModuleType:
     """把源码 exec 成模块对象（`__file__` 指向真身 ⇒ `import account/config/overlap` 正常）。"""
     module = types.ModuleType(name)
@@ -226,10 +339,17 @@ def _exec_source(source: str, name: str) -> types.ModuleType:
 
 
 # ---------------------------------------------------------------- 夹具
-def _write_fixture(tmp_path: Path) -> Path:
-    """合成一份「候选池里有银行 + 港股互联网 + 红利」的报告 + 调仓建议。"""
+def _write_fixture(tmp_path: Path, max_per_theme=_MISSING) -> Path:
+    """合成一份「候选池里有银行 + 港股互联网 + 红利」的报告 + 调仓建议。
+
+    ``max_per_theme``：写进 ``meta.params`` 的**同族上限**（V2 冻结参数接缝）。
+    默认 ``_MISSING`` ⇒ **不写这个键**（字段缺失 ⇒ 提示词必须逐字节保持现状）。
+    """
+    params = {"pool_mode": "e_covered"}
+    if max_per_theme is not _MISSING:
+        params["max_per_theme"] = max_per_theme
     report = {
-        "meta": {"asof": _ASOF, "params": {"pool_mode": "e_covered"}},
+        "meta": {"asof": _ASOF, "params": params},
         "stock_scores": {"n_stocks": 120, "unique_values": 118,
                          "degenerate_check": {"passed": True},
                          "mean": 0.0123, "std": 0.45},
@@ -366,6 +486,70 @@ def test_变异_抽掉7_1小节_任务断言必须转红(tmp_path: Path, overlap
         _assert_task_duties(_section(mutated, "## 7. 任务", "---"))
     # 变异是**外科手术**：只动任务节 ⇒ 3.5 授权断言仍应通过
     _assert_3_5_authorized(_section(mutated, "## 3.5.", "## 4."))
+
+
+# ---------------------------------------------------------------- 用例（2026-11-25 同族上限接缝）
+def test_同族上限关_同族不再被列为否决依据(tmp_path: Path, overlap_stub):
+    """`max_per_theme == 0`（V2 `allow_theme_cap=false`）⇒ 同族**不是**否决依据。"""
+    run_root = _write_fixture(tmp_path, max_per_theme=0)
+    text = _render(_exec_source(_current_source(), "btc_cap_off"), run_root)
+    section = _section(text, "## 3.5.", "## 4.")
+    _assert_theme_cap_off(section)
+    # 改的只是引言 ⇒ 3.5 表格（表头 + 数据行）逐字不变
+    assert _table_rows(section) == _EXPECTED_TABLE_ROWS, "3.5 表格被连带改了"
+
+
+def test_同族上限关_上下文必须与改动前不同(tmp_path: Path, overlap_stub):
+    """`max_per_theme == 0` ⇒ 上下文**必须**与「改动前」不同（证明改动真生效）。"""
+    run_root = _write_fixture(tmp_path, max_per_theme=0)
+    now = _render(_exec_source(_current_source(), "btc_cap_off_now"), run_root)
+    before = _render(
+        _exec_source(_source_before_theme_cap_fix(), "btc_cap_off_before"), run_root)
+    assert now != before, "同族上限=关时上下文与改动前一样 ⇒ 改动没生效"
+    # 「改动前」确实还是旧口径（把「同族」当可否决依据）
+    assert "同族不构成一票否决依据" not in before
+    assert "凡表中**同族**、" in before
+
+
+def test_max_per_theme缺失_上下文与改动前逐字节一致(tmp_path: Path, overlap_stub):
+    """字段**缺失** ⇒ 提示词**逐字节保持现状**（fail-safe，不许动现有金标文案）。"""
+    run_root = _write_fixture(tmp_path)          # 不写 max_per_theme 这个键
+    now = _render(_exec_source(_current_source(), "btc_missing_now"), run_root)
+    before = _render(
+        _exec_source(_source_before_theme_cap_fix(), "btc_missing_before"), run_root)
+    assert now == before, "字段缺失时上下文变了 ⇒ 破坏了 fail-safe 约定"
+    # 默认口径文案原样保留
+    assert _DEFAULT_OVERLAP_INTRO in _section(now, "## 3.5.", "## 4.")
+    assert "同族不构成一票否决依据" not in now
+
+
+def test_max_per_theme为1_上下文与改动前逐字节一致(tmp_path: Path, overlap_stub):
+    """`max_per_theme == 1`（默认口径）⇒ 提示词**逐字节保持现状**。"""
+    run_root = _write_fixture(tmp_path, max_per_theme=1)
+    now = _render(_exec_source(_current_source(), "btc_one_now"), run_root)
+    before = _render(
+        _exec_source(_source_before_theme_cap_fix(), "btc_one_before"), run_root)
+    assert now == before, "max_per_theme=1 时上下文变了 ⇒ 破坏了默认口径约定"
+    assert _DEFAULT_OVERLAP_INTRO in _section(now, "## 3.5.", "## 4.")
+    assert "同族不构成一票否决依据" not in now
+
+
+def test_变异_事实源短路_同族豁免断言必须转红(tmp_path: Path, overlap_stub):
+    """变异负例 C：事实源判定短路成「永远不关」⇒ 同族豁免断言必须转红。"""
+    run_root = _write_fixture(tmp_path, max_per_theme=0)
+    mutated = _render(
+        _exec_source(_source_theme_cap_never_off(), "btc_mut_cap"), run_root)
+    with pytest.raises(AssertionError):
+        _assert_theme_cap_off(_section(mutated, "## 3.5.", "## 4."))
+
+
+def test_变异_抽掉同族豁免句_豁免断言必须转红(tmp_path: Path, overlap_stub):
+    """变异负例 D：抽掉「同族不构成一票否决依据」那句 ⇒ 豁免断言必须转红。"""
+    run_root = _write_fixture(tmp_path, max_per_theme=0)
+    mutated = _render(
+        _exec_source(_source_without_theme_cap_exemption(), "btc_mut_exempt"), run_root)
+    with pytest.raises(AssertionError):
+        _assert_theme_cap_off(_section(mutated, "## 3.5.", "## 4."))
 
 
 @pytest.mark.skipif(not (_REAL_SNAPSHOT / "etf_analysis_report.json").exists(),

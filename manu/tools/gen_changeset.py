@@ -20,7 +20,7 @@ import hashlib
 import os
 from pathlib import Path
 
-PROJ = Path("/tmp/pycharm_project_658d3fc4")
+PROJ = Path("/tmp/pycharm_project_3b68a403")
 RESULTS = Path("/mnt/data/siping/runs/etf_rotation_results")
 BASELINE_FRP = RESULTS / "_backup_pre_pctfix_20261117" / "final_rebalance_plan.py"
 

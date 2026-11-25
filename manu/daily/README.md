@@ -292,7 +292,7 @@ python manu/etf_rotation/daily/main.py [选项]
 ### 用法示例
 
 ```bash
-#    ⬇ 本块所有命令的前提：cwd ＝ 工程根（服务器工作副本 /tmp/pycharm_project_658d3fc4）
+#    ⬇ 本块所有命令的前提：cwd ＝ 工程根（服务器工作副本 /tmp/pycharm_project_3b68a403）
 #    解释器 ＝ /home/huangzhe/anaconda3/envs/ql/bin/python（下面写 'python' 只是简写，**别用系统 python3**）
 
 # ① 完整跑（缺省 = 观察态）：现场拉数 → 内存计算 → 落一个快照目录
@@ -343,7 +343,7 @@ python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only --live-trad
 | 落点 | 路径 | 角色 |
 |:--|:--|:--|
 | **快照目录**（真值） | `<SNAPSHOT_ROOT>/<YYYYMMDD_HHMMSS>/report_<YYYYMMDD>.md` | 🔴 **权威副本**：跑完即冻结，与快照内其它件**同代** |
-| **交付目录**（副本） | `manu/report/report_<YYYYMMDD>.md`（服务器即 `/tmp/pycharm_project_658d3fc4/manu/report/`；可用 env `ETF_ROTATION_REPORT_DIR` 改目录，或用 `--report-md` 指定绝对路径） | 便于**直接贴回窗口 / 拉回 host 看**的副本 |
+| **交付目录**（副本） | `manu/report/report_<YYYYMMDD>.md`（服务器即 `/tmp/pycharm_project_3b68a403/manu/report/`；可用 env `ETF_ROTATION_REPORT_DIR` 改目录，或用 `--report-md` 指定绝对路径） | 便于**直接贴回窗口 / 拉回 host 看**的副本 |
 
 🔴 **快照才是真值**：`manu/report/` 那份是**副本**；要复盘「当时到底算了什么」，看快照目录
 （`snapshot_manifest.json` 里有每个件的 sha1 ＋ `stages` / `skipped` / `notes` / `live_trade`）。

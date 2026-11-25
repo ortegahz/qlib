@@ -278,7 +278,7 @@ def _check_account(run_root: Path) -> list[tuple[str, bool, str]]:
 
     🔴 期望值（现金 / 总资产 / 持仓集合）的**唯一来源** = **交付件同目录**的
        ``account_context.json``（账户事实源）。旧实现写死
-       ``/tmp/pycharm_project_658d3fc4/manu/etf_rotation/data/account_snapshot.csv``
+       ``/tmp/pycharm_project_3b68a403/manu/etf_rotation/data/account_snapshot.csv``
        + cash=15518.87 / total_assets=29854.67（2026-11-04 的 5 只旧账户口径）
        ⇒ 本轮真实账户（2026-11-05 口径：1 只 512800 / 总资产 30035.57 / 现金 23367.37）
        必然对不上 ⇒ 闸门必红。

@@ -39,7 +39,7 @@ OUT_DIR_EXPLICIT=0
 if [ -n "${OUT_DIR:-}" ] && [ "${OUT_DIR:-}" != "$DEFAULT_OUT_DIR" ]; then
   OUT_DIR_EXPLICIT=1
 fi
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 QL_PY="${QL_PY:-/home/huangzhe/anaconda3/envs/ql/bin/python}"
 #: 🔴 2026-11-09 新增：qlib **provider 覆盖**（默认空 = 上游基座 ⇒ **零回归**）。
 #:    显式指定时**原样透传**给 run_pipeline.sh ⇒ 重建用的数据源与每日链一致。

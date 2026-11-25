@@ -11,7 +11,7 @@ r"""只读检查 memory「铁律速览入口」与铁律正文的**一一对应*
 用法
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/check_memory_rules_index.py
     /home/huangzhe/anaconda3/envs/ql/bin/python manu/tools/check_memory_rules_index.py \
-        --project-dir /tmp/pycharm_project_658d3fc4 \
+        --project-dir /tmp/pycharm_project_3b68a403 \
         --json-out /mnt/data/siping/runs/etf_rotation_results/_memidx_check/result.json
 
 判定口径（检查 A —— 章节覆盖）
@@ -75,7 +75,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 
 RULES_REL = "manu/memory/rules.md"
 MASTER_REL = "manu/memory/memory.md"

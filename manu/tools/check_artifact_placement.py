@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 
 #: 🔴 **双 env 的名字**（§十六 末尾「全部改成由**双 env** 派生」）
 ENV_DATASET_ROOT = "ETF_ROTATION_OUTPUT_ROOT"

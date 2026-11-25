@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_658d3fc4"
+DEFAULT_PROJECT_DIR = "/tmp/pycharm_project_3b68a403"
 
 #: 回归证据根（单一事实源 = `daily_config.ETF_ROTATION_RESULTS_ROOT`，同一环境变量）
 _RESULTS_ROOT = os.environ.get(

@@ -47,7 +47,7 @@ V2_DIR_CANDIDATES = (
     # ② 从脚本自身位置推导（本文件在 `<repo>/manu/tools/` ⇒ 仓库根 = parents[2]）
     Path(__file__).resolve().parents[2] / "manu" / "etf_rotation" / "v2",
     # ③ 兜底：服务器工程根（脚本被单独拷走时）
-    Path("/tmp/pycharm_project_658d3fc4/manu/etf_rotation/v2"),
+    Path("/tmp/pycharm_project_3b68a403/manu/etf_rotation/v2"),
 )
 V2_DIR = next(
     (p for p in V2_DIR_CANDIDATES if p is not None and (p / "config_v2.py").is_file()),

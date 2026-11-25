@@ -25,7 +25,7 @@ Qlib 穿透打分 → 组合映射 → 邮件推送）。它与 `manu/etf_rotati
       * `ETF_ROTATION_RESULTS_ROOT` **结果根**（默认 /mnt/data/siping/runs/etf_rotation_results）
         ⇒ 产物/快照/报告/日志（研究链 canonical、每日链 `daily/`、`snapshots/`、`logs/`）
     🔴 **所有路径都可被环境变量覆盖**（服务器上 cron 的环境极简 ⇒ 必须能注入）
-    ETF_ROTATION_REPO_ROOT   工程根（默认 /tmp/pycharm_project_658d3fc4）
+    ETF_ROTATION_REPO_ROOT   工程根（默认 /tmp/pycharm_project_3b68a403）
     ETF_ROTATION_RUN_ROOT    每日产物根（默认 <RESULTS_ROOT>/daily）
     ETF_ROTATION_LOG_DIR     日志目录（默认 <RESULTS_ROOT>/logs）
     ETF_ROTATION_QL_PY       量化层解释器（默认 /home/huangzhe/anaconda3/envs/ql/bin/python）
@@ -74,7 +74,7 @@ ETF_ROTATION_RESULTS_ROOT = Path(
     )
 ).expanduser()
 #: 工程根（服务器工作副本）
-REPO_ROOT = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_658d3fc4"))
+REPO_ROOT = Path(os.environ.get("ETF_ROTATION_REPO_ROOT", "/tmp/pycharm_project_3b68a403"))
 #: 研究链产物根（每日链路**只读**参照，不写）
 #:    落点 `<RESULTS_ROOT>`（研究链交付件 + 每日链的父目录）
 RESEARCH_RUN_ROOT = ETF_ROTATION_RESULTS_ROOT
@@ -135,7 +135,7 @@ QLIB_DATASET_ROOT = Path(
 QLIB_CN_DATA = QLIB_DATASET_ROOT / "cn_data"
 
 #: TradingAgents 工作副本（llm env 侧）
-TRADINGAGENTS_DIR = Path(os.environ.get("ETF_ROTATION_TA_DIR", str(REPO_ROOT / "TradingAgents")))
+TRADINGAGENTS_DIR = Path(os.environ.get("ETF_ROTATION_TA_DIR", "/tmp/pycharm_project_59a2a4f0"))
 
 #: SMTP 授权码 env 文件（🔴 **不进仓库**；须 0600）
 SMTP_SECRETS_FILE = Path(
@@ -279,7 +279,7 @@ QLIB_INCREMENT_LEDGER = Path(
 #: 文件名带**分析日期**（`report_<YYYYMMDD>.md`）⇒ 便于回看与版本化。
 #: 🔴 2026-11-10 铁律十六（落点双根化）：报告**也是「结果」** ⇒ 必须落
 #:    **结果根** `<RESULTS_ROOT>/reports/`，**不许**再落仓库内 `manu/report/`
-#:    （服务器上那是 `/tmp/pycharm_project_658d3fc4/manu/report` ⇒ 既不在项目
+#:    （服务器上那是 `/tmp/pycharm_project_3b68a403/manu/report` ⇒ 既不在项目
 #:    专属根之下，又会把工程目录变成产物堆放点）。
 #:    ⇒ 报告与快照 / canonical 同属结果根，**默认不回传 host**。
 REPORT_DIR = Path(

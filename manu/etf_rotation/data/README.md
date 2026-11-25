@@ -42,22 +42,22 @@ bash manu/tools/sync_to_server.sh manu/etf_rotation/data
 
 # 1) 快照 + 候选池
 ssh -F /dev/null -p 32222 huangzhe@192.168.99.40 \
-  "cd /tmp/pycharm_project_658d3fc4 && \
+  "cd /tmp/pycharm_project_3b68a403 && \
    /home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/data/fetch_etf_universe.py --stage all"
 
 # 2) 日线历史（候选池的临时集合）
 ssh -F /dev/null -p 32222 huangzhe@192.168.99.40 \
-  "cd /tmp/pycharm_project_658d3fc4 && \
+  "cd /tmp/pycharm_project_3b68a403 && \
    /home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/data/fetch_etf_prices.py --resume"
 
 # 3) 用真实 20 日均额重算候选池（必须夹在 2 和 4 之间）
 ssh -F /dev/null -p 32222 huangzhe@192.168.99.40 \
-  "cd /tmp/pycharm_project_658d3fc4 && \
+  "cd /tmp/pycharm_project_3b68a403 && \
    /home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/data/fetch_etf_universe.py --stage finalize"
 
 # 4) 成分股权重
 ssh -F /dev/null -p 32222 huangzhe@192.168.99.40 \
-  "cd /tmp/pycharm_project_658d3fc4 && \
+  "cd /tmp/pycharm_project_3b68a403 && \
    /home/huangzhe/anaconda3/envs/ak/bin/python manu/etf_rotation/data/fetch_etf_holdings.py --resume"
 ```
 

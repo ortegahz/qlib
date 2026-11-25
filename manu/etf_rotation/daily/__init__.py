@@ -13,7 +13,7 @@
 辅助模块：`daily_config.py`（常量单一事实源）、`account_state.py`（实盘账户基准）、
 `calendar_gate.py`（交易日历门，fail-closed）、`run_paths.py`（每日产物**路径**工具，无模式概念）。
 
-入口（服务器工作副本 `/tmp/pycharm_project_658d3fc4`）：
+入口（服务器工作副本 `/tmp/pycharm_project_3b68a403`）：
 
 ```bash
 /home/huangzhe/anaconda3/envs/ql/bin/python manu/etf_rotation/daily/main.py --asof 2026-11-06

@@ -21,10 +21,14 @@
 # ============================================================
 set -euo pipefail
 
-SRC_REPO="${SRC_REPO:-/media/manu/1TB-Volume/workspace/qlib}"
+#: 🔴 2026-11-20：本地工程盘路径已变（旧 `/media/manu/1TB-Volume/workspace/qlib` **不再存在**）
+#:    ⇒ 默认值改为**从脚本自身位置反推仓库根**（本文件在 `<repo>/manu/tools/` ⇒ 上溯两级到 `<repo>`）
+#:    ⇒ 挂载点/盘符再变也不用改脚本；仍可用 env `SRC_REPO` 显式覆盖。
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_REPO="${SRC_REPO:-$(cd "$_SCRIPT_DIR/../.." && pwd)}"
 SSH_HOST="${SSH_HOST:-huangzhe@192.168.99.40}"
 SSH_PORT="${SSH_PORT:-32222}"
-REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_658d3fc4}"
+REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_3b68a403}"
 SSH_BASE=(-F /dev/null -p "$SSH_PORT" -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
 RSYNC_RSH="ssh -F /dev/null -p $SSH_PORT"
 

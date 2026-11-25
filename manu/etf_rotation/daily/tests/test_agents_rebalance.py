@@ -387,3 +387,173 @@ def test_persist_execution_card_creates_run_dir(tmp_path):
     path = AR.persist_execution_card({"orders": []}, target, "2026-12-01")
     assert path.exists()
     assert target.is_dir()
+
+
+# ==================================================================
+# 🔴 7. 同标的双行冲突（2026-11-23 真机缺陷回归）
+# ==================================================================
+#: 真机现场（2026-11-20 跑批实测）：同一标的 `512800` 产出**两条冲突行动行**
+#:   行 A（规则层「已持仓但未进入目标名额」）⇒ 目标 **0 股**    ⇒ 卖 7,700 股
+#:   行 B（TA 一票否决后的**顺延补位**）  ⇒ 目标 **1,000 股** ⇒ 卖 6,700 股
+#: 两行**都按期初 7,700 股起算** ⇒ 合计卖 **14,400 股 > 持仓 7,700 股**
+#: ⇒ `cash_end = 36,680.60` **超过**总资产 `30,501.07`（虚增 **6,179.53 元**）
+#: ⇒ `post_trade.positions` 里 512800 **重复两次**
+#: ⇒ 逐日台账 `(日期, 代码)` 主键碰撞 ⇒ **重跑不幂等**。
+_ACCOUNT_1120 = {
+    "total_assets": 30501.07,
+    "cash": 23370.87,
+    "market_value": 7130.20,
+    "positions": [
+        {"code": "512800", "name": "银行ETF华宝", "shares": 7700, "market_value": 7130.20},
+    ],
+}
+
+
+def _dup_rows_1120() -> list[dict]:
+    """复刻真机两行（行 A 目标 0 股 / 行 B 目标 1,000 股）。"""
+    return [
+        {
+            "code": "512800", "name": "银行ETF华宝", "action": "卖出",
+            "current_shares": 7700, "price": 0.926, "price_date": "2026-11-20",
+            "target_shares": 0, "delta_shares": -7700,
+            "target_weight": 0.0, "target_amount": 0.0,
+            "reason": "已持仓但未进入目标名额 ⇒ 目标 0 股",
+        },
+        {
+            "code": "512800", "name": "银行ETF华宝", "action": "买入",
+            "current_shares": 7700, "price": 0.926, "price_date": "2026-11-20",
+            "target_shares": 1000, "delta_shares": -6700,
+            "target_weight": 0.0304, "target_amount": 926.0,
+            "reason": "TA 合规筛选顺延补位 ⇒ 目标 1,000 股",
+        },
+    ]
+
+
+def test_same_code_two_rows_merge_into_one_terminal_row():
+    """🔴 同一 ticker 的两行 ⇒ 归并成**唯一一行**（后序合法覆盖前序）。"""
+    card = AR.build_execution_card(
+        actions=_dup_rows_1120(), account=_ACCOUNT_1120, asof="2026-11-20",
+        execution_date="2026-11-21", live_trade=False,
+    )
+
+    # ① orders 里 512800 **只有一条**
+    rows = [o for o in card["orders"] if o["code"] == "512800"]
+    assert len(rows) == 1, f"同一标的出现 {len(rows)} 条行动行（缺陷未修）：{rows}"
+    order = rows[0]
+
+    # ② 终态 = 后序那行 ⇒ 目标 1,000 股 / 净卖 6,700 股
+    assert order["target_shares"] == 1000
+    assert order["delta_shares"] == -6700
+    assert order["action"] == "卖出"
+    assert order["current_shares"] == 7700
+
+    # ③ post_trade.positions 里 512800 **只出现一次**
+    codes = [p["code"] for p in card["post_trade"]["positions"]]
+    assert codes.count("512800") == 1, f"positions 里 512800 重复：{codes}"
+
+    # ④ 现金守恒：cash_end 不得超过总资产（+1 元浮点容差）
+    cash_end = card["cash_flow"]["cash_end"]
+    assert cash_end <= card["account"]["total_assets"] + 1.0, (
+        f"cash_end={cash_end} 超过总资产 {card['account']['total_assets']} ⇒ 账面虚增"
+    )
+    # 实测口径：现金 23,370.87 ＋ 卖出净额 6,192.38 ⇒ 29,563.25（权益 926.00 补回）
+    assert cash_end == pytest.approx(29563.25, abs=0.01)
+
+    # ⑤ 归并必须**可审计**（披露 + 告警都要有）
+    disp = card["merge_disclosure"]
+    assert len(disp) == 1
+    assert disp[0]["code"] == "512800"
+    assert disp[0]["n_rows"] == 2
+    assert disp[0]["terminal_target_shares"] == 1000
+    assert any("512800" in w and "2 条行动行" in w for w in card["warnings"]), (
+        f"归并没有写进 warnings（不许静默）：{card['warnings']}"
+    )
+
+    # ⑥ 理由拼接保留两行来源（审计要看得见「为什么有两行」）
+    assert "目标 0 股" in order["reason"]
+    assert "顺延补位" in order["reason"]
+
+
+def test_merge_keeps_single_row_untouched():
+    """🔴 只有一行时归并**不许**改写语义（回归护栏）。"""
+    card = AR.build_execution_card(
+        actions=[{
+            "code": "512800", "name": "银行ETF华宝", "action": "卖出",
+            "current_shares": 7700, "price": 0.926, "price_date": "2026-11-20",
+            "target_shares": 1000, "delta_shares": -6700,
+            "target_weight": 0.0304, "target_amount": 926.0,
+            "reason": "维持 1,000 股",
+        }],
+        account=_ACCOUNT_1120, asof="2026-11-20", execution_date="2026-11-21",
+    )
+    order = next(o for o in card["orders"] if o["code"] == "512800")
+    assert order["target_shares"] == 1000
+    assert order["delta_shares"] == -6700
+    assert not [d for d in card["merge_disclosure"] if d["n_rows"] > 1]
+
+
+def test_fail_closed_assertion1_blocks_oversell(monkeypatch):
+    """🔴 断言①（卖出股数 ≤ 期初可用股数）**必须有牙**：归并一旦失效就硬失败。"""
+    #: 模拟「归并被绕过」的回归（探针有牙 ⇒ 断言不是摆设）
+    monkeypatch.setattr(
+        AR, "merge_actions_by_code",
+        lambda actions, account_positions=None: (list(actions or []), []),
+    )
+    with pytest.raises(ValueError, match="断言①"):
+        AR.build_execution_card(
+            actions=_dup_rows_1120(), account=_ACCOUNT_1120, asof="2026-11-20",
+            execution_date="2026-11-21",
+        )
+
+
+def test_fail_closed_assertion2_blocks_cash_inflation():
+    """🔴 断言②（cash_end ≤ total_assets + 1.0）**必须有牙**：账面虚增就硬失败。"""
+    with pytest.raises(ValueError, match="断言②"):
+        AR.build_execution_card(
+            actions=[{
+                "code": "512800", "name": "银行ETF华宝", "action": "卖出",
+                "current_shares": 7700, "price": 0.926, "price_date": "2026-11-20",
+                "target_shares": 0, "delta_shares": -7700,
+                "target_weight": 0.0, "target_amount": 0.0,
+                "reason": "清仓",
+            }],
+            account={"total_assets": 1000.0, "cash": 100.0}, asof="2026-11-20",
+            execution_date="2026-11-21",
+        )
+
+
+def test_merge_discloses_current_shares_conflict_without_silent_override():
+    """🔴 期初股数与账户快照冲突 ⇒ **如实披露**，且**硬断言①**以账户为卖出上限。"""
+    card = AR.build_execution_card(
+        actions=[{
+            "code": "512800", "name": "银行ETF华宝", "action": "卖出",
+            "current_shares": 5000, "price": 0.926, "price_date": "2026-11-20",
+            "target_shares": 1000, "delta_shares": -4000,
+            "target_weight": 0.0304, "target_amount": 926.0,
+            "reason": "减仓",
+        }],
+        account=_ACCOUNT_1120, asof="2026-11-20", execution_date="2026-11-21",
+    )
+    order = next(o for o in card["orders"] if o["code"] == "512800")
+    #: 归并只管「终态」⇒ **不改写**期初股数（改写会让既有守卫「封顶不得反向减仓」失真）
+    assert order["current_shares"] == 5000
+    assert order["delta_shares"] == -4000
+    #: 冲突必须**如实披露**（不许静默取其一）
+    assert any("期初股数冲突" in w for w in card["warnings"]), (
+        f"期初股数冲突没有披露：{card['warnings']}"
+    )
+    assert any("期初股数冲突" in str(d.get("rule") or "")
+               for d in card["merge_disclosure"]), card["merge_disclosure"]
+    #: 🔴 硬断言①：**卖出上限以账户快照为准**
+    #:    （动作行自报 9,000 股 ⇒ 卖超账户的 7,700 股 ⇒ 硬失败、不落盘）
+    with pytest.raises(ValueError, match="断言①"):
+        AR.build_execution_card(
+            actions=[{
+                "code": "512800", "name": "银行ETF华宝", "action": "卖出",
+                "current_shares": 9000, "price": 0.926, "price_date": "2026-11-20",
+                "target_shares": 0, "delta_shares": -9000,
+                "target_weight": 0.0, "target_amount": 0.0,
+                "reason": "清仓",
+            }],
+            account=_ACCOUNT_1120, asof="2026-11-20", execution_date="2026-11-21",
+        )

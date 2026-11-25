@@ -26,7 +26,7 @@
          那里本来就因为「找不到完整快照」而 skip）。
 
 【怎么跑第 2 层（服务器）】
-    cd /tmp/pycharm_project_658d3fc4
+    cd /tmp/pycharm_project_3b68a403
     export ETF_ROTATION_E2E_SEAM=1
     python -m pytest manu/etf_rotation/v2/tests/test_v2_seam_e2e_probe.py -q
   ⇒ 约 2~4 分钟（要起 6 次子进程）。

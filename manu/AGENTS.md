@@ -82,8 +82,8 @@ manu/                          # 本工程自研层 —— 全部自研代码在
 |:--|:--|
 | 本地工程 checkout | `/media/manu/1TB-Volume/workspace/qlib/`（**唯一可写编辑区**） |
 | 服务器 | `ssh -F /dev/null -p 32222 huangzhe@192.168.99.40` |
-| 服务器工程目录 | `/tmp/pycharm_project_658d3fc4`（**只读 + 同步落地区**） |
-| 本机 SSHFS 镜像 | `/home/manu/mnt/pycharm_project_658d3fc4`（**只读 ro**，写不进去，**不是推送通道**） |
+| 服务器工程目录 | `/tmp/pycharm_project_3b68a403`（**只读 + 同步落地区**） |
+| 本机 SSHFS 镜像 | `/home/manu/mnt/pycharm_project_3b68a403`（**只读 ro**，写不进去，**不是推送通道**） |
 | conda env | `ql`（Python 3.12.16）→ `source /home/huangzhe/anaconda3/etc/profile.d/conda.sh && conda activate ql` |
 | qlib 安装 | ✅ `pyqlib 0.9.8` **editable** 装到工程目录；numpy 2.5.4 / pandas 2.3.3 / lightgbm 4.7.0 |
 | 服务器持久盘 | `/mnt/data`（7.4 T）⇒ **重活产物放这里** |
@@ -100,7 +100,7 @@ manu/                          # 本工程自研层 —— 全部自研代码在
 ### 4.2 PyCharm 协同（本工程特有）
 
 - 远程解释器：`/home/huangzhe/anaconda3/envs/ql/bin/python`（SFTP 到 `192.168.99.40:32222`）
-- 自动上传：`autoUpload=Always`，映射 `local=$PROJECT_DIR$` → `deploy=/tmp/pycharm_project_658d3fc4`
+- 自动上传：`autoUpload=Always`，映射 `local=$PROJECT_DIR$` → `deploy=/tmp/pycharm_project_3b68a403`
 - **在 PyCharm GUI 里改文件** → 自动上传到服务器，**但本地 checkout 不变**。
 - **Agent 在命令行改文件** → PyCharm **不感知** ⇒ 必须 `bash manu/tools/sync_to_server.sh`。
 - 🔴 **两条方向都要记住**：
@@ -116,7 +116,7 @@ manu/                          # 本工程自研层 —— 全部自研代码在
 | 事实 | 值 |
 |:--|:--|
 | 服务器 ssh | **`ssh -F /dev/null -p 32222 huangzhe@192.168.99.40`** |
-| 服务器工程目录 | `/tmp/pycharm_project_658d3fc4`（conda env `ql`） |
+| 服务器工程目录 | `/tmp/pycharm_project_3b68a403`（conda env `ql`） |
 | 服务器数据 | `/mnt/data/...`（本机镜像 `/home/manu/mnt/data`，**只读**） |
 | 常驻作业写法 | `setsid nohup <cmd> > /mnt/data/<name>.log 2>&1 < /dev/null &` |
 

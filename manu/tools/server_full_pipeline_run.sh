@@ -27,7 +27,7 @@
 # ============================================================
 set -uo pipefail
 
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 #: 🔴 **结果落点根**（单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
 #:    `ETF_ROTATION_RESULTS_ROOT`）⇒ 产物 / 快照 / 报告 / 日志**留在服务器**，
 #:    全部落在这棵树下（**不再拷回 host**）。
@@ -48,7 +48,7 @@ ASOF_PIPE="${ASOF_PIPE:-2026-11-09}"
 ASOF_BASE="${ASOF_BASE:-2026-11-03}"
 
 #: 🔴 **2026-11-16 真机事故（必须钉在这里，不许依赖调用方的 shell）**：
-#:    服务器工程目录 `/tmp/pycharm_project_658d3fc4` **无 .git** ⇒ `import qlib` 会退到
+#:    服务器工程目录 `/tmp/pycharm_project_3b68a403` **无 .git** ⇒ `import qlib` 会退到
 #:    `setuptools_scm.get_version()` ⇒ **探测不到版本** ⇒ `LookupError`
 #:    ⇒ 阶段 1 的 `verify_provider`（qlib 读回校验）直接炸 ⇒ **整条流水线 rc=1**
 #:    （现象：阶段 1 把 11-16 的全市场 bar 都取齐了，最后一步读回校验才挂，白跑 75 分钟）。
@@ -171,7 +171,9 @@ fi
 #:    ⇒ 阶段 4（多智能体辩论）炸 ⇒ 前面 23 分钟白跑）。
 #:    ⇒ 同样**必须开跑前预检**（这次只需 1 秒；缺了则要 23 分钟才暴露）。
 say "=== 步骤 1.6/5：TradingAgents 可用性预检（ta-dir ＋ import）==="
-TA_DIR="${ETF_ROTATION_TA_DIR:-$PROJ/TradingAgents}"
+#: 🔴 2026-11-20：PyCharm 工程映射变更 ⇒ **TradingAgents 已是独立工程**，
+#:    不再嵌在 qlib 工程目录里（`$PROJ/TradingAgents` 已不存在）⇒ 默认值改为独立工程根。
+TA_DIR="${ETF_ROTATION_TA_DIR:-/tmp/pycharm_project_59a2a4f0}"
 TA_PY="${ETF_ROTATION_LLM_PY:-/home/huangzhe/anaconda3/envs/llm/bin/python}"
 if [ -d "$TA_DIR" ] && ( cd "$PROJ" && "$TA_PY" -c "import sys; sys.path.insert(0, '$TA_DIR'); from tradingagents.default_config import DEFAULT_CONFIG" ) >/dev/null 2>&1; then
   say "   ✅ TradingAgents 可用（$TA_DIR）"

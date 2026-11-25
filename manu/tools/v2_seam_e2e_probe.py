@@ -40,7 +40,7 @@ DAILY_DIR_CANDIDATES = (
     if os.environ.get("ETF_ROTATION_REPO_ROOT")
     else None,
     Path(__file__).resolve().parents[2] / "manu" / "etf_rotation" / "daily",
-    Path("/tmp/pycharm_project_658d3fc4/manu/etf_rotation/daily"),
+    Path("/tmp/pycharm_project_3b68a403/manu/etf_rotation/daily"),
 )
 DAILY_DIR = next((p for p in DAILY_DIR_CANDIDATES if p and (p / "daily_config.py").exists()), None)
 if DAILY_DIR is None:  # pragma: no cover

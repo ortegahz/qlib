@@ -435,7 +435,7 @@ def main() -> int:
             "generated_at": "2026-11-04T00:00:00+08:00",
             "host": "test-Super-Server",
             "python_version": "3.12.16",
-            "script": "/tmp/pycharm_project_658d3fc4/manu/etf_rotation/analyze.py",
+            "script": "/tmp/pycharm_project_3b68a403/manu/etf_rotation/analyze.py",
             "inputs": {"stock_scores": {"size_bytes": 22758233}},
             "params": {"alpha_weight": 0.5},
         },

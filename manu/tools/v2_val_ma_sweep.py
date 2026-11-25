@@ -29,7 +29,7 @@ import json
 import sys
 from pathlib import Path
 
-PROJ = Path("/tmp/pycharm_project_658d3fc4")
+PROJ = Path("/tmp/pycharm_project_3b68a403")
 V2 = PROJ / "manu" / "etf_rotation" / "v2"
 sys.path.insert(0, str(V2))
 

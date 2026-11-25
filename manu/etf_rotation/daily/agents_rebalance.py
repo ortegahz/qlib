@@ -1696,6 +1696,118 @@ def _buy_cost(amount: float) -> float:
     return amt + _est_fee(amt, "buy") + amt * float(DC.SLIPPAGE_RATE)
 
 
+def merge_actions_by_code(
+    actions: list[dict] | None,
+    account_positions: list[dict] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """🔴 **标的级终态归并**（ticker 唯一主键）—— 多来源行动行归并成「每个 ticker 一行」。
+
+    🔴 2026-11-23（真机缺陷：**同标的双行冲突**）
+    实测 2026-11-20 的计划件对 **同一标的 `512800`** 产出**两条冲突行**：
+    一行「已持仓但未进入目标名额」目标 **0 股**、一行「TA 顺延补位」目标 **1,000 股**，
+    两行**都按期初 7,700 股起算** ⇒ 下游按行折算 ⇒ 合计卖出 **14,400 股 > 持仓 7,700 股**
+    ⇒ 执行卡 `cash_end = 36,680.60` **超过**总资产 `30,501.07`（虚增 **6,179.53 元**）
+    ⇒ `post_trade.positions` 里 512800 重复两次
+    ⇒ 逐日台账 `(日期, 代码)` 主键碰撞 ⇒ **重跑不幂等**。
+
+    ⇒ 本函数是**执行层的最后一道闸**（上游 `final_rebalance_plan` 已就地修好源侧，
+      这里**再兜一层** ⇒ 任何来源的动作表都先归并、再折算）：
+      - **后序合法覆盖前序**：同一 ticker 的**最后一行**是终态（目标权重 / 目标股数）；
+      - **期初股数**：动作行自报值与账户快照不一致 ⇒ **如实披露，不静默取其一**
+        （动作行的 `current_shares` 本身是研究链算出的期初实际持仓；
+          **卖出上限**以账户快照为准 ⇒ 由 `build_execution_card` 的**硬断言①**兜底）；
+      - `delta_shares` **只允许**在最后一步算一次 = 终态目标股数 − 期初股数
+        （执行卡本来就是这么算的 ⇒ 归并后每个 ticker 只有一行 ⇒ 只算一次）。
+
+    返回
+    ----
+    ``(merged_actions, disclosure)``：归并后的动作表 ＋ 逐条归并披露（审计要看得到）。
+    """
+    rows = [dict(a) for a in (actions or [])]
+    acct_shares: dict[str, int] = {}
+    for pos in (account_positions or []):
+        _code = str(pos.get("code") or "").strip().zfill(6)
+        _sh = _i(pos.get("shares"))
+        if _code and _sh is not None:
+            acct_shares[_code] = int(_sh)
+
+    order: list[str] = []
+    grouped: dict[str, list[dict]] = {}
+    unkeyed: list[dict] = []
+    for a in rows:
+        code = str(a.get("code") or "").strip().zfill(6)
+        if not code:
+            #: 🔴 无代码行**没有 ticker** ⇒ 谈不上「同标的双行」⇒ 原样保留（不丢数据）
+            unkeyed.append(a)
+            continue
+        if code not in grouped:
+            grouped[code] = []
+            order.append(code)
+        grouped[code].append(a)
+
+    merged: list[dict] = []
+    disclosure: list[dict] = []
+    for code in order:
+        group = grouped[code]
+        #: 🔴 **后序合法覆盖前序** ⇒ 终态 = 同一 ticker 的**最后一行**
+        terminal = dict(group[-1])
+        terminal["code"] = code
+        if len(group) > 1:
+            _reasons = [str(a.get("reason") or "") for a in group]
+            _reasons = [r for r in _reasons if r]
+            terminal["reason"] = "｜".join(dict.fromkeys(_reasons))
+            terminal["merged_action_rows"] = len(group)
+            disclosure.append({
+                "code": code,
+                "name": str(terminal.get("name") or ""),
+                "n_rows": len(group),
+                "winning_row_index": len(group) - 1,
+                "terminal_target_weight": _f(terminal.get("target_weight")),
+                "terminal_target_shares": _i(terminal.get("target_shares")),
+                "rule": "后序合法覆盖前序（同一 ticker 只保留终态一行）",
+            })
+        #: 🔴 **期初股数：动作行自报值与账户快照不一致 ⇒ 如实披露，不静默取其一**
+        #    （归并只管「终态」（后序覆盖前序）⇒ **不改写**期初股数：
+        #      ① 动作行的 `current_shares` 就是研究链算出的**期初实际持仓**
+        #         （生产口径来自 `account_snapshot.csv` ⇒ 与账户快照同源）；
+        #      ② 账户快照是**卖出上限**的权威 ⇒ 由下面的**硬断言①**兜底，
+        #         不在这里偷偷改写语义（改写会让「封顶不得反向减仓」等既有守卫失真）。
+        if code in acct_shares:
+            _prev = _i(terminal.get("current_shares"))
+            if _prev is not None and int(_prev) != acct_shares[code]:
+                terminal["current_shares_conflict"] = {
+                    "action_row_value": int(_prev),
+                    "account_value": acct_shares[code],
+                }
+                disclosure.append({
+                    "code": code,
+                    "name": str(terminal.get("name") or ""),
+                    "n_rows": len(group),
+                    "winning_row_index": len(group) - 1,
+                    "terminal_target_weight": _f(terminal.get("target_weight")),
+                    "terminal_target_shares": _i(terminal.get("target_shares")),
+                    "rule": (
+                        "🔴 期初股数冲突：动作行自报 "
+                        f"{int(_prev)} 股 vs 账户快照 {acct_shares[code]} 股"
+                        " ⇒ **如实披露，不静默取其一**"
+                        "（卖出上限以**账户快照**为准 ⇒ 由硬断言①兜底）"
+                    ),
+                })
+        merged.append(terminal)
+    for a in unkeyed:
+        merged.append(a)
+        disclosure.append({
+            "code": "",
+            "name": str(a.get("name") or ""),
+            "n_rows": 1,
+            "winning_row_index": 0,
+            "terminal_target_weight": _f(a.get("target_weight")),
+            "terminal_target_shares": _i(a.get("target_shares")),
+            "rule": "无代码行动行（原样保留，不参与标的级归并）",
+        })
+    return merged, disclosure
+
+
 def _aggregate_cash(orders: list[dict]) -> dict[str, float]:
     """把订单表汇总成现金流分量（卖出 / 买入各自合计）。"""
     sells = [o for o in orders if (o["delta_shares"] or 0) < 0]
@@ -1785,6 +1897,28 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
 
     acc, acc_warnings = _resolve_account(account)
     warnings.extend(acc_warnings)
+
+    # 🔴 2026-11-23（真机缺陷：**同标的双行冲突** · 根因修复 · 执行层兜底）
+    #   动作表可能对**同一 ticker** 给出多条冲突行
+    #   （规则层调仓「目标 0 股」 + TA 顺延补位「目标 1,000 股」 + 孤儿持仓保留）
+    #   ⇒ 逐行折算 ⇒ 合计卖出 > 持仓 ⇒ `cash_end` 虚增 ⇒ `post_trade.positions` 重复
+    #   ⇒ 台账 `(日期, 代码)` 主键碰撞 ⇒ 重跑不幂等。
+    #   ⇒ 这里先做**标的级终态归并**（ticker 唯一主键、**后序合法覆盖前序**）
+    #     ⇒ 每个 ticker 只剩**一行** ⇒ 下游 `delta_shares` 只算一次
+    #     ＝ 终态目标股数 − 期初实际持仓股数（期初股数取**账户快照真值**）。
+    _merged_actions, _merge_disp = merge_actions_by_code(actions, acc.get("positions") or [])
+    actions = _merged_actions
+    for _d in _merge_disp:
+        if int(_d.get("n_rows") or 1) > 1:
+            warnings.append(
+                f"🔴 同一标的 {_d['code']} {_d['name']} 出现 **{_d['n_rows']} 条行动行**"
+                f" ⇒ 已按「后序合法覆盖前序」归并为 1 条"
+                f"（终态目标股数 {_d['terminal_target_shares']}）"
+                f"｜{_d['rule']}"
+            )
+        elif "期初股数冲突" in str(_d.get("rule") or ""):
+            warnings.append(f"🔴 {_d['code']} {_d['name']}：{_d['rule']}")
+
     total_assets = _f(acc.get("total_assets"))
     cash = _f(acc.get("cash"))
     market_value = _f(acc.get("market_value"))
@@ -1940,6 +2074,101 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
                     f"> 单只上限 {max_amt:.2f} 元 ⇒ 整手口径下不可建仓"
                     f" ⇒ 该席位归现金躺平（**不下单**）"
                 ),
+            })
+            continue
+
+        # 🔴 2026-11-25（口径归位：**被最低佣金门槛作废的新开仓** ⇒ 「不可建仓」，不许「维持」）
+        #     研究链（`min_trade_gate.py`）已把这一行**就地作废**：
+        #     `min_amount_skipped=True` / `min_amount_kind="新开仓"` /
+        #     `action="不建仓"`（0 股时）/ `target_shares=0` / `delta_shares=0`。
+        #     但执行卡**从不读 `act["action"]`** ⇒ 旧口径只按 `delta_shares` 重写成「持有」
+        #     ⇒ 被门槛作废的席位被印进《无动作（维持）》表 ⇒ 读起来像「维持原仓」，
+        #        实际是「本轮根本买不进」⇒ **口径说谎**。
+        #     ⇒ 修法：命中「**0 股 + 门槛作废 + 新开仓**」⇒ **不进下单清单**，
+        #       归入 `cash_flow.unbuildable_slots`（碎屑归现金），
+        #       并把**披露**（阈值 / 被作废金额 / 门槛档位 / 原有 `lot_note`）原样带走。
+        #     ⚠️ 硬不变量：
+        #        ① 现金 / 权益 / 目标权重**零变化**（该行股数差本就为 0、金额为 0
+        #           ⇒ 归现金 ⇒ 现金守恒；`shares=0` ⇒ 权益不变）；
+        #        ② 「买不进」的标的**不得**出现在 `orders` 里；
+        #        ③ `current_shares > 0` 的「持有」行（门槛作废但**有持仓** ⇒ 维持）
+        #           **不得**被误分类（判据里的 `current_shares == 0` 就是这条）。
+        _min_kind = str(act.get("min_amount_kind") or "")
+        #: 判据里的 `delta_shares == 0`：此处股数差**还没算** ⇒ 用等价式
+        #: 「目标股数 == 当前股数 == 0」（研究链作废时把 `target_shares` 回退到
+        #: `current_shares`，两者都是 0 ⇒ 股数差必为 0）
+        _zero_position = (current_shares == 0 and target_shares == 0)
+        if (act.get("min_amount_skipped") is True and _min_kind == "新开仓"
+                and _zero_position):
+            _threshold = _f(act.get("min_amount_threshold"))
+            _skipped_amount = _f(act.get("min_amount_skipped_amount"))
+            _lot_note = str(act.get("lot_note") or "").strip()
+            _why = (
+                f"金额 {_skipped_amount:.2f} 元 < 门槛 {_threshold:.2f} 元"
+                if (_skipped_amount is not None and _threshold is not None) else ""
+            )
+            _reason = "；".join([p for p in [
+                f"🔴 最低佣金门槛作废（档位：{_min_kind}）",
+                _why,
+                "⇒ 本轮买不进（0 股建仓）⇒ 该席位归现金躺平（**不下单**）",
+                _lot_note,
+            ] if p])
+            unbuildable.append({
+                "code": code,
+                "name": name,
+                "action": "不可建仓",
+                "target_shares": 0,
+                "current_shares": current_shares,
+                "price": price,
+                "price_date": price_date,
+                "one_lot_amount": round(one_lot_amount, 2),
+                "max_amount": max_amt,
+                #: 🔴 **披露不许丢**：门槛阈值 / 被作废金额 / 门槛档位 / 原有 `lot_note`
+                "min_amount_threshold": _threshold,
+                "min_amount_skipped_amount": _skipped_amount,
+                "min_amount_kind": _min_kind,
+                "lot_note": _lot_note,
+                "reason": _reason,
+            })
+            continue
+
+        # 🔴 2026-11-25（口径归位：**研究链自判「整手买不起」** ⇒ 「不可建仓」，不许「维持」）
+        #     计划件（`final_rebalance_plan.py`）对「目标金额 < 一手金额」的席位**自己**判定：
+        #       `action="不可建仓"` / `target_shares=0` / 权重归现金 / `lot_note` 写明原因。
+        #     但执行卡**从不读 `act["action"]`** ⇒ 旧口径只按 `delta_shares` 把这一行
+        #     重写成「持有」⇒ 被印进《无动作（维持）》表 ⇒ 读起来像「维持原仓」，
+        #        实际是「本轮整手都买不起」⇒ **口径说谎**。
+        #     ⇒ 修法：命中「**计划件标签=不可建仓 + 0 股 + 目标股数=0 + 有 lot_note**」
+        #       ⇒ **不进下单清单**，归入 `cash_flow.unbuildable_slots`（碎屑归现金），
+        #       并把**披露**（`lot_note` / 一手金额 / 单只上限）原样带走。
+        #     ⚠️ 硬不变量：
+        #        ① 现金 / 权益 / 目标权重**零变化**（该行股数差本就为 0、金额为 0
+        #           ⇒ 归现金 ⇒ 现金守恒；`shares=0` ⇒ 权益不变）；
+        #        ② 「买不进」的标的**不得**出现在 `orders` 里；
+        #        ③ `current_shares > 0` 的真实持仓行**不得**被误分类
+        #           （判据里的 `current_shares == 0` 就是这条）；
+        #        ④ 与分支 A（单只金额上限）/ 分支 B（最低佣金门槛）**互斥**：本分支排在
+        #           二者**之后** ⇒ A / B 命中即 `continue` ⇒ 互不覆盖。
+        _plan_action = str(act.get("action") or "").strip()
+        _lot_note = str(act.get("lot_note") or "").strip()
+        if (_plan_action == "不可建仓" and current_shares == 0
+                and target_shares == 0 and _lot_note):
+            _reason = "；".join([p for p in [
+                f"🔴 计划件判定「整手买不起」：{_lot_note}",
+                "⇒ 整手口径下本轮买不进 ⇒ 该席位归现金躺平（**不下单**）",
+            ] if p])
+            unbuildable.append({
+                "code": code,
+                "name": name,
+                "action": "不可建仓",
+                "target_shares": 0,
+                "current_shares": current_shares,
+                "price": price,
+                "price_date": price_date,
+                "one_lot_amount": round(one_lot_amount, 2),
+                "max_amount": max_amt,
+                "lot_note": _lot_note,
+                "reason": _reason,
             })
             continue
 
@@ -2110,6 +2339,58 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         })
     equity_amount = sum(p["market_value"] or 0.0 for p in positions)
 
+    # ==================================================================
+    # 🔴 2026-11-23（真机缺陷：**同标的双行冲突**）—— **两道硬断言（Fail-Closed）**
+    #   断言①：**卖出股数 ≤ 期初可用股数**（按 code 汇总）⇒ 超出 ⇒ 直接 raise
+    #   断言②：**cash_end ≤ total_assets + 1.0**（容忍 1 元浮点误差）⇒ 超出 ⇒ 直接 raise
+    #   ⇒ 目的：从**根源**杜绝「账面虚增」这类畸变被执行卡带进实盘。
+    #   ⇒ 落点在**执行卡构造之前** ⇒ 抛异常 ⇒ 执行卡**不予落盘** ⇒ 阶段失败（`--full` 硬失败）。
+    #   ⚠️ 前提（运维约定）：跑批**之前**账户快照必须已刷新到**节点日收盘口径**
+    #      （`daily_config.ACCOUNT_SNAPSHOT_DATE` / `TOTAL_ASSETS` / `CASH`）
+    #      ⇒ 账户价 == 卡片价 ⇒ 断言②不会因隔夜价格漂移而误伤。
+    # ==================================================================
+    #: 期初可用股数：**账户快照优先**（权威）⇒ 账户没有该标的才回退到行动行自报值
+    _acct_shares: dict[str, int] = {}
+    for _pos in (acc.get("positions") or []):
+        _c = str(_pos.get("code") or "").strip().zfill(6)
+        _s = _i(_pos.get("shares"))
+        if _c and _s is not None:
+            _acct_shares[_c] = int(_s)
+
+    _sell_by_code: dict[str, int] = {}
+    _row_shares: dict[str, int] = {}
+    for _o in orders:
+        _c = str(_o.get("code") or "").strip().zfill(6)
+        _d = _i(_o.get("delta_shares"))
+        if not _c or _d is None:
+            continue
+        if int(_d) < 0:
+            _sell_by_code[_c] = _sell_by_code.get(_c, 0) + int(_d)
+        _cur = _i(_o.get("current_shares"))
+        if _cur is not None:
+            _row_shares[_c] = max(_row_shares.get(_c, 0), int(_cur))
+
+    for _c in sorted(_sell_by_code):
+        _sell_shares = -int(_sell_by_code[_c])
+        _avail = _acct_shares.get(_c, _row_shares.get(_c))
+        if _avail is None:
+            continue
+        if _sell_shares > int(_avail):
+            raise ValueError(
+                f"🔴 Fail-Closed 断言①失败：{_c} 卖出股数 {_sell_shares} > 期初可用股数 "
+                f"{int(_avail)}（超卖 {_sell_shares - int(_avail)} 股）"
+                f" ⇒ 执行卡**不予落盘**（多半是「同标的双行」没归并干净）"
+            )
+
+    _cash_end_check = _f(cash_flow.get("cash_end"))
+    if _cash_end_check is not None and total_assets is not None:
+        if _cash_end_check > total_assets + 1.0:
+            raise ValueError(
+                f"🔴 Fail-Closed 断言②失败：调仓后现金 {_cash_end_check:.2f} 元 > 总资产 "
+                f"{total_assets:.2f} 元（虚增 {_cash_end_check - total_assets:.2f} 元）"
+                f" ⇒ 执行卡**不予落盘**（多半是「同标的双行」重复计卖出）"
+            )
+
     n_built = sum(1 for p in positions if (p["shares"] or 0) > 0)
     if n_built < n_target:
         warnings.append(
@@ -2140,6 +2421,8 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             "market_value": market_value,
         },
         "orders": orders,
+        #: 🔴 2026-11-23：**标的级终态归并**的逐条披露（审计要看得到「哪只被合并过」）
+        "merge_disclosure": _merge_disp,
         "post_trade": {
             "cash": cash_end_value,
             "equity_amount": round(equity_amount, 2),

@@ -70,7 +70,7 @@ OUTPUT_ROOT = Path(
 )
 DEFAULT_RUN_ROOT = RESULTS_ROOT / "daily"
 DEFAULT_SECRETS = Path("/mnt/data/siping/secrets/smtp.env")
-DEFAULT_REPO = Path("/tmp/pycharm_project_658d3fc4")
+DEFAULT_REPO = Path("/tmp/pycharm_project_3b68a403")
 DEFAULT_CALENDAR = OUTPUT_ROOT / "datasets" / "etf" / "trade_calendar.csv"
 CRON_TAG = "etf_rotation_daily"
 

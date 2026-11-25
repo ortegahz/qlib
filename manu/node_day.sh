@@ -42,7 +42,7 @@ DEFAULT_RUN_ROOT="$RESULTS_ROOT"
 OUTPUT_ROOT="${ETF_ROTATION_OUTPUT_ROOT:-/mnt/data/siping/datasets/manu/etf_rotation}"
 #: 临时工作区 = 数据集根下的 `_work/`（与 `daily_config.WORK_ROOT` 同口径）
 WORK_ROOT="$OUTPUT_ROOT/_work"
-DEFAULT_REPO_ROOT="/tmp/pycharm_project_658d3fc4"
+DEFAULT_REPO_ROOT="/tmp/pycharm_project_3b68a403"
 
 # ---- 参数默认值 --------------------------------------------------------------
 NODE_DATE=""
@@ -60,7 +60,7 @@ usage() {
 
 可选：
   --run-root PATH             产物目录（默认 <落点根>/runs）
-  --repo-root PATH            工程根目录（默认 /tmp/pycharm_project_658d3fc4）
+  --repo-root PATH            工程根目录（默认 /tmp/pycharm_project_3b68a403）
   --total-assets-basis {plan|node}
                               总资产口径（默认 plan；**透传**给 reprice_node_day.py）
                                 plan = 计划件口径（**账户快照日** 2026-11-04 的账户总资产）

@@ -1059,7 +1059,7 @@ def _mutate_baseline(plan: dict) -> list[tuple[str, dict]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="verify_artifacts 两条新断言的守卫自检")
     parser.add_argument("--run-root", default=str(C.ETF_RUN_ROOT))
-    parser.add_argument("--project-dir", default="/tmp/pycharm_project_658d3fc4")
+    parser.add_argument("--project-dir", default="/tmp/pycharm_project_3b68a403")
     parser.add_argument("--keep", action="store_true", help="保留临时目录（默认结束即删）")
     args = parser.parse_args()
 

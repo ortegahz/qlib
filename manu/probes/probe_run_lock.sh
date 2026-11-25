@@ -25,7 +25,7 @@
 # 退出码：0 = 全部断言通过；1 = 有断言失败
 set -uo pipefail
 
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 #: 🔴 **结果落点根**（单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
 #:    `ETF_ROTATION_RESULTS_ROOT`）⇒ 产物根 = 结果根
 RESULTS_ROOT="${ETF_ROTATION_RESULTS_ROOT:-/mnt/data/siping/runs/etf_rotation_results}"

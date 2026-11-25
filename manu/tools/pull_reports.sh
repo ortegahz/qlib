@@ -7,7 +7,7 @@
 #     流水线在服务器上跑（重活上服务器，铁律二）⇒ 报告天然落在服务器的
 #     $REMOTE_ROOT/manu/report/ ⇒ 但用户在 PyCharm 里打开的是 **host 工程**
 #     ⇒ 报告必须【拉回 host】才看得到。
-#     本机 SSHFS 挂载 /home/manu/mnt/pycharm_project_658d3fc4 是【只读】，
+#     本机 SSHFS 挂载 /home/manu/mnt/pycharm_project_3b68a403 是【只读】，
 #     能读服务器但**推不回去**；pull 方向则可以直接用它读，不必再走 ssh。
 #
 #   用法:
@@ -20,12 +20,16 @@
 # ============================================================
 set -euo pipefail
 
-SRC_REPO="${SRC_REPO:-/media/manu/1TB-Volume/workspace/qlib}"
+#: 🔴 2026-11-20：本地工程盘路径已变（旧 `/media/manu/1TB-Volume/workspace/qlib` **不再存在**）
+#:    ⇒ 默认值改为**从脚本自身位置反推仓库根**（本文件在 `<repo>/manu/tools/` ⇒ 上溯两级到 `<repo>`）
+#:    ⇒ 挂载点/盘符再变也不用改脚本；仍可用 env `SRC_REPO` 显式覆盖。
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_REPO="${SRC_REPO:-$(cd "$_SCRIPT_DIR/../.." && pwd)}"
 SSH_HOST="${SSH_HOST:-huangzhe@192.168.99.40}"
 SSH_PORT="${SSH_PORT:-32222}"
-REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_658d3fc4}"
+REMOTE_ROOT="${REMOTE_ROOT:-/tmp/pycharm_project_3b68a403}"
 # 本机 SSHFS 挂载点（只读镜像）；挂不上就退回 ssh + rsync
-SSHFS_MIRROR="${SSHFS_MIRROR:-/home/manu/mnt/pycharm_project_658d3fc4}"
+SSHFS_MIRROR="${SSHFS_MIRROR:-/home/manu/mnt/pycharm_project_3b68a403}"
 
 # 🔴 2026-11-10 铁律十六：报告的真值已随「落点双根化」搬到**结果根**下的
 #    `reports/`（不再落仓库内 `manu/report/`）⇒ 拉取源改指结果根。
@@ -71,7 +75,7 @@ remote_list() {
   if [ "$REMOTE_READ" = "sshfs" ]; then
     ( cd "$SRC_DIR" && find . -maxdepth 1 -name '*.md' -type f -printf '%P\n' | sort )
   else
-    ssh -F /dev/null -p "$SSH_PORT" "$SSH_HOST" \
+    ssh -F /dev/null -n -p "$SSH_PORT" "$SSH_HOST" \
       "cd '$REMOTE_DIR' && find . -maxdepth 1 -name '*.md' -type f -printf '%P\n' | sort"
   fi
 }
@@ -80,7 +84,7 @@ remote_md5() {
   if [ "$REMOTE_READ" = "sshfs" ]; then
     md5sum "$SRC_DIR/$rel" | awk '{print $1}'
   else
-    ssh -F /dev/null -p "$SSH_PORT" "$SSH_HOST" "md5sum '$REMOTE_DIR/$rel'" | awk '{print $1}'
+    ssh -F /dev/null -n -p "$SSH_PORT" "$SSH_HOST" "md5sum '$REMOTE_DIR/$rel'" | awk '{print $1}'
   fi
 }
 
@@ -118,7 +122,7 @@ while IFS= read -r rel; do
   if [ "$REMOTE_READ" = "sshfs" ]; then
     cp -f "$SRC_DIR/$rel" "$LOCAL_DIR/$rel.tmp" && mv -f "$LOCAL_DIR/$rel.tmp" "$LOCAL_DIR/$rel"
   else
-    ssh -F /dev/null -p "$SSH_PORT" "$SSH_HOST" "cat '$REMOTE_DIR/$rel'" > "$LOCAL_DIR/$rel.tmp"
+    ssh -F /dev/null -n -p "$SSH_PORT" "$SSH_HOST" "cat '$REMOTE_DIR/$rel'" > "$LOCAL_DIR/$rel.tmp"
     mv -f "$LOCAL_DIR/$rel.tmp" "$LOCAL_DIR/$rel"
   fi
 done <<< "$FILES"

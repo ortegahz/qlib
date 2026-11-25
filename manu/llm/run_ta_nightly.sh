@@ -3,7 +3,7 @@
 #   bash manu/etf_rotation/llm/run_ta_nightly.sh [ticker] [date]
 # 需要 api.minimaxi.com 网络访问；产物落在 <run-root>/tradingagents_decision.{md,json}
 set -uo pipefail
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 LLM_PY="${LLM_PY:-/home/huangzhe/anaconda3/envs/llm/bin/python}"
 #: 🔴 **结果落点根**（单一事实源 = `manu/etf_rotation/daily/daily_config.py` 的
 #:    `ETF_ROTATION_RESULTS_ROOT`）⇒ 产物根 = 结果根

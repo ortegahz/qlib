@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-PROJ="${PROJ_DIR:-/tmp/pycharm_project_658d3fc4}"
+PROJ="${PROJ_DIR:-/tmp/pycharm_project_3b68a403}"
 QL_PY="${QL_PY:-/home/huangzhe/anaconda3/envs/ql/bin/python}"
 V2_ROOT="$PROJ/manu/etf_rotation/v2"
 LOG="${LOG:-/mnt/data/siping/runs/etf_rotation_results/v2/_gates_v2_$(date +%Y%m%dT%H%M%S).log}"

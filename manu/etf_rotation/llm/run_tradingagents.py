@@ -34,7 +34,7 @@ if str(_ROOT) not in sys.path:
 
 import config as C  # noqa: E402
 
-DEFAULT_TA_DIR = "/tmp/pycharm_project_658d3fc4/TradingAgents"
+DEFAULT_TA_DIR = "/tmp/pycharm_project_59a2a4f0"
 #: 产物根（落点 `<落点根>/runs`；与研究链 `config.ETF_RUN_ROOT` 同源）
 DEFAULT_RUN_ROOT = C.ETF_RUN_ROOT
 

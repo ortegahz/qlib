@@ -70,10 +70,16 @@ _UNIVERSE = set(_NAMES)
 
 
 def _screening(monkeypatch, actions=None, candidates=None, rejections=None,
-               held=("512800",), current_weights=None):
-    """跑一次 `apply_ta_screening`（重合度算不出来 ⇒ 视作「无冲突对」，不编数据）。"""
+               held=("512800",), current_weights=None, max_per_theme=None):
+    """跑一次 `apply_ta_screening`（重合度算不出来 ⇒ 视作「无冲突对」，不编数据）。
+
+    🔴 2026-11-25（V2 冻结件接缝）：``max_per_theme`` = **本轮生效**的同族上限
+    （``None`` ⇒ 回落 ``config.MAX_PER_THEME`` ⇒ 行为与今天逐字相同；
+    **0 ＝ 不限** ⇒ 同族可占第二槽）。
+    """
     monkeypatch.setattr(F.overlap_mod, "compute_overlap_pairs",
                         lambda **kw: [])
+    extra = {} if max_per_theme is None else {"max_per_theme": max_per_theme}
     return F.apply_ta_screening(
         actions=actions if actions is not None else _ACTIONS,
         candidates=candidates if candidates is not None else _CANDIDATES,
@@ -88,6 +94,7 @@ def _screening(monkeypatch, actions=None, candidates=None, rejections=None,
         equity_cap=0.8,
         universe_codes=set(_UNIVERSE),
         official_names=_NAMES,
+        **extra,
     )
 
 
@@ -116,8 +123,83 @@ def test_端到端_披露里有守卫字段(monkeypatch):
     res = _screening(monkeypatch)
     guard = res["ta_screening"].get("theme_guard")
     assert isinstance(guard, dict), res["ta_screening"].keys()
+    #: 🔴 2026-11-25（V2 接缝）：守卫披露的必须是**生效值**
+    #:    （不传 ⇒ 回落 `config.MAX_PER_THEME`）
     assert int(guard["max_per_theme"]) == int(C.MAX_PER_THEME), guard
     assert "theme_map" in guard and "blocked" in guard, guard
+
+
+# ───────────── ② 生效同族上限（V2 冻结件接缝 · 2026-11-25）─────────────
+def test_生效值等于传入值(monkeypatch):
+    """🔴 守卫披露的 `max_per_theme` ＝ **本轮生效值**（＝ 传进来的值）。"""
+    res = _screening(monkeypatch, max_per_theme=3)
+    guard = res["ta_screening"]["theme_guard"]
+    assert int(guard["max_per_theme"]) == 3, guard
+    assert int(res["ta_screening"]["max_per_theme_effective"]) == 3, res["ta_screening"]
+
+
+def test_缺省回落config(monkeypatch):
+    """🔴 不传 `max_per_theme` ⇒ 回落 `config.MAX_PER_THEME`（**旧行为逐字不变**）。"""
+    res = _screening(monkeypatch)
+    guard = res["ta_screening"]["theme_guard"]
+    assert int(guard["max_per_theme"]) == int(C.MAX_PER_THEME), guard
+    assert int(res["ta_screening"]["max_per_theme_effective"]) == int(C.MAX_PER_THEME)
+
+
+def test_生效值0时同族可占第二槽_但顺延替换纪律不变(monkeypatch):
+    """🔴 生效值 **0 ＝ 不限** ⇒ **最终清单**的同族配额不拦（守卫不拦）；
+    但**顺延的同族替换纪律不变**（顺延者仍须与已入选集合**及被否决者**不同族）。
+
+    🔴 2026-11-25 审计修正：本条原先断言「上限 0 时允许顺延同族」——**那条是错的**。
+    「同族上限=0」只放开**同族配额**（最终清单 + 顺延的同族计数闸门）；
+    顺延的**替换纪律**（否则「否决一只银行 ETF、换来另一只银行 ETF」⇒ 否决形同虚设）
+    与同族上限**无关**，由三处钉死：① `apply_ta_screening` docstring；
+    ② 探针 A3「顺延结果必须与已入选集合…不同族」＋ A5 变异负例；
+    ③ 提示词 3.5 小节（`max_per_theme == 0` 分支**仍**写
+    「顺延者必须与已入选集合**不同族**」⇒ `test_ta_context_duties.py` 钉死）。
+    ⇒ 代码必须与之一致（否则「提示词说一套、代码做另一套」）。
+    """
+    res = _screening(monkeypatch, max_per_theme=0)
+    guard = res["ta_screening"]["theme_guard"]
+    assert int(guard["max_per_theme"]) == 0, guard
+    assert guard["blocked"] == [], guard
+    codes = [str(r.get("code")) for r in res["actions"]]
+    #: 🔴 顺延仍**必须**不同族 ⇒ 515020（银行，与被否决的 512800 同族）**不许**补位
+    assert "515020" not in codes, res["actions"]
+    #: 补位的是**不同族**的 512890（证券）
+    assert "512890" in codes, res["actions"]
+
+
+def test_守卫本体_生效值0时同族两只都留():
+    """🔴 `_final_theme_guard` 本体：生效值 0 ⇒ 同族两只新买**都留**。"""
+    kept = [
+        {"code": "515020", "name": "银行ETF易方达", "action": "买入",
+         "target_weight": 0.16, "current_weight": 0.0},
+        {"code": "512800", "name": "银行ETF华宝", "action": "买入",
+         "target_weight": 0.16, "current_weight": 0.0},
+    ]
+    out = F._final_theme_guard(
+        kept, [], theme_of=_themes({"515020": "银行", "512800": "银行"}),
+        max_per_theme=0,
+        score_of=lambda c: {"515020": 1.95, "512800": 1.90}.get(c, 0.0))
+    assert out["blocked"] == [], out
+    assert float(kept[0]["target_weight"]) == 0.16, kept
+    assert float(kept[1]["target_weight"]) == 0.16, kept
+
+
+def test_守卫本体_缺省回落config():
+    """🔴 `_final_theme_guard` 不传 `max_per_theme` ⇒ 回落 `config.MAX_PER_THEME`。"""
+    kept = [
+        {"code": "515020", "name": "银行ETF易方达", "action": "买入",
+         "target_weight": 0.16, "current_weight": 0.0},
+        {"code": "512800", "name": "银行ETF华宝", "action": "买入",
+         "target_weight": 0.16, "current_weight": 0.0},
+    ]
+    out = F._final_theme_guard(
+        kept, [], theme_of=_themes({"515020": "银行", "512800": "银行"}),
+        score_of=lambda c: {"515020": 1.95, "512800": 1.90}.get(c, 0.0))
+    assert int(out["max_per_theme"]) == int(C.MAX_PER_THEME), out
+    assert [b["code"] for b in out["blocked"]] == ["512800"], out
 
 
 # ───────────────────────── ② 守卫本体 ─────────────────────────
