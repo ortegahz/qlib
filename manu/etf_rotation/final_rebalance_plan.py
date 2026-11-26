@@ -2359,7 +2359,10 @@ def _defensive_effective_slots(
 
     【保留哪几只（确定性排序，不许随机）】
       ① **当前有持仓的优先**（`current_shares > 0` 或当前权重表命中）；
-      ② 其余按目标权重 **降序**；③ 同优先级按 `code` **升序**。
+      ② 其余按目标权重 **降序**；③ 同优先级按**规则层最终分 `final_score` 降序**，
+      再按 `code` **升序**（🔴 2026-11-26 修：旧口径并列时按代码升序
+      ⇒ 会把**规则层第 5 名**（final=+0.8159 的 563020）挤掉、留下**顺延补位**
+      final=-0.8850 的 515650 ⇒ 交付层与 TA「买 563020」的权威裁决背离）。
 
     【权重怎么给】
       每席 = ``席位预算 / n_slots``，再按单只上限 ``config.MAX_SINGLE_WEIGHT`` **截断**
@@ -2392,6 +2395,11 @@ def _defensive_effective_slots(
         if not current_weights:
             return False
         return _code(r) in current_weights
+
+    def _score(r: dict) -> float:
+        """该席位的**规则层最终分**（拿不到 ⇒ 0.0，不编数字）。"""
+        v = _f(r.get("final_score"))
+        return float(v) if v is not None else 0.0
 
     rows = [dict(r) for r in (seat_rows or [])]
     facts: dict = {"effective_slots": None}
@@ -2427,9 +2435,23 @@ def _defensive_effective_slots(
     #:    （存活席位比允许的少 ⇒ 全部保留，每个分到的更多 ⇒ 仍 ≥ 门槛）
     n_slots = min(len(seat_idx), max(1, raw_floor))
 
+    #: 🔴 2026-11-26（真缺陷 · 槽位挤掉的是**规则层更好的席位**）：
+    #:    实测（11-25 跑批 `snapshots/20261125_180119` · 修好否决解析后重生成）：
+    #:    存活 3 席（512800 持仓席 / 563020 规则层第 5 名 final=+0.8159 /
+    #:    515650 顺延补位 final=**-0.8850**）⇒ 槽位上限 2 ⇒ 旧排序（同权重按
+    #:    **代码升序**）挑中「515650」⇒ **把规则层第 5 名 563020 挤掉**（归现金），
+    #:    而 TA 权威裁决明写「**买 563020**（16%）」⇒ 交付层与裁决再次背离。
+    #:    ⇒ 修法：并列权重时按**规则层最终分降序**（确定性 tie-break），再按代码升序。
+    #:       （本函数 docstring 里「被 TA 否决的 159307 抢槽位、把池内第一名挤掉」
+    #:         那条历史事故是**同源缺陷**：槽位挑选没按规则层排名排序。）
     order = sorted(
         seat_idx,
-        key=lambda i: (0 if _held(rows[i]) else 1, -_tw(rows[i]), _code(rows[i])),
+        key=lambda i: (
+            0 if _held(rows[i]) else 1,
+            -_tw(rows[i]),
+            -_score(rows[i]),
+            _code(rows[i]),
+        ),
     )
     keep_idx = set(order[:n_slots])
     drop_idx = order[n_slots:]
