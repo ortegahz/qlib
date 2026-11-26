@@ -20,7 +20,9 @@ M1 沙箱基线绿（交付面 == 快照）⇒ rc 0；
 M2 交付面内容被改 ⇒ 必须报「A 交付面与快照真值不一致」；
 M3 快照内报告副本缺失 ⇒ 必须报「B 快照内缺报告副本」；
 M4 交付面报告缺失 ⇒ 必须报「C 交付面缺报告」；
-M5 同一 asof 有多个快照 ⇒ 必须以 ``finalized_at`` **最新**的那个为准；
+M5 同一 asof 有多个**交付**快照 ⇒ 必须以 ``finalized_at`` **最新**的那个为准；
+M5b 🔴 **stage-1/2 半成品快照**（无计划件/执行卡）⇒ **不参与判定**（否则制造假红）；
+M5c 🔴 **历史交付日**（非当前交付日）的分叉 ⇒ **只披露、不判红**（历史不回改）；
 M6 🔴 **反例**：交付面有报告但**找不到对应快照** ⇒ 只披露、**rc 0**（历史报告不算缺陷）；
 M7 工具**只读** ⇒ 跑完整个结果根的 md5 必须一字不变；
 M8 结果根不存在 ⇒ 退出码 **2**（用法/输入错误，不是「绿灯」）。
@@ -76,13 +78,29 @@ def _load_tool():
 TOOL = _load_tool()
 
 
-def _write_snapshot(root: Path, run_id: str, *, asof: str, finalized: str, body: str | None) -> Path:
+def _write_snapshot(
+    root: Path,
+    run_id: str,
+    *,
+    asof: str,
+    finalized: str,
+    body: str | None,
+    delivery: bool = True,
+) -> Path:
+    """写一个快照目录。
+
+    ``delivery=True`` ⇒ **交付快照**（有计划件 ＋ 执行卡）；``False`` ⇒
+    **stage-1/2 半成品快照**（只刷数据/打分）⇒ **不参与判定**（2026-11-26 实测踩过这个坑）。
+    """
     snap = root / "snapshots" / run_id
     snap.mkdir(parents=True, exist_ok=True)
     (snap / "snapshot_manifest.json").write_text(
         json.dumps({"run_id": run_id, "asof": asof, "finalized_at": finalized}, ensure_ascii=False),
         encoding="utf-8",
     )
+    if delivery:
+        (snap / "final_rebalance_plan.json").write_text("{}\n", encoding="utf-8")
+        (snap / f"execution_card_{asof.replace('-', '')}.json").write_text("{}\n", encoding="utf-8")
     if body is not None:
         (snap / f"report_{asof.replace('-', '')}.md").write_text(body, encoding="utf-8")
     return snap
@@ -161,12 +179,40 @@ def test_m5_latest_snapshot_wins(sandbox: Path) -> None:
     assert "A" in [d.code for d in result.defects], result.as_dict()
 
 
+def test_m5b_partial_snapshot_must_not_be_judged(sandbox: Path) -> None:
+    """M5b：半成品快照（无计划件/执行卡）**不参与判定** ⇒ 不得把真一致报成不一致。"""
+    _write_snapshot(sandbox, "20261117_221846", asof="2026-11-17", finalized="2026-11-17T23:08:55+08:00", body="交付版\n")
+    _write_published(sandbox, "2026-11-17", "交付版\n")
+    # 同 asof、更晚定稿，但**只是数据刷新的半成品**（2026-11-26 实测同型）
+    _write_snapshot(sandbox, "20261118_121403", asof="2026-11-17", finalized="2026-11-18T12:14:39+08:00", body=None, delivery=False)
+    result = TOOL.analyze(str(sandbox))
+    assert result.ok, result.as_dict()
+    assert any("半成品快照" in note for note in result.notes), result.as_dict()
+
+
+def test_m5c_historical_asof_drift_is_only_disclosed(sandbox: Path) -> None:
+    """M5c：历史交付日分叉 ⇒ 只披露、**不判红**；但**当前交付日**分叉必须判红。"""
+    _write_snapshot(sandbox, "20261111_172340", asof="2026-11-11", finalized="2026-11-12T09:22:24+08:00", body="历史真值\n")
+    _write_published(sandbox, "2026-11-11", "历史发布面\n")
+    _write_snapshot(sandbox, "20261125_180119", asof="2026-11-25", finalized="2026-11-26T09:15:16+08:00", body="当前真值\n")
+    _write_published(sandbox, "2026-11-25", "当前真值\n")
+    result = TOOL.analyze(str(sandbox))
+    assert result.ok, result.as_dict()
+    assert result.current_asof == "2026-11-25", result.as_dict()
+    assert any("历史交付日分叉" in note for note in result.notes), result.as_dict()
+
+    _write_published(sandbox, "2026-11-25", "当前发布面没跟上\n")
+    result = TOOL.analyze(str(sandbox))
+    assert not result.ok
+    assert "A" in [d.code for d in result.defects], result.as_dict()
+
+
 def test_m6_published_without_snapshot_is_only_disclosed(sandbox: Path) -> None:
     """M6（反例）：交付面有报告但没有对应快照 ⇒ 只披露、**rc 0**。"""
     _write_published(sandbox, "2026-11-17", "历史报告\n")
     result = TOOL.analyze(str(sandbox))
     assert result.ok, result.as_dict()
-    assert any("找不到对应快照" in note for note in result.notes), result.as_dict()
+    assert any("找不到对应交付快照" in note for note in result.notes), result.as_dict()
 
 
 def test_m7_tool_is_read_only(sandbox: Path) -> None:
