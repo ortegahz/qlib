@@ -75,6 +75,29 @@ _RATING_RE = re.compile(r"\*{0,2}(?<![A-Za-z])Rating\*{0,2}\s*[:：]\s*(?P<v>[^\
 #:      「触发后 / 触发则 / 触发时 / 触发条件」仍按条件句处理。
 _FACT_TRIGGER_RE = re.compile(r"(?:已|已经|均|皆|都|全部)?触发(?![后则时条])")
 
+#: 🔴 2026-11-26（真缺陷 · **前瞻触发句**被当成本轮裁决 · 11-25 17:31 真机跑批实证）：
+#:    交付件 `snapshots/20261125_180119` 的 TA 权威裁决章里写着
+#:      「**风险触发**（任一出现即调整，不等下个节点）：① 可核实的银行重大信用/监管/分红事件
+#:        → 对 512800 一票否决、权益降至 ≤16%；② 512800 跌破 MA60 → 按规则强制退出且不再加回；
+#:        ③ 组合回撤触及 -15% → 整体转现金；④ 若 563020 与 512800 的重叠≥0.90 或相关≥0.95
+#:        → 一票否决 563020」
+#:    ⇒ 这是**未来触发器清单**（"任一出现即调整"），**不是**本轮裁决。
+#:    ⇒ 旧口径两个漏口（都只做**句级**判定）：
+#:      ① 首子句里的「风险触发」被 `_FACT_TRIGGER_RE`（"触发"**无前缀也匹配**）抹掉
+#:         ⇒ 首子句「（任一出现即调整」无条件词 ⇒ 判成「**非**条件句」；
+#:      ② ④ 里的「**若**」在**后续子句** ⇒ 句级检查看不见 ⇒ 563020 被当成当前一票否决。
+#:    ⇒ **真实后果**（11-25 跑批交付件）：TA 裁决明明写「买 563020 / 512800 减仓至 16%」，
+#:      交付计划却把 **563020 与 512800 双双记成「一票否决」** ⇒ 563020 没买、
+#:      512800 一股没卖、顺延位买了 TA 从未点名的 512890 ⇒ 交付层与 TA 权威裁决背离。
+#:    ⇒ 修法：**前瞻触发上下文**（风险触发 / 触发条件 / 触发线 / 条件式降级 /
+#:      什么会改变 / 转更消极 · 转更积极）⇒ 这句里的**否决动词与方向动词**都不是本轮裁决；
+#:      「**已触发 / 已经触发**」这类**既成事实**写法**照旧**按事实处理（不许豁免真否决）。
+_FORWARD_TRIGGER_RE = re.compile(
+    r"(风险触发|触发条件|触发线|条件式降级|条件式处理|什么会改变|转更消极|转更积极)"
+)
+#: 「**既成事实**」的触发（已/已经/均/皆/都/全部 ＋ 触发）⇒ 不是前瞻条件 ⇒ 不豁免
+_FACT_TRIGGER_STRICT_RE = re.compile(r"(?:已|已经|均|皆|都|全部)触发")
+
 #: Executive Summary（多行）—— 取到空行为止
 #: 🔴 2026-11-05 10:0x（M-Q 修）：**冒号是可选的**。
 #:    实测 09:22 那份决策 md 写的是「**Executive Summary**\n\n最终决策是：…」
@@ -579,6 +602,12 @@ def _is_conditional(sentence: str) -> bool:
     #    下面只处理「**既成事实**」的否决（见 `_is_definitive_rejection`）。
     if _is_definitive_rejection(head):
         return False
+    # 🔴 2026-11-26（真缺陷 · 前瞻触发上下文 ⇒ 整句不是本轮裁决）：
+    #    「风险触发（任一出现即调整）：① … → 对 512800 一票否决；④ 若 … → 一票否决 563020」
+    #    是**未来触发器** ⇒ 这句里的**否决动词**（与**方向动词**）都不作数。
+    #    ⚠️ 「已触发 / 已经触发」＝**既成事实** ⇒ 不豁免（否则真否决被放过）。
+    if _FORWARD_TRIGGER_RE.search(head) and not _FACT_TRIGGER_STRICT_RE.search(head):
+        return True
     # 🔴 2026-11-05 10:3x（M-Q 修）：「降级条件：…⇒ 残仓一次性清零」是**触发器**，
     #    不是本轮裁决 ⇒ 但「条件买入/条件建仓」是**动作** ⇒ 判条件前先抹掉它。
     probe = _COND_BUY_SPAN.sub("", head)
@@ -2250,6 +2279,30 @@ _VETO_WEAKENED_MARKERS: tuple[str, ...] = (
 #: 弱化限定词与否决动词之间允许的最大距离（字）。
 _VETO_WEAKEN_WINDOW = 12
 
+#: 🔴 2026-11-26（真缺陷 · **反事实**否决被当成本轮否决 · 11-25 真机跑批实证）：
+#:    11-25 交付件的 TA 权威裁决章原文：
+#:      「按 3.5 的顺延规则，**否决 512800 后**能顺延进来的只有医药/消费那批最终分
+#:        -0.73~-1.90 的候选，那是明显更差的一笔交易。结论：512800 不是清仓对象，
+#:        但当前 23.28% 高于 16% 规则目标，方向是**减到目标**。」
+#:    ⇒ 「否决 X **后**能顺延的只有…」是**反事实推演**（"如果否决了会怎样"），
+#:      **不是**本轮的一票否决 ⇒ 旧口径把它判成否决 ⇒ 512800 被冻成「维持席位」
+#:      ⇒ TA 明写「减到 16%」的减仓指令**一股没卖**，顺延位还买了 TA 从未点名的 512890。
+#:    ⇒ 口径：否决动词后面若跟「**代码 ＋ 后 / 之后 / 的话 / 情况下**」⇒ **反事实** ⇒ 不作数
+#:      （宁漏勿误：本模块的既有原则就是「保守判定（宁漏勿误）」）。
+_COUNTERFACTUAL_TAIL_RE = re.compile(
+    r"^\s*(?:[1-9]\d{5}\s*)?(?:之后|后|的话|情况下|的情形下)"
+)
+
+
+def _counterfactual_veto_positions(clause: str, verbs: list[tuple[int, str]]) -> set[int]:
+    """**反事实**句式里的否决动词位置（`否决 512800 后…` ⇒ 不是本轮裁决）⇒ 不作数。"""
+    out: set[int] = set()
+    for pos, word in verbs:
+        tail = clause[pos + len(word):]
+        if _COUNTERFACTUAL_TAIL_RE.match(tail):
+            out.add(pos)
+    return out
+
 
 def _weakened_veto_positions(clause: str, verbs: list[tuple[int, str]]) -> set[int]:
     """被**弱化限定词**跟在后面的否决动词位置（`一票否决理由不足` ⇒ 这条否决不成立）。"""
@@ -2505,13 +2558,16 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
         # 🔴 2026-11-13（真 bug · G-TA1）：「只可**作否决的补充理由**」里的「否决」
         #    是**名词**（宾语），不是裁决动词 ⇒ 位置作废。
         noun_local = _noun_veto_positions(clause, clause_verbs)
+        # 🔴 2026-11-26（真缺陷 · 反事实句式）：「否决 512800 **后**能顺延的只有…」
+        #    是**假设推演**，不是本轮一票否决 ⇒ 该动词位置作废。
+        counterfactual_local = _counterfactual_veto_positions(clause, clause_verbs)
         verbs = [
             (cstart + pos, word)
             for pos, word in clause_verbs
             if pos not in hypo_local and pos not in meta_local
             and pos not in weak_local and pos not in refused_local
             and pos not in noun_local and pos not in third_local
-            and pos not in viewpoint_local
+            and pos not in viewpoint_local and pos not in counterfactual_local
         ]
         # 🔴 2026-11-11 修（真误伤）：**比较引用 / 工具引用**里的代码
         #    （「与 515450 相关性 0.917」「只用 515450 表达足够」）
