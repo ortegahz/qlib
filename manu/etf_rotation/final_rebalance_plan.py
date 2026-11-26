@@ -3514,6 +3514,16 @@ def build_plan(args) -> dict:
     #    ⇒ 每席 2,130 元 < 3,800 元门槛 ⇒ **死锁不解**（实测 11-24 真机复跑）。
     _hold_rows = [a for a in _screen_actions if a.get("held_not_touched")]
     _seat_rows = [a for a in _screen_actions if not a.get("held_not_touched")]
+    #: 🔴 2026-11-26（槽位挑选要看得见规则层排名）：把**规则层最终分**补进席位行
+    #:    ⇒ 槽位上限挤席位时按**最终分**挑（不按代码字母序）。
+    #:    实测（11-25 跑批 `snapshots/20261125_180119` 修好否决解析后重生成）：
+    #:    存活 3 席（512800 持仓席 / 563020 规则层第 5 名 final=+0.8159 /
+    #:    515650 顺延补位 final=-0.8850）⇒ 槽位上限 2 ⇒ 旧口径挑中 515650
+    #:    ⇒ **把 TA 明写「买 563020」的规则层席位挤去归现金**。
+    #:    ⚠️ 席位行**本来不带** `final_score`（只有最终 action 行才带）⇒ 不补 ⇒
+    #:    排序键退化成「代码升序」⇒ 挑谁全看代码字母序（等于随机）。
+    for _r in _seat_rows:
+        _r["final_score"] = priority.get(str(_r.get("code") or "").zfill(6))
     _seat_rows, _slot_facts = _defensive_effective_slots(
         _seat_rows,
         effective_cap=_effective_cap,
