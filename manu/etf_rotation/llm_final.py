@@ -98,6 +98,58 @@ _FORWARD_TRIGGER_RE = re.compile(
 #: 「**既成事实**」的触发（已/已经/均/皆/都/全部 ＋ 触发）⇒ 不是前瞻条件 ⇒ 不豁免
 _FACT_TRIGGER_STRICT_RE = re.compile(r"(?:已|已经|均|皆|都|全部)触发")
 
+#: 🔴 2026-11-26（真缺陷 · 前瞻触发上下文的**跨行**传播）：
+#:    真机 md 可能把「风险触发（任一出现即调整，不等下个节点）：」**单独成行**，
+#:    下面 ①②③④ **各自成行** ⇒ 只看**当前行**的 `_FORWARD_TRIGGER_RE` ⇒
+#:    ① 行看不到触发词 ⇒ 「→ 对 512800 一票否决」又被当成当前一票否决。
+#:    ⇒ 口径：某行含前瞻触发词且以「：」结尾 ⇒ 该行**及其后的清单项行**都算上下文。
+_LIST_ITEM_HEAD_RE = re.compile(
+    r"^\s*(?:[①-⑳]|[（(]\s*\d+\s*[)）]|\d+\s*[、.．]|[-*•·]\s)"
+)
+
+
+def _forward_context_line_flags(text: str) -> list[bool]:
+    """逐行标出「处于**前瞻触发上下文**」的行（跨行传播用）。"""
+    lines = (text or "").splitlines()
+    flags = [False] * len(lines)
+    ctx = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            ctx = False
+            continue
+        if ctx:
+            flags[i] = True
+            # 清单项延续？⇒ 继续传播；否则 ⇒ 上下文到此为止
+            ctx = (bool(_LIST_ITEM_HEAD_RE.match(stripped))
+                   or stripped.endswith(("；", "，", "、")))
+            continue
+        if _FORWARD_TRIGGER_RE.search(stripped):
+            flags[i] = True
+            ctx = stripped.endswith("：")
+    return flags
+
+
+def _line_starts(text: str) -> list[int]:
+    """每行的起始偏移（供 `_line_no_at` 用）。"""
+    starts = [0]
+    for idx, ch in enumerate(text or ""):
+        if ch == "\n":
+            starts.append(idx + 1)
+    return starts
+
+
+def _line_no_at(starts: list[int], offset: int) -> int:
+    """给定「每行起始偏移」列表 ⇒ 求某个偏移落在第几行（0 基）。"""
+    lo, hi = 0, len(starts) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if starts[mid] <= offset:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
 #: Executive Summary（多行）—— 取到空行为止
 #: 🔴 2026-11-05 10:0x（M-Q 修）：**冒号是可选的**。
 #:    实测 09:22 那份决策 md 写的是「**Executive Summary**\n\n最终决策是：…」
@@ -1105,8 +1157,14 @@ def extract_final_decision(text: str) -> dict:
         _section_partial |= _sentence_partial_sell_codes(_sentence)
 
     # ---- 第 1 遍：子句级「动作词」⇒ 同一子句里的代码**一起**成立 ----
+    #: 🔴 2026-11-26：与 `extract_rejections` **同源**的跨行传播
+    #:    （「转更消极（…）：」单独成行 ⇒ 下面的清仓/否决动词不作数）
+    _fwd_flags_sec = _forward_context_line_flags(section)
+    _fwd_starts_sec = _line_starts(section)
     for s_start, s_end, sentence in _sentence_offsets(section):
         if _is_conditional(sentence):
+            continue
+        if _fwd_flags_sec[_line_no_at(_fwd_starts_sec, s_start)]:
             continue
         for c_start, c_end, clause in _clause_spans(sentence, s_start):
             codes = [mm.group(1) for mm in _CODE_RE.finditer(clause)]
@@ -2774,8 +2832,18 @@ def extract_rejections(text: str) -> list[dict]:
     #      多段都被否决时，交付件记的是**约束力最强**的那一段
     #      ⇒ 闸门才能拿「否决层级 vs 买侧层级」判出真矛盾。
     by_code: dict[str, dict] = {}
+    #: 🔴 2026-11-26（真缺陷 · 前瞻触发上下文**跨行**传播）：
+    #:    「风险触发（…）：」单独成行 + 下面 ①②③④ 各自成行 ⇒ 只看当前行会漏
+    #:    ⇒ 逐行标记上下文，命中的行**整行不算裁决**（否决/方向都不作数）。
+    _fwd_flags = _forward_context_line_flags(text)
+    _fwd_starts = _line_starts(text)
     for kind, start, unit in _iter_units(text):
-        hits = _row_hits(unit) if kind == "row" else _prose_hits(unit)
+        if kind == "row":
+            hits = _row_hits(unit)
+        elif _fwd_flags[_line_no_at(_fwd_starts, start)]:
+            hits = []
+        else:
+            hits = _prose_hits(unit)
         reason = " ".join(unit.split())[:_REJECT_REASON_MAX]
         section = _section_at(headings, start)
         rank = _authority_rank(section)
