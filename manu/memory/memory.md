@@ -7522,6 +7522,8 @@ CSV 台账（30 列）已装「当前/目标权重、动作、否决理由、顺
 | ⑧ | **V2 闸门** | 见 §⑥ | ✅ 全 rc=0 |
 | ⑨ | V1 全量闸门 | 11-26 那轮第 15 阶段被叫停 ⇒ **6 红** | 🗄️ **已弃用 ⇒ 只归因留档**（§⑤） |
 
+- ✅ **逐日记录已补齐**（铁律 `§十四.122` 载体）：`manu/memory/records/20261125.md`（六段人读记录 ＋ **w_holdings 陈旧度 / 费率口径分歧 / 现金流双口径**三类披露）＋ 台账 `manu/memory/records/etf_rotation_daily_ledger.csv` **新增 3 行**（`2026-11-25` ＝ 512800 卖出 / 563020 买入 / 515650 归现金，append-only、复跑幂等）；
+  生成器 `manu/tools/append_daily_record.py --snapshot-dir <快照目录>`（**服务器生成 ⇒ 回传 host 为 canonical**），闸门 `manu/tools/check_record_ledger.py` ＋ `check_record_carrier.py` rc=0。
 - **披露项（不抹平）**：`w_holdings` **stale**（`max_fetch_date=2026-11-04`、`stale_days=21`、`n_codes=279`）｜报告内 3 只 ETF 陈旧（159929 滞后 21 天、159545 / 513530 滞后 15 天）｜`v2_frozen_params`：`enabled=true`、`winner_arm=pure_E_native`、`frozen_at=2026-11-18T11:05:53`。
 
 ### ⑤ 🗄️ V1 闸门红阶段**归因留档**（**不再修、不再跑**）
