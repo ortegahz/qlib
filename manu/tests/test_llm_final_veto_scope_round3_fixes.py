@@ -85,6 +85,13 @@ _SNIPPET_PAREN_VETO = (
     "正确做法是限制红利簇只留 515450 一只（否决 159207），而不是砍掉组合里最强的一只\n"
 )
 
+#: 散文层**直接绑定**到 515450 的否决（点名条目说 515450「建仓」⇒ 点名层必须救回）。
+#: 🔴 2026-11-26（G4 修复后）：`_SNIPPET_PAREN_VETO` 那种写法已被散文层的
+#:    「直接绑定」护栏挡住 ⇒ 变异反证改用本片段（只有点名层能救）。
+_SNIPPET_PAREN_VETO_BOUND = (
+    "正确做法是限制红利簇只留 512170 一只（否决 515450），而不是砍掉组合里最强的一只\n"
+)
+
 #: 配套动作总结句（真实 md 风险裁决段原文节选）。
 _SNIPPET_SUMMARY = (
     "配套动作：515450 条件性建仓至 16%；515650 暂缓（放量 1.80／分位 94% 双阈值触发）；"
@@ -159,11 +166,17 @@ def test_explicit_numbered_items_beat_prose_inference():
 
 
 def test_explicit_items_mutation_guard_is_load_bearing():
-    """变异反证：让点名条目识别失效 ⇒ 上一条必须变红（证明这层护栏真在承重）。"""
+    """变异反证：让点名条目识别失效 ⇒ 上一条必须变红（证明这层护栏真在承重）。
+
+    🔴 2026-11-26（G4 修复后）：散文层的「**直接绑定**」护栏也会挡住
+       `_SNIPPET_PAREN_VETO` 那种「否决 159207」写法对 515450 的误伤
+       ⇒ 本变异改用 `_SNIPPET_PAREN_VETO_BOUND`（散文**直接绑定**到 515450）
+       ⇒ **只有点名裁决层**能救回 515450 ⇒ 变异仍然**孤立**地打这一层。
+    """
     saved = LLF._EXPLICIT_ITEM_RE
     try:
         LLF._EXPLICIT_ITEM_RE = __import__("re").compile(r"(?!x)x")
-        codes = _codes(_SNIPPET_EXPLICIT_ITEMS + _SNIPPET_PAREN_VETO)
+        codes = _codes(_SNIPPET_EXPLICIT_ITEMS + _SNIPPET_PAREN_VETO_BOUND)
         assert "515450" in codes, "变异后应当误伤 515450（证明护栏承重）"
     finally:
         LLF._EXPLICIT_ITEM_RE = saved

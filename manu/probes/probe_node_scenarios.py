@@ -38,6 +38,24 @@ M-S7 之前，`reprice_node_day.py` 只会重算**纯规则层**清单 ⇒ 用�
    **复刻同一套阈值与分类**，并把「被作废的行」与门槛披露**逐条对账**
    （code / kind / amount / threshold 一致 + 该行 delta=0、金额=0、目标股数回退到当前股数）。
 
+🔴 **2026-11-26 真机 P11 红灯修（门槛「生效阈值」口径分叉）**
+   证据：`<RESULTS_ROOT>/_gates_full_20261126.log`（探针 `probe_node_scenarios`）。
+   病根：门槛有**两个语义不同的量**（`rules.md §十四.123` ④）——
+     · **名义档** = `config.MIN_TRADE_AMOUNT_NEW` = **3,800 元**；
+     · **本轮生效档** = 小资金兜底触发时
+       `min(名义档, config.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT)` = **1,500 元**。
+   真机现象：产物披露 **1,500**（兜底已生效），本探针独立重算却按 **3,800**
+   ⇒ **口径分叉** ⇒ P11 误判「515450 新开仓 1,590.60 元本该被门槛作废」
+   ⇒ 连带 D5 / D6 两条真负例因「夹具本身就不自洽」而**失去证明力**（三条同时转红）。
+   修法（**口径统一到「本轮生效门槛」**）：
+     ① 生效门槛的解析口 = `min_trade_gate.resolve_effective_thresholds`
+        （**单一事实源**；期望值锚到 `config.py` 的事实源常量）；
+     ② 「兜底是否触发」由本探针**独立复算**
+        （调**生产侧同一个函数** `min_trade_gate.apply_small_account_fallback`
+          ＋ 探针自己重算的**意图行**）⇒ 🔴 **不读被检对象自述**
+        （否则「产物自述 ＋ 产物字段」两处同改仍自洽 ⇒ 守卫失灵，§十四.123 ②）；
+     ③ P11 的三条「应被作废」断言随之改成「按**生效门槛**不该被作废 ⇒ 与产物一致」。
+
 【用法】
     /home/huangzhe/anaconda3/envs/ql/bin/python \\
         manu/etf_rotation/probes/probe_node_scenarios.py \\
@@ -57,9 +75,14 @@ P7  **独立重算**：逐情景从 trades 手推现金恒等式 == 产物 `cash
 P8  **独立重算**：破单席标记完整（落地金额 > 单席上限 ⇔ `slot_breach`）
 P9  幂等：聚合件两次独立运行 sha1 **逐字节**相同
 P10 情景覆盖语义：选项 B 的落地股数与 `llm_final_decision.targets` 的 lots/target_pct 一致
+P11 最小调仓门槛披露对账（**本轮生效门槛** ⇔ 产物 skipped：code/kind/amount/threshold
+    + 作废行 delta=0 / 金额=0 / 目标股数回退 + 兜底披露锚事实源常量）
 D1  真负例：情景字母非法（X）⇒ 退出码 ≠ 0 且中文报错
 D2  真负例：情景代码不在计划件里 ⇒ 退出码 ≠ 0 且中文报错
 D3  真负例：篡改聚合件的 `cash_end` ⇒ P7 的独立重算必须 FAIL（证明闸门有牙）
+D4  真负例：空仓情景（positions 为空）里塞破单席 ⇒ P8 必须 FAIL（证明闸门有牙）
+D5  真负例：把「被门槛作废」的行改成 delta≠0 ⇒ P11 必须 FAIL（证明闸门有牙）
+D6  真负例：把门槛披露里某条 skipped 记录删掉 ⇒ P11 必须 FAIL（证明闸门有牙）
 """
 from __future__ import annotations
 
@@ -246,29 +269,37 @@ def _intended_target_shares(code, letter, plan_action, llm_target, price, total_
       其余 ⇒ `target_pct% × 总资产` → **向下取整到整手**；
     · **TA 一票否决且保持现仓**的行 ⇒ 目标 = 当前股数（delta=0 ⇒ 不参与门槛）。
 
-    返回 `(目标股数 | None, 口径说明, 目标权重百分数 | None)`。
+    🔴 2026-11-26（P11 真红修）：一并返回「门槛作废**之前**的**目标金额**」
+       （`target_amount`）—— 小资金兜底算「剩余额度」时**按目标金额扣非候选行**
+       ⇒ 探针独立复算兜底时必须拿到**同一个口径**的目标金额
+       （口径与 `reprice_node_day._recompute` 逐项一致，见 `_scenario_intent`）。
+
+    返回 `(目标股数 | None, 口径说明, 目标权重百分数 | None, 目标金额 | None)`。
     """
     action = plan_action or {}
     cur = int(action.get("current_shares") or 0)
     if bool(action.get("ta_rejected")) and bool(action.get("held_not_touched")):
-        return cur, "TA 一票否决 ⇒ 保持现仓（不参与门槛）", None
+        return (cur, "TA 一票否决 ⇒ 保持现仓（不参与门槛）", None,
+                cur * float(price or 0.0))
     if letter == "B":
         lots = (llm_target or {}).get("lots")
         pct = (llm_target or {}).get("target_pct")
         if lots not in (None, ""):
-            return (int(lots) * LOT,
-                    f"LLM 裁决：买 {int(lots)} 手（固定 {int(lots) * LOT} 股）", None)
+            _shares = int(lots) * LOT
+            return (_shares,
+                    f"LLM 裁决：买 {int(lots)} 手（固定 {int(lots) * LOT} 股）", None,
+                    _shares * float(price or 0.0))
         if pct is not None and float(pct) == 0:
-            return 0, "LLM 裁决：不建仓（目标权重 0%）", 0.0
+            return 0, "LLM 裁决：不建仓（目标权重 0%）", 0.0, 0.0
         if pct is None:
-            return None, "LLM 裁决既无 lots 也无 target_pct ⇒ 不猜", None
+            return None, "LLM 裁决既无 lots 也无 target_pct ⇒ 不猜", None, None
         amount = float(pct) / 100.0 * float(total_assets or 0.0)
         return (ROUND_LOT(amount / float(price)),
-                f"LLM 裁决目标权重 {float(pct):.4f}%", float(pct))
+                f"LLM 裁决目标权重 {float(pct):.4f}%", float(pct), amount)
     weight = float(action.get("target_weight") or 0.0)
     amount = weight * float(total_assets or 0.0)
     shares = ROUND_LOT(amount / float(price)) if amount > 0 else 0
-    return shares, f"规则层 target_weight {weight * 100:.4f}%", weight * 100.0
+    return shares, f"规则层 target_weight {weight * 100:.4f}%", weight * 100.0, amount
 
 
 def _gate_judgement(current_shares, intended_shares, price, ta_rejected, thresholds):
@@ -303,9 +334,29 @@ def _scenario_gate_view(plan, choices, payload, total_assets, thresholds):
     ⇒ `{代码: {intended_shares, basis, target_pct, price, current_shares,
                 kind, amount, threshold, blocked, delta}}`
     """
+    intent = _scenario_intent(plan, choices, payload, total_assets)
+    return _gate_view_from_intent(intent, thresholds)
+
+
+def _scenario_intent(plan, choices, payload, total_assets):
+    """一个情景的**意图行**（门槛作废**之前**）—— 独立重算。
+
+    ⇒ `{代码: {intended_shares, target_amount, basis, target_pct, price,
+                current_shares, delta, amount, final_score, ta_rejected}}`
+
+    🔴 **口径与 `reprice_node_day._recompute` 逐项一致**（探针不许另抄一份）：
+       · 规则层（选项 A）⇒ `target_amount = target_weight × 总资产`；
+       · 选项 B「按手数」⇒ `target_amount = 股数 × 节点日价`；
+       · 选项 B「按权重」⇒ `target_amount = 权重% × 总资产`；
+       · 选项 B「不建仓」⇒ `target_amount = 0`；
+       · TA 一票否决且保持现仓 ⇒ `target_amount = 当前股数 × 节点日价`。
+    🔴 为什么要「意图行」：小资金兜底（`min_trade_gate.apply_small_account_fallback`）
+       算「剩余额度」时要**扣掉非候选行的目标金额** ⇒ 兜底判定必须在
+       **门槛作废之前**的行上算 ⇒ 探针必须自己重算出这批行（不能读产物自述）。
+    """
     actions = _plan_actions_map(plan)
     llm_targets = _llm_targets_map(plan)
-    view: dict[str, dict] = {}
+    intent: dict[str, dict] = {}
     for row in payload.get("actions") or []:
         code = str(row.get("code") or "").zfill(6)
         price = float(row.get("price") or 0.0)
@@ -316,19 +367,132 @@ def _scenario_gate_view(plan, choices, payload, total_assets, thresholds):
             continue
         cur = int(plan_action.get("current_shares") or 0)
         letter = str((choices or {}).get(code) or "A")
-        shares, basis, pct = _intended_target_shares(
+        shares, basis, pct, target_amount = _intended_target_shares(
             code, letter, plan_action, llm_targets.get(code), price, total_assets)
         if shares is None:
             continue
-        judgement = _gate_judgement(cur, shares, price,
-                                    bool(row.get("ta_rejected")), thresholds)
-        judgement.update({"intended_shares": int(shares), "basis": basis,
-                           "target_pct": pct, "price": price, "current_shares": cur})
+        delta = int(shares) - cur
+        intent[code] = {
+            "intended_shares": int(shares),
+            "target_amount": target_amount,
+            "basis": basis,
+            "target_pct": pct,
+            "price": price,
+            "current_shares": cur,
+            "delta": delta,
+            "amount": abs(delta) * price,
+            "final_score": plan_action.get("final_score"),
+            "name": plan_action.get("name") or row.get("name") or "",
+            "ta_rejected": bool(row.get("ta_rejected")),
+            "held_not_touched": bool(row.get("held_not_touched")),
+        }
+    return intent
+
+
+def _gate_view_from_intent(intent, thresholds):
+    """意图行 ⇒ **门槛判定**视图（分类 + 阈值全部取自 `min_trade_gate` 单一事实源）。"""
+    view: dict[str, dict] = {}
+    for code, it in (intent or {}).items():
+        judgement = _gate_judgement(
+            it.get("current_shares") or 0,
+            it.get("intended_shares") or 0,
+            it.get("price") or 0.0,
+            bool(it.get("ta_rejected")),
+            thresholds,
+        )
+        judgement.update({
+            "intended_shares": int(it.get("intended_shares") or 0),
+            "basis": it.get("basis"),
+            "target_pct": it.get("target_pct"),
+            "price": it.get("price"),
+            "current_shares": int(it.get("current_shares") or 0),
+            "target_amount": it.get("target_amount"),
+            "final_score": it.get("final_score"),
+        })
         view[code] = judgement
     return view
 
 
-def _gate_disclosure_problems(payload, agg_scenario, view, thresholds):
+def _plan_equity_cap(plan):
+    """本轮**生效权益上限**（阶段 6 同口径：从计划件 `ta_screening` 读）。"""
+    scr = (plan or {}).get("ta_screening") or {}
+    for key in ("equity_cap_effective", "equity_cap"):
+        value = scr.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _plan_preferred_code(plan):
+    """阶段 5 已定的「集中标的」（阶段 6 沿用它 ⇒ 两阶段买同一只）。"""
+    fb = (plan or {}).get("small_account_fallback") or {}
+    return str((fb.get("selected") or {}).get("code") or "")
+
+
+def _fallback_rows_from_intent(intent):
+    """意图行 ⇒ **小资金兜底**用的动作行（字段口径同 `reprice_node_day._recompute`）。"""
+    rows: list[dict] = []
+    for code, it in (intent or {}).items():
+        delta = int(it.get("delta") or 0)
+        rows.append({
+            "code": code,
+            "name": it.get("name") or "",
+            "price": float(it.get("price") or 0.0),
+            "current_shares": int(it.get("current_shares") or 0),
+            "target_shares": int(it.get("intended_shares") or 0),
+            "delta_shares": delta,
+            "est_amount": round(abs(delta) * float(it.get("price") or 0.0), 6),
+            "target_amount": it.get("target_amount"),
+            "final_score": it.get("final_score"),
+            "ta_rejected": bool(it.get("ta_rejected")),
+            "held_not_touched": bool(it.get("held_not_touched")),
+        })
+    return rows
+
+
+def _independent_fallback(plan, intent, total_assets):
+    """独立复算本轮**小资金兜底**是否触发（🔴 **不读被检对象的自述**）。
+
+    🔴 **为什么必须独立复算**（`rules.md §十四.123`）：
+       守卫的**期望值**（本轮生效门槛）**不许**取自被检对象（节点日产物）自述的
+       `small_account_fallback.triggered` ⇒ 否则「产物自述 ＋ 产物字段」两处同改
+       仍自洽 ⇒ **守卫失灵**（事实在错、守卫却绿 ⇒ 比没有守卫更危险）。
+    🔴 **为什么是「同源共享函数」而不是「自己复刻判据」**：
+       兜底判据（「剩余额度不足以均分跨过门槛」）只有**一份**——在
+       `min_trade_gate.apply_small_account_fallback` 里 ⇒ 探针直接调用**生产侧
+       同一个函数**（输入 = 探针自己独立重算的**意图行**）⇒ 判据不会分叉。
+    ⇒ 返回 `apply_small_account_fallback` 的披露结构（`triggered` / `relaxed_new_limit` / …）。
+    """
+    rows = _fallback_rows_from_intent(intent)
+    return gate_mod.apply_small_account_fallback(
+        rows,
+        total_assets=total_assets,
+        equity_cap=_plan_equity_cap(plan),
+        thresholds=None,
+        commission_rate=0.0,
+        enabled=True,
+        #: 🔴 阶段 6 同口径：集中额度不得超过**账户级单席上限**
+        max_single_amount=(total_assets * float(A.TARGET_POSITION_WEIGHT)
+                           if total_assets else None),
+        preferred_code=_plan_preferred_code(plan),
+    )
+
+
+def _scenario_effective_thresholds(plan, intent, total_assets):
+    """一个情景的**本轮生效门槛**（独立复算）⇒ `(生效门槛, 兜底披露)`。
+
+    🔴 口径与阶段 6（`reprice_node_day.py`）**逐项一致**：
+       「兜底触发 ⇒ 新开仓档 = min(名义档, 放宽下限)」（**只降不升**）。
+    ⇒ 解析口 = `min_trade_gate.resolve_effective_thresholds`（**单一事实源**）。
+    """
+    fb = _independent_fallback(plan, intent, total_assets)
+    return gate_mod.resolve_effective_thresholds(None, fallback=fb), fb
+
+
+def _gate_disclosure_problems(payload, agg_scenario, view, thresholds, fallback=None):
     """门槛披露对账（探针**独立重算** ⇔ 产物披露）+ 作废行语义核对。
 
     ① 独立重算说「该作废」的行 ⇒ 必须出现在 `min_amount_gate.skipped` 里，
@@ -336,7 +500,13 @@ def _gate_disclosure_problems(payload, agg_scenario, view, thresholds):
     ② 披露里的行 ⇒ 独立重算也要说「该作废」（否则是口径分叉）；
     ③ 作废行在情景产物里 ⇒ **delta = 0、金额 = 0、目标股数回退到当前股数**（行保留）；
     ④ 作废行在**聚合件**里不许出现调仓（delta ≠ 0）；
-    ⑤ 门槛阈值本身 ⇒ 必须与 `min_trade_gate.resolve_thresholds` 一致（同一套门槛）。
+    ⑤ 门槛阈值本身 ⇒ 必须与**本轮生效门槛**（探针**独立复算**）一致；
+    ⑥ 小资金兜底披露 ⇒ 必须与**事实源常量**一致（`config.py` 的名义档 / 放宽档），
+       且「是否触发」必须与探针**独立复算**的结论一致（🔴 不许拿产物自述当期望值）。
+
+    🔴 2026-11-26 真机 P11 红灯修：`thresholds` 的语义是「**本轮生效门槛**」
+       （三档齐全；`None` ⇒ 名义档）⇒ **不是**名义档。
+       旧口径用名义档（3,800）去对账产物（兜底触发后的 1,500）⇒ 口径分叉 ⇒ 假红。
     """
     problems: list[str] = []
     gate = payload.get("min_amount_gate") or {}
@@ -344,7 +514,8 @@ def _gate_disclosure_problems(payload, agg_scenario, view, thresholds):
     for kind_name, limit in thr.items():
         got = (gate.get("thresholds") or {}).get(kind_name)
         if got is None or abs(float(got) - float(limit)) > 0.005:
-            problems.append(f"门槛阈值 {kind_name} 产物 {got} vs 单一事实源 {limit}")
+            problems.append(f"门槛阈值 {kind_name} 产物 {got} vs 独立复算的生效门槛 {limit}")
+    problems.extend(_fallback_disclosure_problems(payload, fallback))
     disclosed: dict[str, dict] = {}
     for rec in gate.get("skipped") or []:
         disclosed[str(rec.get("code") or "").zfill(6)] = rec
@@ -382,6 +553,48 @@ def _gate_disclosure_problems(payload, agg_scenario, view, thresholds):
             for t in agg_scenario.get("trades") or []:
                 if str(t.get("code") or "").zfill(6) == code and int(t.get("delta_shares") or 0) != 0:
                     problems.append(f"{code} 被门槛作废 ⇒ 聚合件里却有 delta={t.get('delta_shares')} 的调仓")
+    return problems
+
+
+def _fallback_disclosure_problems(payload, fallback):
+    """小资金兜底披露的对账（**事实源锚定** ＋ **独立复算**）⇒ 违例清单。
+
+    🔴 `rules.md §十四.123`：
+       ① 期望值锚到**事实源常量**（`config.py` 的名义档 / 放宽档）；
+       ② 产物自述只用来「跟事实源比」，**绝不**把自述的值当期望值；
+       ③ 「名义档 vs 本轮生效档」是**两个语义不同的量** ⇒ 两个分支都要覆盖。
+    ⇒ 本函数覆盖：兜底披露里的**两个档位字面量**（锚事实源）＋
+      「是否触发 / 额度 / 均分额 / 候选数」（与探针独立复算逐项比对）。
+    """
+    problems: list[str] = []
+    fb = payload.get("small_account_fallback") or {}
+    if not fb:
+        return problems
+    normal = fb.get("normal_new_limit")
+    relaxed = fb.get("relaxed_new_limit")
+    if normal is None or abs(float(normal) - float(C.MIN_TRADE_AMOUNT_NEW)) > 0.005:
+        problems.append(f"兜底披露名义档 {normal} vs 事实源 "
+                        f"MIN_TRADE_AMOUNT_NEW {C.MIN_TRADE_AMOUNT_NEW}")
+    if relaxed is None or abs(float(relaxed)
+                              - float(C.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT)) > 0.005:
+        problems.append(f"兜底披露放宽档 {relaxed} vs 事实源 "
+                        f"MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT "
+                        f"{C.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT}")
+    if fallback is None:
+        return problems
+    if bool(fb.get("triggered")) != bool(fallback.get("triggered")):
+        problems.append(f"兜底是否触发 产物 {fb.get('triggered')} vs 独立复算 "
+                        f"{fallback.get('triggered')}（口径分叉）")
+    if int(fb.get("candidate_count") or 0) != int(fallback.get("candidate_count") or 0):
+        problems.append(f"兜底候选数 产物 {fb.get('candidate_count')} vs 独立复算 "
+                        f"{fallback.get('candidate_count')}")
+    for key in ("allowance_amount", "per_candidate_amount"):
+        got = fb.get(key)
+        want = fallback.get(key)
+        if got is None or want is None:
+            continue
+        if abs(float(got) - float(want)) > 0.05:
+            problems.append(f"兜底 {key} 产物 {got} vs 独立复算 {want}")
     return problems
 
 
@@ -582,17 +795,21 @@ def _synth_blocked_case(total_assets: float):
     return payload, agg_scenario, view, code
 
 
-def _d5_fake_open_negative(scen, payloads, views, total_assets):
+def _d5_fake_open_negative(scen, payloads, views, total_assets, eff_thresholds=None):
     """D5 真负例：把「被门槛作废」的行改成 **delta ≠ 0（伪造建仓）** ⇒ 门槛断言必须 FAIL。"""
     case = _find_blocked_case(scen, payloads, views)
     if case is None:
         payload, agg_scenario, view, code = _synth_blocked_case(total_assets)
         source = "合成夹具（本轮产物里没有「被门槛作废」的行）"
+        #: 合成夹具**没有兜底** ⇒ 生效门槛 = 名义档
+        thr = gate_mod.resolve_thresholds()
     else:
         s, payload, view, code = case
         agg_scenario = s
         source = f"真实产物情景 {s.get('label')}"
-    base = _gate_disclosure_problems(payload, agg_scenario, view, None)
+        thr = ((eff_thresholds or {}).get(_signature(s.get("choices") or {}))
+               or gate_mod.resolve_thresholds())
+    base = _gate_disclosure_problems(payload, agg_scenario, view, thr)
     mutated = copy.deepcopy(agg_scenario)
     judge = view.get(code) or {}
     mutated.setdefault("trades", []).append({
@@ -603,7 +820,7 @@ def _d5_fake_open_negative(scen, payloads, views, total_assets):
         "est_amount": LOT * float(judge.get("price") or 0.0), "est_fee": 0.0,
         "target_weight_pct": 0.0, "slot_breach": False,
     })
-    probs = _gate_disclosure_problems(payload, mutated, view, None)
+    probs = _gate_disclosure_problems(payload, mutated, view, thr)
     detected = any(code in p for p in probs)
     detail = (f"{source}：{code}（{judge.get('kind')} {judge.get('amount')} 元 "
               f"< {judge.get('threshold')} 元 ⇒ 门槛作废）被伪造成 delta={LOT} 的建仓后，"
@@ -615,23 +832,27 @@ def _d5_fake_open_negative(scen, payloads, views, total_assets):
     return detected and not base, detail
 
 
-def _d6_missing_disclosure_negative(scen, payloads, views, total_assets):
+def _d6_missing_disclosure_negative(scen, payloads, views, total_assets, eff_thresholds=None):
     """D6 真负例：把门槛披露里某条 **skipped 记录删掉** ⇒ 门槛对账必须 FAIL。"""
     case = _find_blocked_case(scen, payloads, views)
     if case is None:
         payload, agg_scenario, view, code = _synth_blocked_case(total_assets)
         source = "合成夹具（本轮产物里没有「被门槛作废」的行）"
+        #: 合成夹具**没有兜底** ⇒ 生效门槛 = 名义档
+        thr = gate_mod.resolve_thresholds()
     else:
         s, payload, view, code = case
         agg_scenario = s
         source = f"真实产物情景 {s.get('label')}"
-    base = _gate_disclosure_problems(payload, agg_scenario, view, None)
+        thr = ((eff_thresholds or {}).get(_signature(s.get("choices") or {}))
+               or gate_mod.resolve_thresholds())
+    base = _gate_disclosure_problems(payload, agg_scenario, view, thr)
     mutated = copy.deepcopy(payload)
     gate = mutated.get("min_amount_gate") or {}
     gate["skipped"] = [rec for rec in (gate.get("skipped") or [])
                        if str(rec.get("code") or "").zfill(6) != code]
     mutated["min_amount_gate"] = gate
-    probs = _gate_disclosure_problems(mutated, agg_scenario, view, None)
+    probs = _gate_disclosure_problems(mutated, agg_scenario, view, thr)
     detected = any(code in p for p in probs)
     detail = (f"{source}：把 {code} 的 skipped 记录删掉后，门槛对账检出 {len(probs)} 条违例"
               f"⇒ 闸门会 FAIL")
@@ -855,13 +1076,21 @@ def main() -> int:
         scen_payloads = _run_scenario_payloads(NODE_DATE, plan_path, C.ETF_PRICES_CSV,
                                                payload_dir, combos)
         #: 每个情景的**独立重算**（意图目标股数 + 门槛判定）⇒ `{情景签名: {代码: 判定}}`
+        #: 🔴 2026-11-26（P11 真红修）：门槛判定**必须用「本轮生效门槛」**
+        #:    （独立复算 ⇒ 不读产物自述）⇒ 名义档 3,800 只在「兜底未触发」时才是生效档。
         views: dict[str, dict] = {}
+        eff_thresholds: dict[str, dict] = {}
+        fallbacks: dict[str, dict] = {}
         for _label, _choices in combos:
             _sig = _signature(_choices)
             _payload = scen_payloads.get(_sig)
             if _payload is None:
                 continue
-            views[_sig] = _scenario_gate_view(plan, _choices, _payload, _total_assets, None)
+            _intent = _scenario_intent(plan, _choices, _payload, _total_assets)
+            _thr, _fb = _scenario_effective_thresholds(plan, _intent, _total_assets)
+            eff_thresholds[_sig] = _thr
+            fallbacks[_sig] = _fb
+            views[_sig] = _gate_view_from_intent(_intent, _thr)
         #: 分歧码集合 / 期望情景数：**从当前产物 payload 动态取**（N 个分歧项 ⇒ 2^N 情景）
         #: 🔴 不写死 8 / 16 / 3 / 4 ⇒ 分歧项换人时探针不用改，也不会与新产物错配。
         agg_codes = divergence_codes(agg.get("scenarios") or [])
@@ -1072,11 +1301,16 @@ def main() -> int:
                 p11_problems.append(f"{s.get('label')} 缺该情景的节点日产物 ⇒ 无法对账门槛披露")
                 continue
             _view = views.get(_sig) or {}
-            for _prob in _gate_disclosure_problems(_payload, s, _view, None):
+            _thr = eff_thresholds.get(_sig) or gate_mod.resolve_thresholds()
+            for _prob in _gate_disclosure_problems(_payload, s, _view, _thr,
+                                                    fallbacks.get(_sig)):
                 p11_problems.append(f"{s.get('label')}/{_prob}")
             _blocked = [f"{c}({j['kind']} {j['amount']:.2f}<{j['threshold']:.0f})"
                         for c, j in sorted(_view.items()) if j.get("blocked")]
-            _p11_detail.append(f"{s.get('label')}：作废 {'/'.join(_blocked) or '无'}")
+            _fb = fallbacks.get(_sig) or {}
+            _p11_detail.append(
+                f"{s.get('label')}：生效门槛 新开仓 {_thr.get('新开仓')}（兜底触发="
+                f"{_fb.get('triggered')}）｜作废 {'/'.join(_blocked) or '无'}")
         p11_ok = not p11_problems
         checker.add("P11", "最小调仓门槛披露对账（独立重算 ⇔ 产物 skipped：code/kind/amount/threshold"
                     " + 作废行 delta=0 / 金额=0 / 目标股数回退）", p11_ok,
@@ -1144,12 +1378,14 @@ def main() -> int:
                     d4_ok, d4_detail)
 
         # --- D5 伪造「被门槛作废」的行建仓 ⇒ 门槛对账必须 FAIL ---
-        d5_ok, d5_detail = _d5_fake_open_negative(scen, scen_payloads, views, _total_assets)
+        d5_ok, d5_detail = _d5_fake_open_negative(scen, scen_payloads, views, _total_assets,
+                                                  eff_thresholds)
         checker.add("D5", "真负例：把「被门槛作废」的行改成 delta≠0（伪造建仓）"
                     " ⇒ 门槛对账必须 FAIL（证明闸门有牙）", d5_ok, d5_detail)
 
         # --- D6 门槛披露漏记 ⇒ 门槛对账必须 FAIL ---
-        d6_ok, d6_detail = _d6_missing_disclosure_negative(scen, scen_payloads, views, _total_assets)
+        d6_ok, d6_detail = _d6_missing_disclosure_negative(scen, scen_payloads, views,
+                                                            _total_assets, eff_thresholds)
         checker.add("D6", "真负例：把门槛披露里某条 skipped 记录删掉"
                     " ⇒ 门槛对账必须 FAIL（证明闸门有牙）", d6_ok, d6_detail)
 

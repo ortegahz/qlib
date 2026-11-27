@@ -41,6 +41,8 @@ D1  真负例：交付 md 副本里空头侧表块整块消失 ⇒ P6（与 P7�
 D2  真负例：交付 md 副本里多头侧表块被腰斩成残行 ⇒ P7 必须 FAIL
 D3  真负例：交付 json 副本的 meta.context_sha1 被改坏 ⇒ P4 必须 FAIL
 D4  真负例：交付 md 副本里多头侧表块整块消失 ⇒ P6（与 P7）必须 FAIL
+D5  真负例：交付 md 副本里多头侧表块某个**非竖线字符**被改坏 ⇒ P6 必须 FAIL
+D6  真正例：交付 md 副本里表块**单元格内竖线**被转义成 `\\|` ⇒ P6 必须仍 PASS（等价容忍）
 """
 from __future__ import annotations
 
@@ -106,6 +108,60 @@ MIN_TABLE_ROWS = 5
 
 #: markdown 表格行（以竖线开头，**允许前导空白**）
 _TABLE_ROW_RE = re.compile(r"^\s*\|")
+
+
+def _unescaped_pipe_count(row: str) -> int:
+    r"""一行里**未转义**竖线的个数（GFM 语义：``\|`` 是正文，不是列分隔符）。
+
+    🔴 2026-11-27（S5）：为什么不能用 ``row.count("|")`` ——
+       GFM 规定 ``\|`` 表示「正文里的竖线」⇒ 渲染器把**单元格内部**的竖线转义后，
+       一行里仍**肉眼可见**若干个 ``|`` 字符，但它们**不是列分隔符**。
+       旧口径按字符数算 ⇒ 转义后的合法表格会被误判成「块内竖线数不一致」。
+       ⇒ 本探针改按**未转义**竖线数判定（与 markdown 渲染器的切列口径一致）。
+    """
+    count = 0
+    backslashes = 0
+    for char in row:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == "|":
+            if backslashes % 2 == 0:
+                count += 1
+        backslashes = 0
+    return count
+
+
+def _unescape_pipes(line: str) -> str:
+    r"""把 GFM 转义的 ``\|`` 还原成正文竖线 ``|``（其余内容**逐字不动**）。
+
+    🔴 2026-11-27（P6 · Design B'）：渲染器把**单元格内部**的竖线转义成 ``\|``
+       （GFM 语义：``\|`` 是正文、不是列分隔符）⇒ 交付 md 与交付 json 的**事实源**
+       在「单元格正文含竖线」的那一行上**不可能逐字相同** ⇒ 旧口径把
+       「合法的转义」误报成「整块消失」（2026-11-26 交付件 P6 实测红灯）。
+       本函数把 md 侧的 ``\|`` 还原 ⇒ 与 json 事实源**逐字可比**。
+
+    ⚠️ **不许复用渲染器的 `_repair_table_pipes`**（不许自证：断言与被检对象共用
+       同一函数 ⇒ 渲染器一改断言跟着改 ⇒ 断言失去牙齿）⇒ 这里**独立**实现还原口径。
+       反斜杠按 **GFM 奇偶规则**处理：``\|``（1 个反斜杠）⇒ 正文竖线；
+       ``\\|``（2 个）⇒ 字面反斜杠 + 列分隔符（**不**还原）。
+    """
+    out: list[str] = []
+    backslashes = 0
+    for char in line:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == "|" and backslashes % 2 == 1:
+            out.append("\\" * (backslashes - 1))
+            out.append("|")
+            backslashes = 0
+            continue
+        out.append("\\" * backslashes)
+        out.append(char)
+        backslashes = 0
+    out.append("\\" * backslashes)
+    return "".join(out)
 #: 渲染器的「零 LLM 调用」早退分支 / dotenv 导入（行首锚定 ⇒ 注释里提到也不算）
 _RENDER_ONLY_RE = re.compile(r"^\s*if args\.render_only:", re.MULTILINE)
 _DOTENV_RE = re.compile(r"^\s*from dotenv import load_dotenv", re.MULTILINE)
@@ -218,6 +274,24 @@ def _find_verbatim_block(lines: list[str], block: list[str]) -> list[int]:
     hits: list[int] = []
     for i in range(len(lines) - n + 1):
         if lines[i:i + n] == block:
+            hits.append(i)
+    return hits
+
+
+def _find_block_allowing_escaped_pipes(lines: list[str], block: list[str]) -> list[int]:
+    """`block` 在 md 里**逐字连续**出现的起始行号列表（允许 md 侧的 GFM 转义竖线还原后比对）。
+
+    🔴 P6 · Design B'：事实源（交付 json）里 LLM 原文的单元格正文可能含裸 ``|``，
+       交付 md 里同一行被渲染器转义成 ``\\|`` ⇒ **还原后**两者才是同一个字符串。
+       本函数**先还原 md 侧**再逐字比对 ⇒ 只容忍「编码差异」，**不容忍任何内容差异**。
+    """
+    n = len(block)
+    if n <= 0 or n > len(lines):
+        return []
+    norm = [_unescape_pipes(row) for row in lines]
+    hits: list[int] = []
+    for i in range(len(lines) - n + 1):
+        if norm[i:i + n] == block:
             hits.append(i)
     return hits
 
@@ -482,16 +556,23 @@ def _check_debate_tables_present(md_text: str, side_blocks: dict[str, list[list[
        改用「事实源（交付 json）× 展示件（交付 md）」交叉校验：
        json 里每张表块（渲染器保证整块保留）必须在 md 里**逐字连续出现**，
        **少一块就 FAIL**（这正是 M-N「空头表整表消失」事故）。
+
+    🔴 2026-11-27（P6 · Design B'）**等价容忍**：交付 md 的**单元格正文竖线**被
+       渲染器转义成 ``\\|``（GFM 语义）⇒ 与 json 事实源**不可能逐字相同** ⇒
+       旧口径把「合法转义」误报成「整块消失」。⇒ 比对前把 md 侧的 ``\\|``
+       **还原**成 ``|``（见 `_unescape_pipes`，**不复用渲染器函数** ⇒ 不许自证）。
+       **只容忍编码差异**：任何**内容**差异（改一个字 / 少一行 / 整块消失）仍然 FAIL。
     """
     problems = list(json_problems)
     notes: list[str] = []
     lines = md_text.splitlines()
     for side, blocks in side_blocks.items():
         for bi, block in enumerate(blocks):
-            hits = _find_verbatim_block(lines, block)
+            hits = _find_block_allowing_escaped_pipes(lines, block)
             if hits:
                 notes.append(f"{side} 第 {bi + 1} 张表块（{len(block)} 行）在 md 第 "
-                             + str(hits[0] + 1) + " 行逐字命中")
+                             + str(hits[0] + 1) + " 行逐字命中"
+                             "（GFM 转义竖线还原后比对）")
             else:
                 problems.append(f"{side} 第 {bi + 1} 张表块（{len(block)} 行）在交付 md 里"
                                 "没有逐字出现（整块消失 / 被腰斩 ⇒ M-N 事故）")
@@ -501,7 +582,7 @@ def _check_debate_tables_present(md_text: str, side_blocks: dict[str, list[list[
 
 def _check_table_integrity(md_text: str, side_blocks: dict[str, list[list[str]]],
                            json_problems: list[str]) -> tuple[bool, str]:
-    """P7：**逐表块**校验 —— ① 同一表块内所有行行内 `|` 数量一致；② 表块行数 ≥ MIN_TABLE_ROWS。
+    """P7：**逐表块**校验 —— ① 同一表块内所有行行内**未转义** `|` 数量一致；② 表块行数 ≥ MIN_TABLE_ROWS。
 
     🔴 口径（2026-11-05 重写）：**删掉**跨侧等式（「多头与空头表块数必须相等」/
        「逐块行数必须相等」/「表头 `|` 数必须相等」）—— 两家分析师的表结构本来就允许不同
@@ -522,7 +603,8 @@ def _check_table_integrity(md_text: str, side_blocks: dict[str, list[list[str]]]
                                 "（找不到表头与行数都相同的表块）")
                 continue
             rows = lines[span[0]:span[1]]
-            pipes = sorted({row.count("|") for row in rows})
+            # 🔴 S5：按**未转义**竖线数判定（GFM：`\|` 是正文，不是列分隔符）
+            pipes = sorted({_unescaped_pipe_count(row) for row in rows})
             if len(pipes) > 1:
                 problems.append(f"{side} 第 {bi + 1} 张表块行内 `|` 数量不一致："
                                 + str(pipes) + "（残行 ⇒ 被腰斩）")
@@ -612,17 +694,86 @@ def _mutate_halve_bull_row(md_text: str, side_blocks: dict[str, list[list[str]]]
         if row_idx < block_start or row_idx >= block_end:
             continue
         original = lines[row_idx]
-        if original.count("|") < 2:
+        # 🔴 S5：按**未转义**竖线数判定（腰斩必须真的少掉一个**列分隔符**，
+        #    否则负例就只是「正文被截短」⇒ P7 抓不到 ⇒ 负例失去牙齿）
+        if _unescaped_pipe_count(original) < 2:
             continue
         halved = original[: max(1, len(original) // 2)]
-        if halved.count("|") == original.count("|"):
-            # 极端情况：前半截没切到 `|` ⇒ 砍掉最后一个 `|` 及其之后的内容
-            pos = original.rfind("|")
-            halved = original[:pos]
-        if halved.count("|") < original.count("|"):
+        if _unescaped_pipe_count(halved) == _unescaped_pipe_count(original):
+            # 极端情况：前半截没切到列分隔符 ⇒ 砍掉最后一个未转义 `|` 及其之后的内容
+            pos = -1
+            backslashes = 0
+            for idx, char in enumerate(original):
+                if char == "\\":
+                    backslashes += 1
+                    continue
+                if char == "|" and backslashes % 2 == 0:
+                    pos = idx
+                backslashes = 0
+            halved = original[:pos] if pos > 0 else halved
+        if _unescaped_pipe_count(halved) < _unescaped_pipe_count(original):
             new_lines[row_idx] = halved
             return _join_lines(new_lines, md_text)
     raise ValueError("多头表行的腰斩变异没生效 ⇒ D2 负例无效")
+
+
+def _corrupt_one_char(row: str) -> str | None:
+    """把一行里的**第一个非结构字符**改坏 ⇒ 返回新行；整行都是结构字符 ⇒ 返回 None。
+
+    🔴 结构字符 = ``|``（列分隔符）/ ``\\``（转义）/ ``-``（分隔行）/ ``:``（对齐）/ 空白
+       ⇒ 只改**正文**里的一个字 ⇒ 「编码差异」仍在，「内容差异」已发生。
+    """
+    for idx, char in enumerate(row):
+        if char in "|\\- :" or char.isspace():
+            continue
+        replacement = "X" if char != "X" else "Y"
+        return row[:idx] + replacement + row[idx + 1:]
+    return None
+
+
+def _mutate_corrupt_cell_char(md_text: str, side_blocks: dict[str, list[list[str]]],
+                              side: str) -> str:
+    """负例 D5：把某一侧表块**数据行**里的一个**非竖线字符**改坏 ⇒ 返回**新** md 字符串。
+
+    🔴 为什么必须改**全部副本**：同一张表在交付 md 里可能出现不止一次
+       （多头表在「多空辩论要点」与「Trader 交易计划」里各出现一次）⇒ 只改一份时
+       P6 仍能在另一份里逐字命中 ⇒ **负例没有牙** ⇒ 必须按「表头逐字 + 行数」
+       的签名把所有副本一起改（与 `_mutate_drop_side_tables` 同一思路）。
+    🔴 为什么改**非竖线**字符：竖线差异属于 P6 的「等价容忍」范围（GFM 转义）⇒
+       改竖线**判红**才说明口径过宽 ⇒ 这里改**正文**一个字 ⇒ P6 必须判红。
+    """
+    lines = md_text.splitlines()
+    side_bullets = side_blocks.get(side) or []
+    if not side_bullets:
+        raise ValueError(f"{side} 侧（事实源）里没有表块 ⇒ 负例无法构造")
+    located = _locate_debate_blocks(lines, side_blocks)
+    spans = located.get(side) or []
+    sigs: set[tuple[str, int]] = set()
+    for bi in range(len(side_bullets)):
+        span = spans[bi] if bi < len(spans) else None
+        if span is None:
+            raise ValueError(f"{side} 侧第 {bi + 1} 张表块在交付 md 里定位不到"
+                             " ⇒ 负例无法构造")
+        rows = lines[span[0]:span[1]]
+        if rows:
+            sigs.add((rows[0], len(rows)))
+    if not sigs:
+        raise ValueError("没拿到表块签名 ⇒ 负例无法构造")
+    new_lines = list(lines)
+    changed = 0
+    for span in _table_block_spans(lines):
+        rows = lines[span[0]:span[1]]
+        if ((rows[0] if rows else ""), len(rows)) not in sigs:
+            continue
+        for row_idx in range(span[0] + 2, span[1]):
+            corrupted = _corrupt_one_char(lines[row_idx])
+            if corrupted is not None:
+                new_lines[row_idx] = corrupted
+                changed += 1
+                break
+    if not changed:
+        raise ValueError("D5 变异没生效（数据行里没有可改的非结构字符）⇒ 负例无效")
+    return _join_lines(new_lines, md_text)
 
 
 def _mutate_context_sha1(payload: dict) -> dict:
@@ -674,7 +825,7 @@ def run_checks(run_root: Path, repo_root: Path, fingerprint_table: str = "") -> 
                 ok, detail)
 
     ok, detail = _check_table_integrity(md_text, side_blocks, json_problems)
-    checker.add("P7", "逐表块完整：块内行内 `|` 数量一致 / 行数 ≥ 5（不跨侧比较表结构）",
+    checker.add("P7", "逐表块完整：块内行内未转义 `|` 数量一致 / 行数 ≥ 5（不跨侧比较表结构）",
                 ok, detail)
 
     # --- 真负例：只操作**副本**，以「返回新值」的方式传给被断言的函数 ---
@@ -745,6 +896,41 @@ def run_checks(run_root: Path, repo_root: Path, fingerprint_table: str = "") -> 
         d4_detail = "负例构造异常：" + repr(exc)
     checker.add("D4", "真负例：交付 md 副本里多头侧表块整块消失 ⇒ P6（与 P7）必须 FAIL",
                 d4_ok, d4_detail)
+
+    d5_detail = ""
+    d5_ok = False
+    try:
+        mutated_md = _mutate_corrupt_cell_char(md_text, side_blocks, BULL_SIDE)
+        p6_ok, p6_detail = _check_debate_tables_present(mutated_md, side_blocks, json_problems)
+        d5_ok = not p6_ok
+        d5_detail = ("P6：" + p6_detail) if not p6_ok else "改坏一个非竖线字符后 P6 竟然 PASS ⇒ P6 没牙"
+    except Exception as exc:  # noqa: BLE001
+        d5_detail = "负例构造异常：" + repr(exc)
+    checker.add("D5", "真负例：交付 md 副本里多头侧表块某个非竖线字符被改坏 ⇒ P6 必须 FAIL",
+                d5_ok, d5_detail)
+
+    d6_detail = ""
+    d6_ok = False
+    try:
+        # 合成一张「单元格正文含裸竖线」的表：
+        #   事实源（json 原文）用裸 `|`；交付 md 用 GFM 转义 `\|`
+        fact_rows = ["| 指标 | 数值 |", "|---|---|", "| A | x|y| z |"]
+        md_rows = ["| 指标 | 数值 |", "|---|---|", "| A | x\\|y\\| z |"]
+        p6_ok, p6_detail = _check_debate_tables_present(
+            "\n".join(md_rows), {BULL_SIDE: [fact_rows]}, [])
+        strict_hits = _find_verbatim_block(md_rows, fact_rows)
+        d6_ok = bool(p6_ok) and not strict_hits
+        d6_detail = (
+            f"等价容忍生效：新口径 P6 PASS（{p6_detail}）；"
+            f"旧口径（严格逐字）命中 {len(strict_hits)} 次 ⇒ 放宽是必要的"
+        ) if d6_ok else (
+            f"新口径 P6 {'PASS' if p6_ok else 'FAIL'} / 旧口径命中 {len(strict_hits)} 次"
+            f"（两者都满足才算通过）"
+        )
+    except Exception as exc:  # noqa: BLE001
+        d6_detail = "正例构造异常：" + repr(exc)
+    checker.add("D6", "真正例：交付 md 副本里表块单元格内竖线被转义成 `\\|` ⇒ P6 必须仍 PASS",
+                d6_ok, d6_detail)
 
     # --- P8：run-root 零污染（探针跑完再比） ---
     after = _snapshot(run_root)

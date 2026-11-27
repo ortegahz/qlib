@@ -187,14 +187,22 @@ def test_变异_关掉顿号切分则并列项被合并成一项():
     """变异：顿号切分关掉 ⇒ 并列项被合并成**同一个子句** ⇒ `不买` 反向污染前面的标的。
 
     ⇒ 这正是本缺陷的**原始形态**（`512800、515450、512170、159207与563020` 一个子句）。
+
+    🔴 2026-11-26（G4 修复后）：散文层新增「**直接绑定**」护栏
+       （`_reject_verb_bound_codes`：只判与否决动词**紧邻绑定**的代码）
+       ⇒ 单关顿号切分**不再**复现误伤（`不买` 被绑到 `159207与563020` 枚举链上）
+       ⇒ 变异必须**同时**关掉两层（＝还原改动前的散文层），原始误伤才复现。
     """
-    saved = LLF._ITEM_SPLIT_RE
+    saved_split = LLF._ITEM_SPLIT_RE
+    saved_bind = LLF._reject_verb_bound_codes
     try:
         LLF._ITEM_SPLIT_RE = re.compile(r"(?!x)x")
+        LLF._reject_verb_bound_codes = lambda clause, vpos, vlen: set()
         codes = _codes(_md("红利低波只用515450、512170只给半仓、159207与563020不买。"))
         assert codes == {"159207", "512170", "515450", "563020"}, codes
     finally:
-        LLF._ITEM_SPLIT_RE = saved
+        LLF._ITEM_SPLIT_RE = saved_split
+        LLF._reject_verb_bound_codes = saved_bind
 
 
 def test_变异_清空动作词表则自带动作的项被误伤():

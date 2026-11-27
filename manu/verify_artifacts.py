@@ -538,6 +538,46 @@ def _check_sha1_chain(run_root: Path) -> list[tuple[str, bool, str]]:
     return out
 
 
+#: 🔴 交付层「**清仓行**」判定词表：这些行只记录「这只被清掉了」，**不占席位**。
+#:    ⚠️ **不许**用「action == 卖出」一刀切判席位：部分减仓（规则层 512800
+#:    23.28% → 20%）的目标权重仍 > 0 ⇒ 它**仍然占席位**。
+_DROP_ACTIONS = ("卖出", "清仓", "sell")
+
+
+def _delivery_seat_codes(actions: list[dict] | None) -> tuple[list[str], list[str]]:
+    """返回 ``(占席代码列表, 占席但零权重的代码列表)``。
+
+    🔴 2026-11-27（闸门口径缺陷修复 · 11-26 跑批 step4 判红）：
+       「规则层与交付层入选同源」原先只取 ``target_weight > 0`` 的行
+       ⇒ **被防御态有效槽位归零的席位**（11-26 实测：515650 顺延补位**已占席**，
+       但因「防御态有效槽位 1」不配权重、权重落回现金）被误判成「交付层没入选」
+       ⇒ 一次**正确的** TA 否决 + 防御态降仓，被误报成「规则层与交付层不同源」
+       （并连带 ``probe_verify_guards`` 的 P0/N11 两条因全局退出码**连坐**而红）。
+    ⇒ 口径改为：**占席** = 目标权重 > 0 **或** 该行**不是清仓行**
+       （零权重但仍占席的席位**必须**计入 ⇒ 否则闸门会被自己的归零逻辑误伤）。
+    """
+    seats: set[str] = set()
+    zero_weight: set[str] = set()
+    for row in actions or []:
+        code = str(row.get("code") or "")
+        if not code:
+            continue
+        try:
+            target_weight = float(row.get("target_weight") or 0.0)
+        except (TypeError, ValueError):
+            target_weight = 0.0
+        qlib_action = str(row.get("qlib_action") or "")
+        action = str(row.get("action") or "")
+        is_liquidation = qlib_action in _DROP_ACTIONS or action == "卖出"
+        if target_weight <= 1e-12 and is_liquidation:
+            # 清仓行：只记录「被清掉」，**不占席位** ⇒ 不参与同源比对。
+            continue
+        seats.add(code)
+        if target_weight <= 1e-12:
+            zero_weight.add(code)
+    return sorted(seats), sorted(zero_weight)
+
+
 def _check_final_plan(plan: dict, plan_md: str, rec: dict, run_root: Path) -> list[tuple[str, bool, str]]:
     """最终计划：现金对账、权重闭合、MD/JSON 数字一致、与规则层同源。"""
     out: list[tuple[str, bool, str]] = []
@@ -593,7 +633,8 @@ def _check_final_plan(plan: dict, plan_md: str, rec: dict, run_root: Path) -> li
     # 规则层「holdings」= 本期 5 只**目标**；交付层「actions」= 目标 + 持仓中被清掉的 4 只
     # ⇒ 只比「目标侧」：交付层里 target_weight > 0 的那些。
     rec_codes = sorted(str(h.get("code")) for h in (rec.get("holdings") or []))
-    plan_codes = sorted(str(a.get("code")) for a in actions if float(a.get("target_weight") or 0.0) > 0.0)
+    #: 🔴 占席口径见 `_delivery_seat_codes`（含**被防御态归零**的席位）。
+    plan_codes, zero_weight_seats = _delivery_seat_codes(actions)
     # 🔴 2026-11-11：TA 合规筛选（**一票否决 + 顺延补位**）会**合法地**改变交付层名单 ⇒
     #    「同源」的口径必须**扣掉被否决的、补上顺延的、加上保留为「维持」的孤儿持仓**；
     #    否则一次正确的 TA 否决会被误判成「规则层与交付层不同源」。
@@ -608,10 +649,13 @@ def _check_final_plan(plan: dict, plan_md: str, rec: dict, run_root: Path) -> li
         if (_rejected or _substituted or _orphans)
         else "｜本轮无 TA 否决/顺延"
     )
+    _zero_note = (
+        f"｜零权重席位（防御态归零，**仍算入选**）{zero_weight_seats}" if zero_weight_seats else ""
+    )
     out.append((
         "规则层与交付层入选同源（TA 否决/顺延已对账）",
         _same,
-        f"规则层 {rec_codes}｜交付层 {plan_codes}｜期望 {sorted(_expected)}{_ta_note}",
+        f"规则层 {rec_codes}｜交付层 {plan_codes}｜期望 {sorted(_expected)}{_ta_note}{_zero_note}",
     ))
     conflicts = plan.get("llm_conflicts") or []
     has_llm_view = bool((plan.get("tradingagents_view") or "").strip())

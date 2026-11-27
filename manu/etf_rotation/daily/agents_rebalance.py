@@ -1791,15 +1791,17 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
 # C. 组合算术 —— 执行卡片（研究链里**没有**的硬约束都在这里）
 # =============================================================================
 def _est_fee(amount: float, side: str | None) -> float:
-    """费用估算：买入 = max(金额×佣金率, 最低佣金)；卖出另加**印花税**（单边千一）。
+    """费用估算：**买入 = 卖出** = max(金额×佣金率, 最低佣金)（场内 ETF **免印花税**）。
 
-    🔴 卖出才有印花税 ⇒ 同一金额下卖出费**一定**高于买入费（测试会锁住这条）。
+    🔴 2026-11-27（P2：ETF 卖出侧印花税归零）：旧口径在**卖出侧**叠加千一印花税
+       ⇒ 同一金额下卖出费**一定**高于买入费 ⇒ **高估交易摩擦**，且与研究链**不同源**
+       （研究链 `manu/etf_rotation/config.py:245`、`backtest.py:8` 均写明「ETF 免印花税」）。
+       ⇒ 现在**同金额卖出费 == 买入费 == max(金额×佣金率, 最低佣金)**。
+    ⚠️ ``side`` 只作**语义标注**（买入 / 卖出 / 持有），**不再改数值**；
+       **股票线另计**（个股卖出单边千一），但**本链只跑 ETF**。
     """
     amt = abs(float(amount))
-    fee = max(amt * float(DC.COMMISSION_RATE), float(DC.MIN_COMMISSION))
-    if side == "sell":
-        fee += amt * float(DC.STAMP_DUTY_RATE)
-    return fee
+    return max(amt * float(DC.COMMISSION_RATE), float(DC.MIN_COMMISSION))
 
 
 def _buy_cost(amount: float) -> float:

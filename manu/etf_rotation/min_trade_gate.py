@@ -173,6 +173,34 @@ def resolve_thresholds(overrides: dict | None = None) -> dict:
     return thr
 
 
+def resolve_effective_thresholds(overrides: dict | None = None, *,
+                                  fallback: dict | None = None) -> dict:
+    """**本轮生效门槛**（三档）——「小资金兜底触发 ⇒ 新开仓档只降不升」。
+
+    🔴 **单一事实源**（2026-11-26 真机 P11 红灯修 · 证据
+       `<RESULTS_ROOT>/_gates_full_20261126.log`）：
+       「名义档 → 本轮生效档」的换算原先**散在**阶段 5（`final_rebalance_plan.py`）
+       与阶段 6（`reprice_node_day.py`）各自内联 ⇒ **闸门探针**若按名义档
+       （`resolve_thresholds()` = 新开仓 3,800）独立重算，就与产物
+       （兜底触发后的**生效档 1,500**）**口径分叉**
+       ⇒ 真机 P11 误判「515450（1,590.60 元）本该被门槛作废」，
+       连带 D5 / D6 两条负例因夹具不自洽而失去证明力（三条同时转红）。
+    ⇒ 本函数是「名义档 → 生效档」的**唯一**解析口（阶段 5 / 阶段 6 / 闸门探针共用）
+       ⇒ 门槛口径只有一份 ⇒ 探针与产物**不可能**再分叉。
+
+    🔴 **期望值锚到事实源常量**（`rules.md §十四.123` ①）：
+       放宽下限取 `C.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT`（1,500 元），
+       **不是**产物自述的 `relaxed_new_limit` ⇒ 产物自述只用来「跟事实源比」。
+    🔴 **只降不升**：`min(名义档, 放宽下限)` ⇒ 绝不把门槛抬高。
+    ⚠️ 「清仓止损 / 存量微调」两档**不受兜底影响**（兜底只放宽「新开仓」一档）。
+    """
+    thr = resolve_thresholds(overrides)
+    if fallback and bool(fallback.get("triggered")):
+        relaxed = min(float(thr["新开仓"]), float(C.MIN_TRADE_AMOUNT_NEW_SMALL_ACCOUNT))
+        thr["新开仓"] = min(float(thr["新开仓"]), relaxed)
+    return thr
+
+
 def gate_enabled(args=None) -> bool:
     """门槛总开关：`--no-min-amount-gate` ⇒ 关（回退/对比用）；默认 **开**。"""
     if args is None:

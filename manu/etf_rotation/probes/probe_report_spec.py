@@ -9,18 +9,33 @@
 【断言覆盖（用户任务书 §5 的 10 段 + 硬性要求）】
   meta / stock_scores / rank_ic / etf_scores / filter_stats /
   candidates / current_holdings_diagnosis / next_rebalance / risk_disclosure / disclaimer
-  ＋ 硬性要求：无未来函数、`PYTHONHASHSEED=0`、α=0.5（铁律十四.3）、
+  ＋ 硬性要求：无未来函数、`PYTHONHASHSEED=0`、**α / 动量权重 == V2 冻结件**（铁律十四.3）、
     e_covered 池（铁律十四）、min_coverage=0.5、真实账户数不许改。
 
 【守卫生效性自检（铁律十四.52：新增守卫必须自带负例）】
   正例 P0：正式报告原样 ⇒ 全部断言 PASS；
-  负例 N1~N17：故意改坏 17 处 ⇒ 对应断言**必须真的 FAIL**（否则断言可能写死成永远 PASS）。
+  负例 N1~N27：故意改坏 27 处 ⇒ 对应断言**必须真的 FAIL**（否则断言可能写死成永远 PASS）。
   ⚠️ 负例构造本身失败（StopIteration 等）⇒ 判 FAIL 并写清原因，**不许把探针带崩**。
+
+【🔴 2026-11-26 两条红的根因与修法（基线陈旧 ×1 ＋ 真缺陷 ×1）】
+  ① **M4（基线陈旧）**：老断言把 α **写死 0.5**（＝ V1 口径 `config.ALPHA_SCORE_WEIGHT`）
+     ⇒ V2 接缝（2026-11-18，冠军臂 `pure_E_native`）把现役口径换成 **α=1.0 / 动量=0.0**
+     ⇒ 2026-11-26 跑批必红（实测交付件 `meta.params.alpha_weight = 1.0`）。
+     ⇒ 修法：期望值改从 **V2 冻结件**取（每日链同源，仓库内加载口
+     `daily/v2_frozen_params.py`）⇒ 口径变一次、报告与闸门一起变。
+     🔴 **fail-closed**：冻结件读不到 ⇒ M4 判 FAIL，**不许**静默跳过。
+     ⚠️ 期望值**不许**取自 `v2/config_v2.py::ALPHA_WEIGHT_GRID`（＝**搜索空间**，非现役值）。
+  ② **H2（真缺陷）**：持仓诊断的 `ma60_ok` 原先绑在 **exit 闸门**上 ⇒ V2 冻结件
+     （`exit_ma_window = 0`）下**恒为 null**（实测 9 个连续快照全 null）
+     ⇒ 「每只持仓带 MA60 诊断」必红。
+     ⇒ 修法（`analyze.py`）：`ma60_ok` 改成**恒定 MA60 口径**实算的诊断值
+     （窗口 = `config.ENTRY_MA_FILTER_WINDOW`），`ma20_ok` 保留。
 
 【用法】
     PYTHONHASHSEED=0 /home/huangzhe/anaconda3/envs/ql/bin/python \
         manu/etf_rotation/probes/probe_report_spec.py \
-        --report <落点根>/runs/etf_analysis_report.json
+        --report <落点根>/runs/etf_analysis_report.json \
+        [--frozen-params <V2 冻结件路径>]
 
 【副作用】
 不写任何文件（负例在内存里改副本）；只读正式报告与两个日历文件。
@@ -67,6 +82,27 @@ REQUIRED_RISK_IDS = (
     "non_lookthrough_etf",
     "strategy_capacity",
 )
+#: 🔴 **持仓诊断的必需字段清单**（H2；口径 = 在池/MA20/MA60/破位/E/动量/市值/盈亏）
+#:    ⚠️ 字段的**值**也必须存在（不许是 null）—— 2026-11-26 实测的红就是
+#:    `ma60_ok` 的**值**为 null（键在、值为空）⇒ 只查键会漏判。
+HOLDING_DIAG_REQUIRED_FIELDS = (
+    "code",
+    "name",
+    "shares",
+    "market_value",
+    "pnl_pct",
+    "in_candidate_pool",
+    "ma20_ok",
+    "ma60_ok",
+    "broken",
+    "mom120",
+)
+#: 🔴 **V2 冻结件** = α / 动量权重期望值的**单一事实源**（2026-11-26 修 M4）
+#:    默认路径取 ``daily_config.V2_FROZEN_PARAMS_FILE``
+#:    （＝ ``<RESULTS_ROOT>/v2/frozen_params_wf.json``），
+#:    可用环境变量 ``ETF_ROTATION_V2_FROZEN_PARAMS`` 覆盖。
+#:    ⚠️ 期望值**不许**取自 ``v2/config_v2.py::ALPHA_WEIGHT_GRID``（＝**搜索空间**，不是现役值）。
+FROZEN_PARAMS_ENV = "ETF_ROTATION_V2_FROZEN_PARAMS"
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -88,6 +124,49 @@ def load_calendar() -> list[str]:
                 if _DATE_RE.fullmatch(text):
                     days.add(text)
     return sorted(days)
+
+
+def _load_daily_modules() -> None:
+    """把 ``manu/etf_rotation/daily/`` 挂进 ``sys.path``（``daily_config`` 是**裸模块**导入）。
+
+    🔴 用 **append**（不是 ``insert(0)``）⇒ 不许抢在研究链的 ``config`` 前面
+       （研究链的 ``import config`` 必须命中 ``manu/etf_rotation/config.py``）。
+    """
+    daily_dir = str(_ETF_ROOT / "daily")
+    if daily_dir not in sys.path:
+        sys.path.append(daily_dir)
+
+
+def load_frozen_expectation(path: str | Path | None = None) -> tuple[dict | None, str]:
+    """读 **V2 冻结件** ⇒ 返回 ``(期望值 dict | None, 错误说明 str)``。
+
+    期望值 = ``{"alpha_weight": float, "momentum_weight": float,
+    "source": str, "winner_arm": str}``。
+
+    🔴 **单一事实源**：走**每日链同一个加载口** ``daily/v2_frozen_params.py``
+       （``load_frozen_params``）⇒ 报告与闸门永远同源，不会各说各话。
+    🔴 **fail-closed**：冻结件读不到 / 口径对不上 ⇒ 返回 ``(None, 错误说明)``
+       ⇒ M4 判 FAIL，**不许**静默跳过（不确定 ≠ 可以放过）。
+    """
+    try:
+        _load_daily_modules()
+        from daily.v2_frozen_params import load_frozen_params  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 —— 导入失败必须报出来，不许静默
+        return None, f"导入 daily.v2_frozen_params 失败：{type(exc).__name__}: {exc}"
+    try:
+        frozen = load_frozen_params(path) if path is not None else load_frozen_params()
+    except Exception as exc:  # noqa: BLE001 —— 读不到冻结件必须报出来
+        return None, f"V2 冻结件读不到 / 口径对不上：{type(exc).__name__}: {exc}"
+    return (
+        {
+            "alpha_weight": float(frozen.alpha_weight),
+            "momentum_weight": float(frozen.momentum_weight),
+            "source": str(frozen.source_path),
+            "winner_arm": str(frozen.winner_arm),
+            "frozen_at": str(frozen.frozen_at),
+        },
+        "",
+    )
 
 
 def load_account_expectation(report_dir: Path) -> dict:
@@ -274,8 +353,76 @@ def _c1b_pool_count_verdict(report: dict) -> tuple[bool, str]:
     )
     return ok, detail
 
+def _m4_alpha_weight_verdict(report: dict, frozen: dict | None,
+                              frozen_err: str = "") -> tuple[bool, str]:
+    """M4：报告的 **α / 动量权重必须等于 V2 冻结件**（同源）。
+
+    🔴 2026-11-26 修（基线陈旧 ⇒ 同源）：
+       老断言把 α **写死 0.5**（＝ V1 口径 ``config.ALPHA_SCORE_WEIGHT``）⇒ V2 接缝
+       （2026-11-18，冠军臂 ``pure_E_native``）把现役口径换成 **α=1.0 / 动量=0.0**
+       ⇒ 2026-11-26 跑批必红（实测交付件 ``meta.params.alpha_weight = 1.0``）。
+       ⇒ 期望值改从 **V2 冻结件**取 ⇒ 口径变一次、报告与闸门一起变。
+    🔴 **fail-closed**：冻结件读不到 ⇒ 判 FAIL（不许真空 PASS、不许静默跳过）。
+    ⚠️ 期望值**不许**取自 ``v2/config_v2.py::ALPHA_WEIGHT_GRID``（＝**搜索空间**，非现役值）。
+    """
+    if not frozen:
+        return False, (
+            "V2 冻结件读不到 ⇒ 不许真空 PASS、不许静默跳过："
+            + (frozen_err or "（未提供冻结件）")
+        )
+    exp_alpha = frozen.get("alpha_weight")
+    exp_mom = frozen.get("momentum_weight")
+    params = _get(report, "meta.params", {}) or {}
+    got_alpha = params.get("alpha_weight")
+    got_mom = params.get("momentum_weight")
+    where = f"冻结件={frozen.get('source')}｜冠军臂={frozen.get('winner_arm')}"
+    if not isinstance(exp_alpha, (int, float)) or isinstance(exp_alpha, bool):
+        return False, f"{where}｜冻结件的 alpha_weight 非法（{exp_alpha!r}）⇒ 无法判定"
+    if not isinstance(exp_mom, (int, float)) or isinstance(exp_mom, bool):
+        return False, f"{where}｜冻结件的 momentum_weight 非法（{exp_mom!r}）⇒ 无法判定"
+    if not isinstance(got_alpha, (int, float)) or isinstance(got_alpha, bool):
+        return False, f"报告 meta.params.alpha_weight 缺失/非法（{got_alpha!r}）⇒ 无法判定"
+    if not isinstance(got_mom, (int, float)) or isinstance(got_mom, bool):
+        return False, f"报告 meta.params.momentum_weight 缺失/非法（{got_mom!r}）⇒ 无法判定"
+    ok_alpha = float(got_alpha) == float(exp_alpha)
+    ok_mom = float(got_mom) == float(exp_mom)
+    ok = ok_alpha and ok_mom
+    detail = (
+        f"{where}｜期望 α={float(exp_alpha):g} / 动量={float(exp_mom):g}"
+        f"｜实得 α={float(got_alpha):g} / 动量={float(got_mom):g}"
+        + ("" if ok else "｜⇒ 与冻结件**不一致**（报告口径与 V2 冻结口径脱节）")
+    )
+    return ok, detail
+
+
+def _h2_holdings_fields_verdict(report: dict) -> tuple[bool, str]:
+    """H2：每只持仓都带齐诊断字段（**值**不许缺，也不许是 null）。
+
+    🔴 2026-11-26 实测：``ma60_ok`` 的**键**一直都在，但 V2 冻结件把
+       ``exit_ma_window`` 设成 0（强制退出闸门关闭）⇒ ``analyze.py`` 把它绑在
+       exit 闸门上 ⇒ **值恒为 null** ⇒ 「每只持仓带 MA60 诊断」必红。
+       ⇒ 这里判的是**键 + 值**（``None`` 一律算缺），不许只查键。
+    """
+    holdings = _get(report, "current_holdings_diagnosis.holdings", []) or []
+    bad: list[str] = []
+    for row in holdings:
+        if not isinstance(row, dict):
+            bad.append("<非 dict 行>")
+            continue
+        for field in HOLDING_DIAG_REQUIRED_FIELDS:
+            if row.get(field) is None:
+                bad.append(f"{row.get('code')}.{field}")
+    ok = not bad
+    return ok, (
+        f"持仓数={len(holdings)}｜必需字段={len(HOLDING_DIAG_REQUIRED_FIELDS)} 个"
+        f"（{'/'.join(HOLDING_DIAG_REQUIRED_FIELDS)}）｜缺字段={bad[:5] or '无'}"
+    )
+
+
 def run_checks(report: dict, calendar: list[str],
-               account: dict | None = None) -> list[tuple[str, str, bool, str]]:
+               account: dict | None = None,
+               frozen: dict | None = None,
+               frozen_err: str = "") -> list[tuple[str, str, bool, str]]:
     """对报告跑全部规格断言，返回 [(id, 名称, 是否通过, 细节)]。
 
     ``account`` = 账户事实源派生值（见 :func:`load_account_expectation`）；
@@ -305,9 +452,11 @@ def run_checks(report: dict, calendar: list[str],
                 f"｜α={params.get('alpha_weight')}｜动量={params.get('momentum_weight')}"
                 f"｜topk={params.get('target_n_holdings')}｜buffer={params.get('hold_buffer')}"
                 f"｜MA{params.get('entry_ma_window')}/{params.get('exit_ma_window')}")
-    checker.add("M4", "α=0.5（铁律十四.3：E 是暴露分，不是独立 alpha）",
-                float(params.get("alpha_weight", -1)) == 0.5,
-                f"alpha_weight={params.get('alpha_weight')}（期望 0.5）")
+    #: 🔴 2026-11-26 修（基线陈旧 ⇒ 同源）：期望值取自 **V2 冻结件**（每日链同一个加载口）
+    #:    ⇒ 报告口径与 V2 冻结口径永远一致；冻结件读不到 ⇒ **fail-closed 判 FAIL**。
+    _m4_ok, _m4_detail = _m4_alpha_weight_verdict(report, frozen, frozen_err)
+    checker.add("M4", "报告 α / 动量权重 == V2 冻结件（铁律十四.3：E 是暴露分，不是独立 alpha）",
+                _m4_ok, _m4_detail)
     checker.add("M5", "PYTHONHASHSEED=0 可复现（meta.hash_seed == '0'）",
                 str(_get(report, "meta.hash_seed", "")) == "0",
                 f"hash_seed={_get(report, 'meta.hash_seed')!r}（期望 '0'）")
@@ -530,14 +679,12 @@ def run_checks(report: dict, calendar: list[str],
                     ok_codes and ok_total and ok_cash,
                     f"口径={acct.get('source')}｜诊断持仓={got_codes}｜期望={exp_codes}（精确相等）"
                     f"｜总资产 {got_total} vs {exp_total}｜现金 {got_cash} vs {exp_cash}")
-    bad_h = []
-    for row in holdings:
-        for field in ("code", "name", "shares", "market_value", "pnl_pct", "in_candidate_pool",
-                      "ma20_ok", "ma60_ok", "broken", "mom120"):
-            if row.get(field) is None:
-                bad_h.append(f"{row.get('code')}.{field}")
+    #: 🔴 2026-11-26：字段清单与判定口径抽成独立函数（便于变异反证与单测直调）；
+    #:    判的是**键 + 值**（``None`` 一律算缺）—— 2026-11-26 实测的红正是
+    #:    `ma60_ok` 的**键在、值为 null**。
+    _h2_ok, _h2_detail = _h2_holdings_fields_verdict(report)
     checker.add("H2", "每只持仓带诊断字段（在池/MA20/MA60/破位/E/动量/市值/盈亏）",
-                not bad_h, f"缺字段={bad_h[:5] or '无'}")
+                _h2_ok, _h2_detail)
     unselected = [row for row in holdings if not row.get("selected")]
     no_reason_h = [row.get("code") for row in unselected
                    if not str(row.get("reject_reason") or "").strip()]
@@ -733,6 +880,11 @@ def run_static_checks(source: str) -> list[tuple[str, str, bool, str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="ETF 分析报告 · 规格符合性探针（只读）")
     parser.add_argument("--report", required=True, help="etf_analysis_report.json 路径")
+    parser.add_argument(
+        "--frozen-params",
+        default=None,
+        help="V2 冻结件路径（M4 期望值的单一事实源；缺省取 daily_config.V2_FROZEN_PARAMS_FILE）",
+    )
     args = parser.parse_args()
 
     report_path = Path(args.report)
@@ -743,6 +895,8 @@ def main() -> int:
     calendar = load_calendar()
     # 🔴 账户事实源 = **报告同目录**的 ``account_context.json``（缺失 ⇒ H1 fail-closed）
     account = load_account_expectation(report_path.resolve().parent)
+    # 🔴 V2 冻结件 = **M4 期望值的单一事实源**（读不到 ⇒ M4 fail-closed 判 FAIL）
+    frozen, frozen_err = load_frozen_expectation(args.frozen_params)
 
     lines: list[str] = []
     failures: list[str] = []
@@ -754,7 +908,7 @@ def main() -> int:
             failures.append(f"{tag} {name}")
 
     # ---- 正例：正式报告原样 ----
-    results = run_checks(report, calendar, account)
+    results = run_checks(report, calendar, account, frozen, frozen_err)
     for check_id, name, ok, detail in results:
         emit(check_id, name, ok, detail)
 
@@ -768,10 +922,14 @@ def main() -> int:
             emit(check_id, name, ok, detail)
 
     # ---- 负例：故意改坏 ⇒ 对应断言必须真的 FAIL ----
-    def mutate(fn):
+    def mutate(fn, frozen_override=None):
         bad = copy.deepcopy(report)
         fn(bad)
-        return {cid: ok for cid, _n, ok, _d in run_checks(bad, calendar, account)}
+        return {cid: ok for cid, _n, ok, _d in run_checks(
+            bad, calendar, account,
+            frozen if frozen_override is None else frozen_override,
+            frozen_err,
+        )}
 
     def _break_reject_reason(rep: dict) -> None:
         """把某只**未入选**持仓的淘汰原因抹掉 ⇒ H3 必须 FAIL。
@@ -853,6 +1011,23 @@ def main() -> int:
         fs = rep.setdefault("filter_stats", {})
         fs["n_candidate_pool"] = len(cands)
 
+    def _break_ma60_ok(rep: dict, *, drop: bool) -> None:
+        """把持仓诊断里的 `ma60_ok` 弄坏（**删键** / **置 null**）⇒ H2 必须 FAIL。
+
+        🔴 2026-11-26：当天实测的红正是「**键在、值为 null**」这种形态
+           ⇒ 负例必须**两种形态都咬人**（删键 / 置 null），
+           否则断言可能只挡得住其中一种（另一种照样一路 PASS 到交付）。
+        """
+        hd = rep.get("current_holdings_diagnosis")
+        holdings = hd.get("holdings") if isinstance(hd, dict) else None
+        if not isinstance(holdings, list) or not holdings:
+            raise ValueError("报告里没有 current_holdings_diagnosis.holdings ⇒ 夹具不适用")
+        row = holdings[0]
+        if drop:
+            row.pop("ma60_ok", None)
+        else:
+            row["ma60_ok"] = None
+
     negative_cases = [
         ("N1", "删掉 meta.hash_seed", "M5",
          lambda r: r["meta"].pop("hash_seed", None)),
@@ -917,6 +1092,12 @@ def main() -> int:
         ("N24", "**自洽篡改**池子条数（n_candidate_pool 与 len(candidates) 一起改）"
                 "⇒ C1 骗得过去、C1b 必须 FAIL", "C1b",
          _break_pool_count_self_consistent, {"C1": True}),
+        # 🔴 2026-11-26 新增：H2（持仓诊断缺 MA60）的**变异反证**——
+        #    两种形态都要咬人（删键 / 置 null），否则断言可能只挡得住一种。
+        ("N25", "删掉持仓诊断里的 ma60_ok（字段缺失）⇒ H2 必须 FAIL", "H2",
+         lambda r: _break_ma60_ok(r, drop=True)),
+        ("N26", "把持仓诊断里的 ma60_ok 置成 null（值缺失）⇒ H2 必须 FAIL", "H2",
+         lambda r: _break_ma60_ok(r, drop=False)),
     ]
     for case in negative_cases:
         case_id, desc, target_id, fn = case[:4]
@@ -948,6 +1129,27 @@ def main() -> int:
                 detail += ("｜伴随断言成立："
                            + "；".join(f"{eid}={exp}" for eid, exp in extra.items()))
         emit(case_id, f"负例「{desc}」⇒ 断言 {target_id} 必须 FAIL", ok, detail)
+
+    # ---- 负例：改**期望值的来源**（V2 冻结件）⇒ M4 必须 FAIL ----
+    # 🔴 2026-11-26 变异反证（铁律：每个新断言/守卫都要证明有牙）：
+    #    把冻结件里的 α 改成 0.5（＝ V1 老基线）⇒ M4 必须转红
+    #    ⇒ 证明 M4 真的在**比冻结件**，而不是「碰巧永远 PASS」。
+    if frozen:
+        _mutated_frozen = dict(frozen)
+        _mutated_frozen["alpha_weight"] = 0.5
+        try:
+            _got = {cid: ok for cid, _n, ok, _d in
+                    run_checks(report, calendar, account, _mutated_frozen, frozen_err)}
+        except Exception as exc:  # noqa: BLE001 —— 负例构造失败必须报出来
+            emit("N27", "负例「把 V2 冻结件里的 α 改掉（1.0 → 0.5）」⇒ 断言 M4 必须 FAIL",
+                 False, f"负例构造/判定失败：{type(exc).__name__}: {exc}")
+        else:
+            emit("N27", "负例「把 V2 冻结件里的 α 改掉（1.0 → 0.5）」⇒ 断言 M4 必须 FAIL",
+                 _got.get("M4") is False,
+                 f"M4 的判定={_got.get('M4')}（期望 False；True ⇒ 断言没在比冻结件）")
+    else:
+        emit("N27", "负例「把 V2 冻结件里的 α 改掉（1.0 → 0.5）」⇒ 断言 M4 必须 FAIL",
+             False, "冻结件读不到 ⇒ 负例构造不适用（M4 本身已 fail-closed 判红）")
 
     # ---- 正例（口径自检）：「池被抽干」是**合法**形态 ⇒ 不得误判红 ----
     # 🔴 2026-11-11：C1 改成 min(top_n, 池存活数) 后，必须证明它**不会**把
@@ -1009,6 +1211,10 @@ def main() -> int:
           + (f"错误={account.get('error')}" if account.get("error")
              else f"持仓={account.get('codes')}｜总资产={account.get('total_assets')}"
                   f"｜现金={account.get('cash')}"))
+    print("V2 冻结件（M4 期望值来源）："
+          + (f"{frozen.get('source')}｜冠军臂={frozen.get('winner_arm')}"
+             f"｜期望 α={frozen.get('alpha_weight'):g} / 动量={frozen.get('momentum_weight'):g}"
+             if frozen else f"读不到 ⇒ M4 判 FAIL｜{frozen_err}"))
     print("-" * 78)
     print("\n".join(lines))
     print("-" * 78)

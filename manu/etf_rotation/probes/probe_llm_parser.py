@@ -1331,6 +1331,74 @@ def _synthetic(decision_md: Path, body: str, total_assets: float | None = None) 
 
 
 
+def _a16_detector_probe(tmp: Path) -> list[float]:
+    """🔴 **盈亏语境检测器自检**：用一行合成决策（明确含「浮亏 18.91%」）跑一遍解析。
+
+    ⇒ 返回取到的盈亏百分数列表（**空列表 = 检测器坏了**）。
+    ⚠️ 写入的是探针自己的 scratch 文件（**不是**官方决策件）⇒ 零副作用。
+    """
+    body = (
+        "# 合成 A16 自检\n\n## 空头\n\n"
+        "| ETF | 方向 | 备注 |\n"
+        "|:--|:--|:--|\n"
+        "| 512690 | 卖 | 当前18.91%浮亏，退出更合理 |\n"
+    )
+    views = _synthetic(tmp, body)
+    return [
+        float(q)
+        for _lst in views.values()
+        for _v in _lst
+        for q in (_v.get("pnl_pcts") or [])
+    ]
+
+
+def _a16_verdict(off_views: dict, detector_probe) -> tuple[str, str]:
+    """A16 的判定（抽成独立函数 ⇒ 可单测）。
+
+    :param off_views: 官方决策件解析出的视图（``{code: [view, ...]}``）
+    :param detector_probe: 无参可调用 ⇒ 返回合成行取到的盈亏百分数列表（检测器自检）
+    :returns: ``(status, detail)``；``status`` ∈ ``{"PASS", "N/A", "FAIL"}``
+
+    🔴 口径（2026-11-27 修正 · 11-26 跑批 step4 判红）：
+      * **非真空**（官方决策里存在带盈亏语境的行）⇒ 目标权重不得等于任一盈亏率
+        ⇒ 违例即 FAIL。
+      * **真空**（官方决策**根本没有**盈亏/价格/当前语境的百分数）⇒ 本项
+        **不适用**（§十四.117「不适用 ≠ 不合格」）⇒ 判 N/A，**不是 FAIL**
+        （11-26 实测：逐票表里只有 mom120 / E / 拥挤分位 / 重叠 / 相关 ⇒ 全都不是盈亏语境）。
+      * 🔴 但「真空」必须**自证不是检测器坏了** ⇒ 先跑 ``detector_probe``：
+        取不到任何盈亏百分数 ⇒ **检测器坏了** ⇒ 判 FAIL（不许把红灯洗成「不适用」）。
+    """
+    bad_rows: list[str] = []
+    n_tgt = 0
+    n_vac = 0
+    for code, lst in (off_views or {}).items():
+        for v in lst:
+            pnl = [abs(float(q)) for q in (v.get("pnl_pcts") or [])]
+            if pnl:
+                n_vac += 1
+            tp = v.get("target_pct")
+            if tp is None:
+                continue
+            n_tgt += 1
+            if any(abs(float(tp) - x) < 1e-9 for x in pnl):
+                bad_rows.append(f"{code}/{v.get('who')} target={tp} pnl={pnl}")
+    if n_vac > 0:
+        status = "FAIL" if bad_rows else "PASS"
+        return status, (
+            f"有目标的行 {n_tgt}｜**非真空行 {n_vac}**（含盈亏语境）｜违例 {bad_rows}"
+        )
+    probe_pnls = list(detector_probe() or [])
+    if probe_pnls:
+        return "N/A", (
+            f"本轮官方决策**无盈亏语境行**（非真空行数 = 0）⇒ 本项**不适用**"
+            f"（不适用 ≠ 通过；🔴 检测器已自证有效：合成行「浮亏 18.91%」⇒ 取到 {probe_pnls}）"
+        )
+    return "FAIL", (
+        "🔴 非真空行数 = 0，**且**合成行自检也取不到任何盈亏百分数 ⇒ "
+        "**盈亏语境检测器坏了**（不许把红灯洗成「不适用」）"
+    )
+
+
 def _zero_guard_neutralized(mod=F):
     """把 ZERO 方向守卫**同时回退**（变回「旧实现」的样子）。
 
@@ -1697,11 +1765,15 @@ def main() -> int:
                     _n_tgt += 1
                     if any(abs(float(_tp) - _x) < 1e-9 for _x in _pnl):
                         _bad_rows.append(f"{_code}/{_v.get('who')} target={_tp} pnl={_pnl}")
-            check("A16 官方决策：目标权重不得等于该行任一「盈亏/价格/当前语境」的百分数"
-                  "（正负都算）",
-                  (not _bad_rows) and _n_vac > 0,
-                  f"有目标的行 {_n_tgt}｜**非真空行 {_n_vac}**（含盈亏语境）｜违例 {_bad_rows}"
-                  f"｜非真空行数 = 0 ⇒ 本项**不适用**（不许假装通过）")
+            _status, _detail = _a16_verdict(_off_views, lambda: _a16_detector_probe(tmp))
+            if _status == "PASS":
+                check("A16 官方决策：目标权重不得等于该行任一「盈亏/价格/当前语境」的百分数"
+                      "（正负都算）", True, _detail)
+            elif _status == "N/A":
+                print(f"[N/A] A16 {_detail}")
+            else:
+                check("A16 官方决策：目标权重不得等于该行任一「盈亏/价格/当前语境」的百分数"
+                      "（正负都算）", False, _detail)
         else:
             print(f"[N/A] A16 官方决策不存在（{_off_dec}）⇒ 该项**不适用**")
 

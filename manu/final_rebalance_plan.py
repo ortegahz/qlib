@@ -3264,6 +3264,22 @@ def apply_ta_screening(
 #:      **必须用同一套口径**，否则阶段 6 会把阶段 5 拦下的碎单**重新算回来**
 #:      ⇒ 门槛形同虚设 ⇒ 两个脚本都 import 同一个模块。
 
+def _exit_gate_enabled(meta: dict) -> bool:
+    """报告披露的**强制退出闸门**是否开着（**单一事实源** = `meta.params.exit_ma_window`）。
+
+    🔴 2026-11-27（口径分叉修复）：这是「**闸门**」与「**诊断**」的分界线 ——
+       `exit_ma_window > 0` ⇒ 闸门开着（跌破 MA60 的持仓**确实**会被无条件卖出）；
+       `exit_ma_window = 0`（**V2 冻结件口径**）⇒ 闸门关闭，MA60 只是**破位诊断**。
+    🔴 字段缺失 ⇒ **按「关闭」处理**（不许声称强制退出）—— 宁可少说一句，
+       也不许在交付件里写一句**可能不成立**的操作指令。
+    """
+    try:
+        window = int((meta.get("params") or {}).get("exit_ma_window") or 0)
+    except (TypeError, ValueError):
+        return False
+    return window > 0
+
+
 def build_plan(args) -> dict:
     # 🔴 M-B①：F5 判定走「运行内快照」⇒ 每次构建**先清缓存**（新构建必读新盘）
     reset_decision_failure_cache()
@@ -3699,7 +3715,23 @@ def build_plan(args) -> dict:
             )
             continue
         if p["current_shares"] and p["ma60_ok"] is False:
-            p["reason"] = (p["reason"] + "；**已跌破 MA60 ⇒ 持仓强制退出（不看排名）**").strip("；")
+            # 🔴 2026-11-27（口径分叉修复 · 真缺陷）：「强制退出」是**闸门**决策，
+            #    `ma60_ok` 只是**破位诊断** —— 两者不许混用。
+            #    背景：analyze.py 的 `ma60_ok` 原先绑在 **exit 闸门**上（V2 冻结件
+            #    `exit_ma_window=0` ⇒ 恒 None）；改成「恒定 MA60 口径实算的诊断值」后，
+            #    `ma60_ok is False` 会在 V2 下**真的能触发** ⇒ 若文案照旧写
+            #    「持仓强制退出（不看排名）」，交付件就在**说谎**（V2 根本没开强制退出闸门，
+            #    跌破 MA60 的持仓不会被无条件卖出）。
+            #    ⇒ 闸门状态**同源**取报告 `meta.params.exit_ma_window`（analyze.py 写入）：
+            #       > 0 ⇒ 闸门开着 ⇒ 保留「强制退出」措辞；
+            #       = 0 ⇒ 闸门关闭 ⇒ 只披露「破位诊断」，**不许**声称强制退出；
+            #       字段缺失 ⇒ **不声称**（宁可少说一句，也不许在交付件里说谎）。
+            p["reason"] = (
+                p["reason"]
+                + ("；**已跌破 MA60 ⇒ 持仓强制退出（不看排名）**"
+                   if _exit_gate_enabled(meta)
+                   else "；**已跌破 MA60（破位诊断；本期未开启 MA60 强制卖出闸门 ⇒ 不做无条件卖出）**")
+            ).strip("；")
         if p["e_score"] is not None:
             p["reason"] += (f"；E(W×S)={float(p['e_score']):.4f}"
                             + (f"，mom120={float(p['mom120']):+.2%}" if p["mom120"] is not None else ""))

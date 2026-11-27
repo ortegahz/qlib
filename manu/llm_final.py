@@ -2067,18 +2067,28 @@ def _item_scope_hits(
         hits[code] = (code, _name_near(sentence, code, cpos))
 
     # ① R1 同项内
+    # 🔴 2026-11-26（真缺陷 · G4）：**否决动词只绑「直接绑定」的那只代码**
+    #    ⇒ 同项里作为「邻居/对比对象」出现的其它代码**不得连坐**
+    #    （「否决 515170：与 159928 成分重叠」⇒ 只有 515170 被否）。
+    #    ⚠️ 判不出紧邻代码 ⇒ **回落**到既有窗口口径（不许因收紧而漏掉真否决）。
     for idx in range(len(spans)):
-        for cpos, code in item_codes[idx]:
-            for vpos, _word in item_verbs[idx]:
+        for vpos, word in item_verbs[idx]:
+            bound = _reject_verb_bound_codes(clause, vpos, len(word))
+            for cpos, code in item_codes[idx]:
+                if bound:
+                    if code in bound:
+                        _mark(cpos, code)
+                    continue
                 if abs(vpos - cpos) > _REJECT_WINDOW:
                     continue
                 _mark(cpos, code)
-                break
 
     # ② R2 头作用域 / ③ R3 尾作用域
     count = len(spans)
     for idx in range(count):
-        for vpos, _word in item_verbs[idx]:
+        for vpos, word in item_verbs[idx]:
+            # 🔴 2026-11-26（真缺陷 · G4）：**直接绑定**（后继优先；否则最近前驱）
+            bound = _reject_verb_bound_codes(clause, vpos, len(word))
             scope: list[int] = []
             if item_codes[idx]:
                 first = item_codes[idx][0][0]
@@ -2088,6 +2098,12 @@ def _item_scope_hits(
                 elif vpos > last:
                     scope = list(range(0, idx + 1))        # 尾作用域：本项及其前
             else:
+                # 🔴 2026-11-26（真缺陷 · G4）：动词**没有任何直接绑定**
+                #    ⇒ 它没点名任何标的 ⇒ **不是**裁决 ⇒ 不许管辖「越过」的项。
+                #    实测（`snapshots/20261126_171821`）：「>1.5x ⇒ **否决首选**）
+                #    后面紧跟的 159928 只是**监控邻居**（另一张监控表）⇒ 不得连坐。
+                if not bound:
+                    continue
                 # 本项没有代码：动词管辖它「越过」的项（前后都算）
                 for j in range(count):
                     if j == idx or not item_codes[j]:
@@ -2096,10 +2112,15 @@ def _item_scope_hits(
                         scope.append(j)
                     elif j > idx and item_codes[j][0][0] > vpos:
                         scope.append(j)
+            # 🔴 2026-11-26（真缺陷 · G4）：**动词所在项**只认「直接绑定」的代码
+            #    （同项里其余代码是「邻居/对比对象」⇒ 不得连坐）；
+            #    跨项作用域（其余项）维持既有口径。
             for j in scope:
                 if item_action[j]:
                     continue                               # 自带动作 ⇒ 外部动词不管辖
                 for cpos, code in item_codes[j]:
+                    if j == idx and bound and code not in bound:
+                        continue
                     _mark(cpos, code)
 
     return list(hits.values())
@@ -2162,6 +2183,134 @@ def _hypothetical_codes(text: str) -> set[str]:
                     out.add(code_m.group(0))
                     break
     return out
+
+
+#: 🔴 2026-11-26（真缺陷 · G4）：**讨论/疑问语气**里的否决动词不作数。
+#: ------------------------------------------------------------------
+#: 实测（服务器交付件 `snapshots/20261126_171821` · 辩论裁决段原文）：
+#:     「这场辩论真正在吵三件事：512800 个股要不要减、**要不要否决**消费重复腿、
+#:       权益总敞口该多大」
+#: ⇒ 「要不要否决」是**讨论句**（这场辩论在吵什么），**不是**裁决句
+#: ⇒ 旧口径把「否决」绑到了本行**唯一**的代码 512800 头上
+#: ⇒ 512800 被写进「TA 一票否决」名单（真实裁决是**减仓**）⇒ 11-30 实盘批选错票。
+#: ⇒ 口径：**疑问/讨论标记 + 否决动词** ⇒ 该动词**不是**本轮裁决。
+#: ⚠️ 只豁免**紧邻**的那一个动词（同句里后面的真否决不受影响）。
+_REJECT_DISCUSSION_MARKERS: tuple[str, ...] = (
+    "要不要", "是否应该", "是否要", "是否", "可不可以", "能不能", "会不会",
+    "可否", "能否", "可以", "该不该", "应不应该", "应否", "行不行",
+    "好不好", "是不是", "需不需要", "有没有必要", "值不值得",
+    "如何", "怎样", "怎么",
+)
+#: 「疑问标记 + （语气词） + 空白」贴住动词前缀（`要不要否决` / `是否否决`）。
+#: ⚠️ 标记**长的写在前面**（`是否应该` 必须先于 `是否` 命中）。
+_REJECT_DISCUSSION_TAIL_RE = re.compile(
+    r"(?:" + "|".join(re.escape(m) for m in _REJECT_DISCUSSION_MARKERS) + r")"
+    r"[\s*`_~]*(?:了|呢|吧|啊)?[\s*`_~]*$"
+)
+#: 往前看多少字够覆盖「疑问标记 + 语气词」（最长标记「有没有必要」= 5 字）。
+_REJECT_DISCUSSION_WINDOW = 16
+
+
+def _discussion_verb_positions(
+    clause: str, verbs: list[tuple[int, str]]
+) -> set[int]:
+    """本子句里被**疑问/讨论语气**管辖的否决动词位置（⇒ 不是本轮裁决）。
+
+    🔴 2026-11-26（真缺陷 · G4）：「要不要否决」「是否否决」「可以否决吗」
+       这类**讨论句**里的否决动词**不是**裁决 ⇒ 该动词位置作废。
+    ⚠️ 只作废**紧邻**的那一个动词（同句里后面的真否决不受影响）。
+    """
+    out: set[int] = set()
+    for vpos, _word in verbs:
+        head = clause[max(0, vpos - _REJECT_DISCUSSION_WINDOW):vpos]
+        if _REJECT_DISCUSSION_TAIL_RE.search(head):
+            out.add(vpos)
+    return out
+
+
+#: 🔴 2026-11-26（真缺陷 · G4）：**否决动词与代码的「直接绑定」**（按代码块隔离）。
+#: ------------------------------------------------------------------
+#: 实测（服务器交付件 `snapshots/20261126_171821` · 辩论裁决段原文）：
+#:     「1. **否决 515170**：与 159928 成分重叠 0.645、120 日相关 0.938……」
+#: ⇒ 「否决」的**宾语只有 515170**；159928 只是**被提到的邻居标的**
+#:    （用来解释「为什么否决 515170」）。
+#: ⇒ 旧口径按「同一并列项内 40 字窗口」⇒ 两个代码**一起**被判成否决 ✗✗
+#: ⇒ 159928 被写进「TA 一票否决」名单（真实裁决是**买入**）⇒ 11-30 实盘批选错票。
+#: ⇒ 口径：**行内**按「代码块」隔离 ⇒ 否决动词只绑**紧邻它**的那只代码
+#:    （后继优先；没有后继才回看最近的前驱），枚举链（`A、B` / `A与B`）整条算绑定。
+#: ⚠️ 判不出紧邻代码时**回落**到既有窗口口径（不许因收紧而漏掉真否决）。
+#:    「代码 + 动词」之间允许隔的**副词修饰**（`515170正式否决` / `516620正式一票否决`）。
+_BIND_SKIP_CHARS = " \t\r\n*`_~"
+#: 枚举连接词（`512010、563020` / `159207与563020`）。
+_BIND_ENUM_RE = re.compile(r"[\s*`_~]*(?:、|与|和|跟|及|以及)[\s*`_~]*")
+#: 枚举连接词在**前驱方向**的形态（贴住代码前）。
+_BIND_ENUM_BACK_RE = re.compile(r"[\s*`_~]*(?:、|与|和|跟|及|以及)[\s*`_~]*$")
+#: 「代码 + 副词修饰 + 空白」贴住动词前缀。
+_BIND_PREV_RE = re.compile(
+    r"(?<![\d.])(?P<code>[1-9]\d{5})(?!\d)"
+    r"(?:[\s*`_~]*(?:正式|一票|明确|最终|一致|坚决|直接|予以))*"
+    r"[\s*`_~]*$"
+)
+
+
+def _bind_forward_codes(clause: str, pos: int) -> list[tuple[int, str]]:
+    """从 `pos` 起**紧邻**的代码（后继绑定）⇒ [(代码起点, 代码)]。
+
+    🔴 只吃「空白 + markdown 记号」⇒ 「否决 515170**：与 159928」里的
+       159928 **不会被**绑上（中间隔着「：」）。
+    """
+    out: list[tuple[int, str]] = []
+    p = pos
+    while p < len(clause) and clause[p] in _BIND_SKIP_CHARS:
+        p += 1
+    while True:
+        m = _CODE_RE.match(clause, p)
+        if m is None:
+            break
+        out.append((m.start(), m.group(1)))
+        nxt = _BIND_ENUM_RE.match(clause, m.end())
+        if nxt is None:
+            break
+        p = nxt.end()
+    return out
+
+
+def _bind_backward_codes(clause: str, pos: int) -> list[tuple[int, str]]:
+    """`pos` 之前**紧邻**的代码（前驱绑定）⇒ [(代码起点, 代码)]。
+
+    🔴 「512010、563020不建仓」⇒ 绑 563020，并沿枚举链**回吃** 512010。
+    """
+    out: list[tuple[int, str]] = []
+    p = pos
+    # ① 动词前面只剩**枚举连接词**（`512800、515450、暂缓`）
+    #    ⇒ 整条枚举链就是绑定对象 ⇒ 先把连接词摘掉。
+    tail = _BIND_ENUM_BACK_RE.search(clause[:p])
+    if tail is not None and tail.start() < p:
+        p = tail.start()
+    # ② 紧邻代码 ＋ 枚举链
+    while True:
+        m = _BIND_PREV_RE.search(clause[:p])
+        if m is None:
+            break
+        out.append((m.start(), m.group("code")))
+        nxt = _BIND_ENUM_BACK_RE.search(clause[:m.start()])
+        if nxt is None:
+            break
+        p = nxt.start()
+    return out
+
+
+def _reject_verb_bound_codes(clause: str, vpos: int, vlen: int) -> set[str]:
+    """这个否决动词**直接绑定**的代码集合（行内 · 按代码块隔离）。
+
+    🔴 口径：**后继优先**（`否决 515170` ⇒ 绑 515170）；
+       没有后继才回看**最近的前驱**（`515170正式否决` ⇒ 绑 515170）。
+    """
+    fwd = _bind_forward_codes(clause, vpos + vlen)
+    if fwd:
+        return {code for _pos, code in fwd}
+    bwd = _bind_backward_codes(clause, vpos)
+    return {code for _pos, code in bwd}
 
 
 def _codes_with_own_action(
@@ -2545,7 +2694,13 @@ def _explicit_verdict_rejects(verdict: str) -> bool:
     for neg in _REJECT_NEGATIONS:
         cleaned = cleaned.replace(neg, " ")
     cleaned = _REJECT_NEGATION_RE.sub(" ", cleaned)
-    return bool(_reject_verb_hits(cleaned))
+    hits = _reject_verb_hits(cleaned)
+    if not hits:
+        return False
+    # 🔴 2026-11-26（真缺陷 · G4，同族）：**讨论/疑问语气**的否决动词不作数
+    #    （点名条目的「方向『是否否决』」是**讨论**，不是本轮裁决）。
+    discussion = _discussion_verb_positions(cleaned, hits)
+    return any(pos not in discussion for pos, _word in hits)
 
 
 #: 「自带**裁决**」的动作词（比 `_ITEM_ACTION_WORDS` 窄）：
@@ -2619,6 +2774,9 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
         # 🔴 2026-11-26（真缺陷 · 反事实句式）：「否决 512800 **后**能顺延的只有…」
         #    是**假设推演**，不是本轮一票否决 ⇒ 该动词位置作废。
         counterfactual_local = _counterfactual_veto_positions(clause, clause_verbs)
+        # 🔴 2026-11-26（真缺陷 · G4）：**讨论/疑问句**里的否决动词作废
+        #    （「要不要否决」是这场辩论在吵什么，**不是**本轮裁决）。
+        discussion_local = _discussion_verb_positions(clause, clause_verbs)
         verbs = [
             (cstart + pos, word)
             for pos, word in clause_verbs
@@ -2626,6 +2784,7 @@ def _prose_hits(sentence: str) -> list[tuple[str, str]]:
             and pos not in weak_local and pos not in refused_local
             and pos not in noun_local and pos not in third_local
             and pos not in viewpoint_local and pos not in counterfactual_local
+            and pos not in discussion_local
         ]
         # 🔴 2026-11-11 修（真误伤）：**比较引用 / 工具引用**里的代码
         #    （「与 515450 相关性 0.917」「只用 515450 表达足够」）
@@ -2709,9 +2868,17 @@ def _row_hits(row: str) -> list[tuple[str, str]]:
         return []
     action_idx = -1
     for idx in range(code_idx, len(cells)):
-        if _reject_verb_hits(cells[idx]):
-            action_idx = idx
-            break
+        cell_verbs = _reject_verb_hits(cells[idx])
+        if not cell_verbs:
+            continue
+        # 🔴 2026-11-26（真缺陷 · G4）：动作格里若是**讨论句**
+        #    （「是否否决」）⇒ 不是裁决 ⇒ 继续看下一格。
+        if _discussion_verb_positions(cells[idx], cell_verbs) >= {
+            pos for pos, _word in cell_verbs
+        }:
+            continue
+        action_idx = idx
+        break
     if action_idx < 0:
         return []
     action = cells[action_idx]

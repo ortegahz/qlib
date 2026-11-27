@@ -9,7 +9,7 @@
    样本不足 ⇒ ``ma60 is None``；
 2. ``run_pipeline``：**唯一**入口（Mode A/B/C 分诊已下线）⇒ 只有一条流水线；
 3. ``build_execution_card``：整手向下取整、单只金额上限、货基碎屑过滤、
-   现金缓冲守卫、卖出含印花税；
+   现金缓冲守卫、**卖出侧免印花税**（P2：场内 ETF 买卖双向免税 ⇒ 与研究链同源）；
 4. 🔴 **观察态 / 实盘态二态**：``live_trade=False``（缺省）⇒ 执行卡**挂单禁用**；
    ``live_trade=True`` ⇒ 不带禁用标记（可下单）；
 5. 🔴 **无「模式」概念**：`run_paths` / `calendar_gate` 都**不许**再有 mode API；
@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -272,8 +273,16 @@ def test_card_cash_reserve_ratio_is_disclosure_only():
     assert any("权益超配" in w for w in card["warnings"]), "击穿规则层预留必须显式告警"
 
 
-def test_card_sell_fee_includes_stamp_duty():
-    """卖出费（佣金 + 印花税）必须高于同金额买入费（只有佣金）。"""
+def test_card_sell_fee_excludes_stamp_duty():
+    """🔴 P2：场内 ETF **买卖双向免印花税** ⇒ 同金额**卖出费 == 买入费**（都只算佣金）。
+
+    🔴 旧口径（卖出侧叠加千一印花税）⇒ 卖出费**恒高于**买入费 ⇒ **高估交易摩擦**，
+       且每日链与研究链**不同源**（研究链 `manu/etf_rotation/config.py:245`、
+       `backtest.py:8` 都写明「ETF 免印花税」）。
+    独立手算（**期望值是字面量，不取被检对象自述**）：
+      金额 1,000 元 ⇒ 佣金 1,000 × 0.0003 = **0.30 元** < 5 元下限 ⇒ 费 = **5.00 元**；
+      旧口径卖出再加 1,000 × 0.001 = 1.00 元 ⇒ 卖出费 **6.00 元**（**必须不再出现**）。
+    """
     buy = _card(
         [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
           "price": 1.0, "target_amount": 1000.0}],
@@ -286,10 +295,83 @@ def test_card_sell_fee_includes_stamp_duty():
     )
     buy_fee = buy["orders"][0]["est_fee"]
     sell_fee = sell["orders"][0]["est_fee"]
-    assert buy_fee == pytest.approx(DC.MIN_COMMISSION)
-    assert sell_fee == pytest.approx(DC.MIN_COMMISSION + 1000.0 * DC.STAMP_DUTY_RATE)
-    assert sell_fee > buy_fee
+    assert buy_fee == pytest.approx(5.0)
+    assert sell_fee == pytest.approx(5.0)
+    assert sell_fee == buy_fee
     assert sell["orders"][0]["action"] == "卖出"
+
+
+def test_daily_config_stamp_duty_rate_is_zero():
+    """🔴 P2：每日链印花税率必须 = **0.0**（场内 ETF 买卖双向免税 ⇒ 与研究链同源）。
+
+    🔴 期望值写成**字面量 0.0**（不是 ``DC.STAMP_DUTY_RATE`` 自述，也不是从研究链常量反推）。
+    """
+    assert DC.STAMP_DUTY_RATE == 0.0
+
+
+def test_card_constraints_disclose_zero_stamp_duty():
+    """🔴 P2：执行卡的 ``constraints`` **保留** ``stamp_duty_rate`` 字段（披露口径需要），
+    但取值必须是 **0.0**（披露口径随实际口径走，不许留旧值）。
+    """
+    card = _card(
+        [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
+          "price": 1.0, "target_amount": 1000.0}],
+        account={"total_assets": 5000.0, "cash": 5000.0},
+    )
+    assert "stamp_duty_rate" in card["constraints"]
+    assert card["constraints"]["stamp_duty_rate"] == 0.0
+
+
+def test_est_fee_large_amount_no_stamp_duty():
+    """🔴 P2：**费率档**（不是下限档）同样免印花税。
+
+    独立手算：金额 100,000 元 ⇒ 佣金 100,000 × 0.0003 = **30.00 元** > 5 元下限 ⇒ 费 = **30.00 元**；
+    旧口径卖出再加 100,000 × 0.001 = 100.00 元 ⇒ 卖出费 **130.00 元**（**必须不再出现**）。
+    """
+    assert AR._est_fee(100000.0, "buy") == pytest.approx(30.0)
+    assert AR._est_fee(100000.0, "sell") == pytest.approx(30.0)
+
+
+# ---------------------------------------------------------------- 变异反证（P2）
+def test_est_fee_source_has_no_stamp_duty_branch():
+    """🔴 变异反证（**源码级**）：活链 ``_est_fee`` 里**不许**再出现 ``STAMP_DUTY_RATE``。
+
+    为什么要有这条：若有人把卖出侧加税的分支改回来（``fee += amt * STAMP_DUTY_RATE``），
+    「卖出费 == 买入费」那条断言**必须转红** —— 本条会**先**报红，证明守卫确实咬在
+    **活链源码**上（而不是靠本文件手写的替身凑出来的绿）。
+    """
+    src = inspect.getsource(AR._est_fee)
+    assert "STAMP_DUTY_RATE" not in src, (
+        "🔴 活链 `_est_fee` 又出现印花税 ⇒ 卖出侧费用口径被改回旧口径（与研究链不同源）"
+    )
+
+
+def test_sell_fee_assertion_has_teeth_legacy_stamp_duty(monkeypatch):
+    """🔴 变异反证（**行为级**）：把 ``_est_fee`` 换回**旧口径**（卖出侧加千一印花税）
+    ⇒ 卖出费必须回到 6.00 元 / 130.00 元 ⇒ 「卖出费 == 买入费 == 5.00 元」与
+    「10 万元档卖出费 == 30.00 元」两条断言**必须转红**（否则它们就是摆设）。
+
+    🔴 变异体**自带 0.001 字面量**（不读 ``DC.STAMP_DUTY_RATE``）⇒ 变异的是**行为**，
+       不是配置常量 ⇒ 反证的是「加税分支」这件事本身。
+    """
+    def _legacy_est_fee(amount: float, side: str | None) -> float:
+        amt = abs(float(amount))
+        fee = max(amt * float(DC.COMMISSION_RATE), float(DC.MIN_COMMISSION))
+        if side == "sell":
+            fee += amt * 0.001          # 旧口径：卖出单边千一印花税
+        return fee
+
+    monkeypatch.setattr(AR, "_est_fee", _legacy_est_fee)
+    sell = _card(
+        [{"code": "512800", "name": "银行ETF华宝", "current_shares": 1000,
+          "price": 1.0, "target_amount": 0.0}],
+        account={"total_assets": 5000.0, "cash": 0.0},
+    )
+    mutated_card_fee = sell["orders"][0]["est_fee"]
+    assert mutated_card_fee == pytest.approx(6.0)      # 旧口径：5.00 + 1,000×0.001
+    assert mutated_card_fee != pytest.approx(5.0)      # ⇒ 与新口径**互斥** ⇒ 新断言有牙
+    assert AR._est_fee(100000.0, "sell") == pytest.approx(130.0)   # 旧口径：30.00 + 100.00
+    assert AR._est_fee(100000.0, "sell") != pytest.approx(30.0)
 
 
 def test_card_missing_fields_become_none_with_warning():
@@ -491,8 +573,14 @@ def test_same_code_two_rows_merge_into_one_terminal_row():
     assert cash_end <= card["account"]["total_assets"] + 1.0, (
         f"cash_end={cash_end} 超过总资产 {card['account']['total_assets']} ⇒ 账面虚增"
     )
-    # 实测口径：现金 23,370.87 ＋ 卖出净额 6,192.38 ⇒ 29,563.25（权益 926.00 补回）
-    assert cash_end == pytest.approx(29563.25, abs=0.01)
+    # 🔴 P2（2026-11-27：ETF 卖出侧印花税归零）⇒ 现金终值按**免印花税**口径独立手算：
+    #    卖出款 6,700 × 0.926 = 6,204.20
+    #    − 卖出佣金 max(6,204.20 × 0.0003, 5.00) = **5.00**
+    #    − 卖出滑点 6,204.20 × 0.0001 = **0.62042**
+    #    ⇒ 卖出净额 6,198.57958 ⇒ cash_end = 23,370.87 + 6,198.57958 = **29,569.44958**
+    #    （旧口径多扣了一笔卖出印花税 6,204.20 × 0.001 = 6.2042 元 ⇒ 旧值 29,563.25；
+    #      场内 ETF 本无此税 ⇒ 该笔扣减必须消失）
+    assert cash_end == pytest.approx(29569.44958, abs=0.01)
 
     # ⑤ 归并必须**可审计**（披露 + 告警都要有）
     disp = card["merge_disclosure"]

@@ -303,8 +303,13 @@ MODEL_VERSION = validate_model_version(
 #: 佣金（万分之；买卖各算一次，下限 5 元 —— 与研究链一致）
 COMMISSION_RATE = 0.0003
 MIN_COMMISSION = 5.0
-#: 印花税（**卖出**单边，千分之一）
-STAMP_DUTY_RATE = 0.001
+#: 印花税：**0.0**（场内 ETF **买卖双向均免征**印花税）
+#: 🔴 2026-11-27（P2：ETF 卖出侧印花税归零）：旧值 0.001（**卖出**单边千一）**高估了交易摩擦**，
+#:    且每日链与研究链**不同源** —— 研究链 `manu/etf_rotation/config.py:245`
+#:    （「场内 ETF：**免印花税**、免过户费」）与 `manu/etf_rotation/backtest.py:8`
+#:    （「ETF 免印花税、免过户费」）都写明免税 ⇒ 本链改回**同源**口径。
+#: ⚠️ **股票线另计**（个股卖出单边千一），但**本链只跑 ETF** ⇒ 此处不适用。
+STAMP_DUTY_RATE = 0.0
 #: 滑点（万分之一，估算用）
 SLIPPAGE_RATE = 0.0001
 

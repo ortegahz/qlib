@@ -25,6 +25,7 @@ import re
 import sys
 import time
 import traceback
+from collections import Counter
 from pathlib import Path
 
 #: 研究链根（`llm/` 不是包 ⇒ 按**绝对路径**把研究链根加进 sys.path）
@@ -68,6 +69,175 @@ def _split_table_blocks(text: str) -> list[tuple[bool, str]]:
 
 #: 散文块被裁剪时，至少保留多少字符（低于这个值就整块丢，不留半截）。
 _MIN_PROSE_KEEP = 300
+
+
+#: 🔴 2026-11-27（S5）：markdown 表格**单元格正文里**的竖线必须转义。
+#:
+#:    【实测事故】2026-11-26 17:18 那一轮交付 md（服务器 ``probe_llm_stage_repro``
+#:    P7 红灯：「表块行内 `|` 数量不一致 [3, 5]」）：LLM 在单元格正文里写了**绝对值记号**
+#:    ``|均值| 0.13%`` ⇒ 该行有 **5 个**竖线，同表其它行只有 **3 个** ⇒
+#:      ① markdown 渲染器按 5 列切 ⇒ 多出来的列**整列丢弃**
+#:         ⇒ 用户读到的纪要里这一行的后半段**根本没显示**；
+#:      ② P7 判「块内竖线数不一致」红灯。
+#:
+#:    【修法】GFM 规定 ``\|`` 才是「正文里的竖线」⇒ 渲染层把**单元格内部**的竖线
+#:    转义掉（渲染出来仍然是 ``|``），列分隔符保持裸竖线 ⇒ 块内各行列数一致。
+def _unescaped_pipe_positions(line: str) -> list[int]:
+    r"""本行**未转义**竖线的下标（``\|`` 已被反斜杠转义 ⇒ 属正文，不是列分隔符）。"""
+    positions: list[int] = []
+    backslashes = 0
+    for index, char in enumerate(line):
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == "|":
+            if backslashes % 2 == 0:
+                positions.append(index)
+        backslashes = 0
+    return positions
+
+
+def _canonical_pipe_count(counts: list[int]) -> int:
+    """表块的**规范列数（竖线数）**＝ 多数票；并列时优先表头那一行。
+
+    🔴 为什么取多数票而不是表头行：万一**表头自己**被写坏了（LLM 在表头单元格里
+       也写了竖线），取表头会把整张表的列数带偏 ⇒ 取多数票才是「这张表本来几列」。
+    """
+    if not counts:
+        return 0
+    counter = Counter(counts)
+    best_hits = max(counter.values())
+    tied = [value for value, hits in counter.items() if hits == best_hits]
+    if len(tied) == 1:
+        return tied[0]
+    return counts[0] if counts[0] in tied else min(tied)
+
+
+def _pipe_delimiter_score(line: str, index: int) -> float:
+    """这个竖线**像不像**列分隔符（`` | `` 形态最像；两侧都黏着正文最不像）。"""
+    prev_char = line[index - 1] if index > 0 else " "
+    next_char = line[index + 1] if index + 1 < len(line) else " "
+    prev_blank = prev_char.isspace()
+    next_blank = next_char.isspace()
+    if prev_blank and next_blank:
+        return 3.0
+    if prev_blank or next_blank:
+        return 1.0
+    return -3.0
+
+
+def _empty_cell_penalty(line: str, left: int, right: int) -> int:
+    """两个相邻分隔符之间是**空单元格** ⇒ 罚分（避免把竖线选成「紧挨着的一对」）。"""
+    return 0 if line[left + 1:right].strip() else 2
+
+
+def _pick_delimiters(
+    line: str, lead: int, interior: list[int], tail: int, want: int
+) -> list[int]:
+    """从候选竖线里挑 ``want`` 个当**列分隔符**（其余留给转义）。
+
+    🔴 目标：把「最像分隔符」的挑出来 ⇒ **内容竖线**（两侧黏着正文，如 ``、|均值``）
+       被排除 ⇒ 它的列数就归位了。挑不动（候选不够）时**退回全部保留**（宁可少修，
+       也不要把对的列分隔符转义掉）。
+    """
+    count = len(interior)
+    if want <= 0:
+        return []
+    if want >= count:
+        return list(interior)
+    scores = [_pipe_delimiter_score(line, pos) for pos in interior]
+    # best[t][j] ＝ 前 j+1 个候选里挑 t 个分隔符、且最后一个是 interior[j] 时的最优分
+    best: list[list[tuple[float, list[int]] | None]] = [
+        [None] * count for _ in range(want + 1)
+    ]
+    for j in range(count):
+        best[1][j] = (
+            scores[j] - _empty_cell_penalty(line, lead, interior[j]),
+            [interior[j]],
+        )
+    for t in range(2, want + 1):
+        for j in range(count):
+            for i in range(j):
+                previous = best[t - 1][i]
+                if previous is None:
+                    continue
+                value = (
+                    previous[0]
+                    + scores[j]
+                    - _empty_cell_penalty(line, interior[i], interior[j])
+                )
+                current = best[t][j]
+                if current is None or value > current[0]:
+                    best[t][j] = (value, previous[1] + [interior[j]])
+    candidates: list[tuple[float, list[int]]] = []
+    for j in range(count):
+        entry = best[want][j]
+        if entry is None:
+            continue
+        value = entry[0] - _empty_cell_penalty(line, interior[j], tail)
+        candidates.append((value, entry[1]))
+    if not candidates:
+        return list(interior[:want])
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _repair_table_pipes(block: str) -> str:
+    """把表块里**单元格内部的竖线**转义掉 ⇒ 块内每行列数一致。
+
+    🔴 **只转义、不造数**：竖线**少于**规范列数的行（真·残行 / 被腰斩）**原样保留**
+       ⇒ 交给 P7 判红；本函数**绝不**编造单元格去把列数补齐。
+    """
+    lines = block.split("\n")
+    spots_per_line = [_unescaped_pipe_positions(line) for line in lines]
+    counts = [len(spots) for spots in spots_per_line]
+    target = _canonical_pipe_count(counts)
+    if target <= 0:
+        return block
+    repaired: list[str] = []
+    for line, spots in zip(lines, spots_per_line):
+        if len(spots) <= target:
+            repaired.append(line)
+            continue
+        lead = spots[0]
+        has_tail = len(spots) > 1 and line.rstrip().endswith("|")
+        tail = spots[-1] if has_tail else len(line)
+        interior = spots[1:-1] if has_tail else spots[1:]
+        want = target - 1 - (1 if has_tail else 0)
+        keep = {lead} | set(_pick_delimiters(line, lead, interior, tail, want))
+        if has_tail:
+            keep.add(spots[-1])
+        escape = [pos for pos in spots if pos not in keep]
+        pieces: list[str] = []
+        cursor = 0
+        for pos in escape:
+            pieces.append(line[cursor:pos])
+            pieces.append("\\|")
+            cursor = pos + 1
+        pieces.append(line[cursor:])
+        repaired.append("".join(pieces))
+    return "\n".join(repaired)
+
+
+def _normalize_md_tables(md: str) -> str:
+    """把整篇 md 里的**表格块**逐块修复（单元格内竖线转义）。
+
+    🔴 为什么放在**渲染的最后一步**：``_tail()`` 只保证「表格整块不裁」，**不保证
+       表内竖线是列分隔符** ⇒ 必须在拼装完成后对最终 md 规范化一遍。
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    for line in md.split("\n"):
+        if _TABLE_ROW_RE.match(line):
+            buf.append(line)
+            continue
+        if buf:
+            out.append(_repair_table_pipes("\n".join(buf)))
+            buf = []
+        out.append(line)
+    if buf:
+        out.append(_repair_table_pipes("\n".join(buf)))
+    return "\n".join(out)
+
 
 def _head_tail(text: str, limit: int) -> str:
     """头 1/3 + 省略标记 + 尾 2/3（旧的裁剪口径，只用于**散文**）。"""
@@ -308,7 +478,8 @@ def _render_md(payload: dict) -> str:
         "量化层数字以 `etf_analysis_report.json` 为准，"
         "最终调仓清单以 `final_rebalance_plan.md` 为准。",
     ]
-    return "\n".join(md)
+    # 🔴 2026-11-27（S5）：表格单元格里的**内容竖线**统一转义（见 `_repair_table_pipes`）。
+    return _normalize_md_tables("\n".join(md))
 
 
 def main() -> int:

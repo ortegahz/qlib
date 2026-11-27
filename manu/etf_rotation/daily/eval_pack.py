@@ -576,8 +576,8 @@ def build_cost_assumption(
             "slippage_rate": card_slip,
             "stamp_duty_rate": stamp,
             "note": (
-                "🔴 每日链执行卡口径：**含 5 元最低佣金下限**；卖出另加千一印花税"
-                "（🔴 但 ETF 实为**免印花税** ⇒ 卖出侧费用口径偏高）"
+                "🔴 每日链执行卡口径：**含 5 元最低佣金下限**；"
+                "ETF 买卖双向免印花税 ⇒ 卖出侧**不再叠加印花税**（与研究链口径同源）"
             ),
         },
         "node_reprice": {

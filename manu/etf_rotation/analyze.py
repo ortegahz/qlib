@@ -335,6 +335,18 @@ def _pct(value: object, digits: int = 2) -> str:
     return f"{value * 100:.{digits}f}%"
 
 
+def _ma_state(value: object) -> str:
+    """均线诊断**三态**渲染：True=站上 / False=跌破 / None=**不可判定**。
+
+    🔴 2026-11-26：老写法 ``"✅" if h.get("ma60_ok") else "❌"`` 把
+       「查不到（None）」也渲染成 ❌（跌破）⇒ **拿不当破位**（口径说谎）。
+       ⇒ 现在 None 单独渲染成 ❓（不可判定），**不许**冒充跌破。
+    """
+    if value is None:
+        return "❓"
+    return "✅" if bool(value) else "❌"
+
+
 def _ensure_hash_seed() -> None:
     """固定 ``PYTHONHASHSEED=0``（未设置时自重入一次；已设成别的值则告警）。"""
     current = os.environ.get("PYTHONHASHSEED")
@@ -1148,6 +1160,22 @@ def _rebuild_chain(
         str(c) for c in current_holdings if not exit_ma.get(str(c), True)
     } if exit_win else set()
     cand["exit_ma_ok"] = [bool(exit_ma.get(str(c), True)) for c in cand["code"]]
+    #: 🔴 2026-11-26（真缺陷修复 · 探针 H2）：持仓诊断的 `ma60_ok` 原先取自 **exit 闸门**
+    #:    的 MA map ⇒ V2 冻结件把 `exit_ma_window` 设成 **0**（强制退出闸门关闭）⇒
+    #:    `ma60_ok` **恒为 None**（实测：20261118_123209 ~ 20261126_171821 连续 9 个快照
+    #:    的 `ma60_ok` 全是 None；唯一例外 20261118_163556 是 V1 口径、exit 闸门开着
+    #:    ⇒ ma60=True）⇒ 探针 H2「每只持仓带 MA60 诊断」必红。
+    #:    ⇒ 修法：`ma60_ok` 改成**恒定按 MA60 口径实算**的诊断值（**与闸门开关无关**），
+    #:    窗口取 **`C.ENTRY_MA_FILTER_WINDOW`（=60，本工程唯一的 MA60 定义处）**；
+    #:    `ma20_ok` **保留**（参考信号，窗口 `C.TREND_MA_REPORT_WINDOW`）。
+    #:    ⚠️ 两个字段都只是**诊断**，**不动**闸门判定（`entry_ma_ok` / `exit_ma_ok`）。
+    #:    ⚠️ V1 口径（exit 闸门窗口 = 60）下 `exit_ma` 与本 map **逐位相同**
+    #:    ⇒ 直接复用，零额外开销、零行为变化。
+    _ma60_win = int(getattr(C, "ENTRY_MA_FILTER_WINDOW", 0) or 0)
+    ma60_map = (
+        exit_ma if (exit_win and exit_win == _ma60_win)
+        else _ma_ok_map(prices, asof, _ma60_win)
+    )
 
     # ---- 组合级回撤刹车（净值回撤超阈值 ⇒ 整个组合切防守资产）----
     if brake_mode:
@@ -1387,6 +1415,9 @@ def _rebuild_chain(
         "exit_ma": exit_ma,
         #: 🔴 2026-11-11：报告口径的 MA20（**参考信号**，非闸门）—— 供持仓诊断表展示
         "report_ma": report_ma,
+        #: 🔴 2026-11-26：**恒定 MA60 口径**的诊断 map（与 exit 闸门开关无关）——
+        #:    供持仓诊断表的 `ma60_ok` 展示（口径来源 = `config.ENTRY_MA_FILTER_WINDOW`）
+        "ma60": ma60_map,
         "exit_codes": sorted(exit_codes),
         "relaxed": relaxed,
         "weights_used": {"alpha": w_alpha, "momentum": w_mom},
@@ -1475,6 +1506,9 @@ def _diagnose_holdings(
     exit_ma = chain["exit_ma"]
     #: 🔴 报告口径的 MA20（参考信号）；老 chain 没有这个键 ⇒ 回落用 entry_ma（向后兼容）
     report_ma = chain.get("report_ma") or entry_ma
+    #: 🔴 2026-11-26：MA60 破位**诊断** map（**恒定 MA60 口径**，与 exit 闸门开关无关）——
+    #:    老 chain 没有这个键 ⇒ 回落用 exit_ma（V1 口径下二者逐位相同，向后兼容）
+    ma60_map = chain.get("ma60") or exit_ma
     actions: list[dict] = []
 
     rows: list[dict] = []
@@ -1495,10 +1529,14 @@ def _diagnose_holdings(
         reason = reasons.get(code)
         # 🔴 无行情数据的 code 根本不在 MA map 里 ⇒ 不能用 `.get(code, False)`
         # （那会把「查不到」当成「跌破」，凭空造出强制退出理由）。None = 不可判定。
-        #: 🔴 `ma20_ok` = **报告口径**的 MA20（参考信号）；`ma60_ok` = 退出闸门（MA60）。
-        #:    ⚠️ 入场闸门（MA60）由 `cand["entry_ma_ok"]` 承担 ⇒ 这里**不再**拿 MA20 当闸门。
+        #: 🔴 `ma20_ok` = **报告口径**的 MA20（参考信号）；`ma60_ok` = **恒定 MA60 口径**的
+        #:    破位诊断（窗口 = `config.ENTRY_MA_FILTER_WINDOW`，**与闸门开关无关**）。
+        #:    ⚠️ 二者都**不是**闸门：入场闸门（MA60）由 `cand["entry_ma_ok"]` 承担、
+        #:    退出闸门由 `cand["exit_ma_ok"]` 承担 ⇒ 这里**不再**拿 MA20 当闸门。
+        #:    🔴 2026-11-26：老实现把 `ma60_ok` 绑在 **exit 闸门**上 ⇒ V2 冻结件
+        #:    （`exit_ma_window = 0`）下恒为 None ⇒ 持仓诊断表答不出「这只持仓破没破 MA60」。
         ma20_ok = report_ma.get(code) if report_ma else None
-        ma60_ok = exit_ma.get(code) if exit_ma else None
+        ma60_ok = ma60_map.get(code) if ma60_map else None
         px_codes = set()
         if prices is not None and len(prices):
             px_codes = set(prices["code"].astype(str).unique())
@@ -2833,8 +2871,8 @@ def _render_markdown(rep: dict) -> str:
                     "是" if h.get("in_universe") else "否",
                     "是" if h.get("in_candidate_pool") else "否",
                     "是" if h.get("selected") else "否",
-                    ("MA20(参考) " + ("✅" if h.get("ma20_ok") else "❌")
-                     + " / MA60(闸门) " + ("✅" if h.get("ma60_ok") else "❌")),
+                    ("MA20(参考) " + _ma_state(h.get("ma20_ok"))
+                     + " / MA60(破位诊断) " + _ma_state(h.get("ma60_ok"))),
                     _num(h.get("e_score"), 3),
                     _pct(h.get("mom120")),
                     h.get("reject_reason") or "—",

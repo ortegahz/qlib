@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -127,7 +128,10 @@ def card() -> dict:
         "cash_flow": {"buy_fees": 5.0, "cash_end": 19889.64},
         "constraints": {
             "commission_rate": 0.0003, "min_commission": 5.0,
-            "slippage_rate": 0.0001, "stamp_duty_rate": 0.001,
+            "slippage_rate": 0.0001,
+            # 🔴 P2（2026-11-27：ETF 卖出侧印花税归零）：执行卡现在披露 **0.0**
+            #    （场内 ETF 买卖双向免印花税 ⇒ 与研究链口径同源）
+            "stamp_duty_rate": 0.0,
         },
         "post_trade": {
             "positions": [
@@ -274,6 +278,63 @@ def test_cost_assumption_flags_two_calibers(card: dict) -> None:
     assert any("不一致" in d for d in payload["disagreements"])
     assert payload["per_order"], "逐单费用对照缺失"
     assert payload["per_order"][0]["gap_bp_vs_backtest"] is not None
+
+
+def test_cost_assumption_note_states_etf_stamp_duty_exempt(card: dict) -> None:
+    """🔴 P2：执行卡层的 note 必须**如实**写「ETF 买卖双向免印花税 ⇒ 卖出侧不再叠加印花税」。
+
+    🔴 旧文案（「卖出另加千一印花税」＋「卖出侧费用口径偏高」）与新口径**直接矛盾**
+       ⇒ 留着就是**说谎的披露件**（P4「口径写在件里」）。
+    期望值是**字面量**：note 里必须**不含**旧文案的两句关键措辞，且必须**含**新措辞。
+    """
+    node = {"cash_flow": {"buy_fees": 2.26044, "cash_end": 19892.72956}}
+    payload = EP.build_cost_assumption(card, node, asof="2026-11-26", plan={"actions": []})
+    note = str(payload["layers"]["execution_card"]["note"])
+    assert "免印花税" in note
+    assert "卖出另加千一印花税" not in note, f"旧口径文案仍在披露件里：{note!r}"
+    assert "口径偏高" not in note, f"旧口径文案仍在披露件里：{note!r}"
+    # 🔴 这条只验「披露层**如实转述**卡里的口径」（期望值 = 字面量 0.0）；
+    #    卡里那个 0.0 **本身**由每日链生产 ⇒ 它的牙齿在
+    #    ``test_agents_rebalance.py::test_card_constraints_disclose_zero_stamp_duty``。
+    assert payload["layers"]["execution_card"]["stamp_duty_rate"] == 0.0
+
+
+def test_cost_assumption_note_mutation_proof(tmp_path: Path, card: dict) -> None:
+    """🔴 变异反证：把 ``eval_pack.py`` 的 note **改回旧文案**（临时副本）⇒
+    上面那条断言**必须转红**（否则它就是摆设）。
+
+    🔴 只动**临时目录里的副本** ⇒ **绝不碰真源码**（``eval_pack.py`` 是纯标准库模块 ⇒ 加载无副作用）。
+    """
+    src = Path(EP.__file__).read_text(encoding="utf-8")
+    old_note = (
+        '"🔴 每日链执行卡口径：**含 5 元最低佣金下限**；卖出另加千一印花税"\n'
+        '                "（🔴 但 ETF 实为**免印花税** ⇒ 卖出侧费用口径偏高）"'
+    )
+    new_note = (
+        '"🔴 每日链执行卡口径：**含 5 元最低佣金下限**；"\n'
+        '                "ETF 买卖双向免印花税 ⇒ 卖出侧**不再叠加印花税**（与研究链口径同源）"'
+    )
+    assert old_note not in src, "🔴 活链里找不到旧文案 ⇒ 源码结构变了，本文件的变异反证失效"
+    assert new_note in src, "🔴 活链里找不到新文案 ⇒ 源码结构变了，本文件的变异反证失效"
+    mutated = src.replace(new_note, old_note, 1)
+    assert mutated != src, "变异未生效"
+    tmp_src = tmp_path / "eval_pack_mutated_stamp.py"
+    tmp_src.write_text(mutated, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("eval_pack_mutated_stamp", tmp_src)
+    assert spec is not None and spec.loader is not None
+    mut = importlib.util.module_from_spec(spec)
+    sys.modules["eval_pack_mutated_stamp"] = mut
+    try:
+        spec.loader.exec_module(mut)
+        node = {"cash_flow": {"buy_fees": 2.26044, "cash_end": 19892.72956}}
+        payload = mut.build_cost_assumption(card, node, asof="2026-11-26", plan={"actions": []})
+        mutated_note = str(payload["layers"]["execution_card"]["note"])
+        assert "卖出另加千一印花税" in mutated_note, (
+            "🔴 变异反证失效：改回旧文案后旧措辞竟然没出现 ⇒ 上面那条断言没有牙齿"
+        )
+        # ⇒ 上面那条守卫（「卖出另加千一印花税」不在 note 里）在**变异体上必然转红**
+    finally:
+        sys.modules.pop("eval_pack_mutated_stamp", None)
 
 
 def test_nav_rows_flag_future_dirty_point() -> None:
