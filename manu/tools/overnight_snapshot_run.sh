@@ -68,7 +68,8 @@ write_summary(){
     echo "- 交付面报告：\`$RESULTS_ROOT/reports/\`（文件名带**信号日**，如 \`report_<YYYYMMDD>.md\`）"
     echo "- 编排器日志：\`$LOG\`"
     echo "- 指纹表：\`$RUN/_ms5_md5.txt\`"
-    echo "- 全量闸门日志：\`$RUN/_gates_overnight_$RUN_TAG.log\`"
+    echo "- 活闸门（V2）日志：\`$LOG_DIR/step4_gates_v2.log\`"
+    echo "- V1 全量闸门日志（**已弃用** · 仅在 \`RUN_V1_GATES=1\` 时才产出）：\`$RUN/_gates_overnight_$RUN_TAG.log\`"
     echo
     echo "## 口径声明"
     echo
@@ -130,17 +131,45 @@ RC2=$?
 record "指纹表重生成（重生成 + dry-run 复验）" "$(( RC1 != 0 || RC2 != 0 ))" "step3_fingerprint.log"
 say "   重生成退出码=$RC1｜dry-run 复验退出码=$RC2"
 
-# ---- 步骤 4：全量闸门（单核 + nice；不碰别人 session）--------------------
-say "=== 步骤 4/4：全量闸门（run_gates.sh --skip-repro）==="
-nice -n 10 bash manu/etf_rotation/run_gates.sh --skip-repro \
-     --log "$RUN/_gates_overnight_$RUN_TAG.log" > "$LOG_DIR/step4_gates.log" 2>&1
-RC=$?
-# 🔴 2026-11-19（`rules.md §十四.127`）：阶段数**不许手写** ⇒ 从单一事实源
-#    `run_gates.sh` 的 `run_stage` 调用数**动态派生**（读不到就写「缺」，不许猜、不许写死）。
-GATES_STAGES="$(grep -c '^run_stage ' manu/etf_rotation/run_gates.sh 2>/dev/null || true)"
-[ -n "$GATES_STAGES" ] || GATES_STAGES="缺"
-record "全量闸门（${GATES_STAGES} 阶段）" "$RC" "step4_gates.log / _gates_overnight_$RUN_TAG.log"
-say "   退出码=$RC"
+# ---- 步骤 4：活闸门（V2）＋ V1 归因留档（已弃用 · 默认不跑）---------------
+# 🔴 2026-11-27（`rules.md §十四.137` 铁律三）：**唯一活的闸门入口 = V2**
+#    （`manu/etf_rotation/v2/run_gates_v2.sh`）⇒ 生产批的闸门步改跑 V2。
+# 🔴 旧口径跑的是 **V1 全量闸门**（`manu/etf_rotation/run_gates.sh`，28 阶段），
+#    而用户 2026-11-26 已定调「**V1 已弃用 ⇒ 不再跑、不再修；红阶段只做归因留档**」
+#    ⇒ 生产批**默认不再跑 V1**（V1 的红阶段只做归因留档，见 memory §「2026-11-26 · ⑤」）。
+#    需要复现历史归因时显式 `RUN_V1_GATES=1`（默认 0 ⇒ 不跑）。
+say "=== 步骤 4/4：活闸门（V2 · run_gates_v2.sh）==="
+V2_GATES="manu/etf_rotation/v2/run_gates_v2.sh"
+if [ ! -f "$V2_GATES" ]; then
+  say "   🔴 **活闸门脚本缺失**（$V2_GATES）⇒ fail-closed（不许静默跳过闸门）"
+  record "活闸门（V2）" "2" "—（活闸门脚本缺失：$V2_GATES）"
+else
+  # 🔴 2026-11-19（`rules.md §十四.127`）：阶段数**不许手写** ⇒ 从单一事实源
+  #    `run_gates_v2.sh` 的 `run_stage` 调用数**动态派生**（读不到就写「缺」，不许猜、不许写死）。
+  V2_STAGES="$(grep -c '^run_stage ' "$V2_GATES" 2>/dev/null || true)"
+  [ -n "$V2_STAGES" ] || V2_STAGES="缺"
+  #    `PROJ_DIR` / `QL_PY` 显式传 ⇒ 不依赖闸门脚本里的硬编码缺省路径。
+  nice -n 10 env PROJ_DIR="$PROJ" QL_PY="$QL_PY" bash "$V2_GATES" \
+       --log "$LOG_DIR/step4_gates_v2.log" > "$LOG_DIR/step4_gates.log" 2>&1
+  RC=$?
+  record "活闸门（V2 · ${V2_STAGES} 阶段）" "$RC" "step4_gates.log / step4_gates_v2.log"
+  say "   退出码=$RC"
+fi
+
+# ---- 步骤 4b：V1 全量闸门（**已弃用** · 仅归因留档 · 默认不跑）------------
+#    🔴 用户 2026-11-26 定调：V1 全量闸门**不再跑、不再修** ⇒ 默认不跑；
+#       这里的红阶段**只做归因留档**，**不许**据此回改 V2 冻结件或探针。
+if [ "${RUN_V1_GATES:-0}" = "1" ]; then
+  say "=== 步骤 4b：V1 全量闸门（**已弃用** · 仅归因留档）==="
+  nice -n 10 bash manu/etf_rotation/run_gates.sh --skip-repro \
+       --log "$RUN/_gates_overnight_$RUN_TAG.log" > "$LOG_DIR/step4_gates_v1.log" 2>&1
+  RC=$?
+  GATES_STAGES="$(grep -c '^run_stage ' manu/etf_rotation/run_gates.sh 2>/dev/null || true)"
+  [ -n "$GATES_STAGES" ] || GATES_STAGES="缺"
+  record "V1 全量闸门（已弃用 · 归因留档 · ${GATES_STAGES} 阶段）" "$RC" \
+         "step4_gates_v1.log / _gates_overnight_$RUN_TAG.log"
+  say "   退出码=$RC（🔴 已弃用口径 ⇒ 红阶段只做归因留档，不据此回改代码）"
+fi
 
 say "=== 通宵自跑结束 === 总结见 $SUMMARY"
 exit 0

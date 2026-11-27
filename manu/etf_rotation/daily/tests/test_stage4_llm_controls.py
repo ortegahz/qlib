@@ -305,6 +305,16 @@ def _run_pipeline_until_stage4(tmp_path, monkeypatch, **kwargs):
     monkeypatch.setattr(AR, "_run_rules_layer", _fake_run_rules_layer)
     # 🔴 快照根必须落在 tmp_path ⇒ 绝不往**唯一落点根**写真东西
     monkeypatch.setattr(DC, "SNAPSHOT_ROOT", tmp_path / "snapshots")
+    # 🔴 2026-11-27（补真缺陷「测试污染生产净值序列」）：本用例跑的是
+    #    ``AR.run_pipeline(asof="2026-12-01", ...)`` ⇒ 跑批会走到
+    #    ``agents_rebalance.py:1480`` 的 ``nav_mod.prepare_daily_nav(...)``，
+    #    而该调用**故意不传 path=**（生产就该写生产路径）⇒
+    #    ``nav_state.state_path()`` 落到**生产**路径 ``DC.NAV_STATE_FILE``
+    #    （server 的 ``.../_state/nav_history.json``）
+    #    ⇒ 本用例（asof=2026-12-01 是个**未来日期**）会把一个合成净值点
+    #    写进**生产**净值序列 ⇒ 污染净值评估 ＋ 抬高历史峰值 ⇒ 钝化急跌刹车
+    #    （铁律「不许拿生产当试验田」）⇒ 必须重定向到 tmp_path。
+    monkeypatch.setattr(DC, "NAV_STATE_FILE", tmp_path / "nav_history.json")
 
     with pytest.raises(_StopAtStage4):
         AR.run_pipeline(asof="2026-12-01", run_dir=tmp_path / "run",

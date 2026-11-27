@@ -184,6 +184,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="阶段 4 的 reasoning_effort 覆盖（缺省空串 = **不覆盖**，"
                         "沿用 TradingAgents/.env 里现役的 max）；"
                         "实测 MiniMax 单次调用：max 185s / high 116s / medium 91s")
+    p.add_argument("--model-version", default=DC.MODEL_VERSION,
+                   choices=DC.MODEL_VERSIONS,
+                   help="🔴 打分模型版本标签（写进 snapshot manifest / "
+                        "报告口径表 / 执行卡 / 分数旁挂文件）"
+                        "｜缺省 = daily_config.MODEL_VERSION（默认 「V2」 = 现役口径）"
+                        "｜⚠️ **只改标记**，不切换任何模型/参数"
+                        " ⇒ 绝不等于「启用 V3」")
     p.add_argument("--snapshot-root", default=None,
                    help="快照根目录（缺省用 daily_config.SNAPSHOT_ROOT）")
     p.add_argument("--run-root", default=None, help="（兼容）产物目录；缺省 = 本轮快照目录")
@@ -624,6 +631,9 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
     report = _import_daily_report()
 
     live_trade = bool(getattr(args, "live_trade", False))
+    # 🔴 本轮**打分模型版本标签**（"V2" 现役 / "V3" 研发）⇒ 写进 manifest / 报告 / 执行卡。
+    #    ⚠️ **只标记、不切换**：不带这个参数的旧调用方 ⇒ 回落 daily_config.MODEL_VERSION（V2）。
+    model_version = str(getattr(args, "model_version", None) or DC.MODEL_VERSION)
     flags = resolve_stage_flags(args)
 
     # ---- 阶段 0：交易日历门（fail-closed）--------------------------------
@@ -634,7 +644,8 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
         raise StageError("calendar_gate", exc) from exc
     if not is_trading:
         log_stage.info("今天不是 A 股交易日（%s）⇒ 静默退出，不产出报告", asof)
-        snap = snap_mod.create_snapshot(snapshot_root, asof=asof, live_trade=live_trade)
+        snap = snap_mod.create_snapshot(snapshot_root, asof=asof, live_trade=live_trade,
+                                        model_version=model_version)
         snap.set_stage("calendar_gate", "skipped", reason="非交易日")
         snap.set_skipped("all_stages", "非交易日 ⇒ 整轮静默退出")
         _write_heartbeat(snap.path, asof, status="skipped_non_trading_day",
@@ -645,7 +656,8 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
     log_stage.info("交易日校验通过：%s 是 A 股交易日", asof)
 
     # ---- 建快照（本轮唯一产物根）------------------------------------------
-    snap = snap_mod.create_snapshot(snapshot_root, asof=asof, live_trade=live_trade)
+    snap = snap_mod.create_snapshot(snapshot_root, asof=asof, live_trade=live_trade,
+                                    model_version=model_version)
     run_dir = snap.path
     if state is not None:
         state["snapshot"] = snap
@@ -886,6 +898,10 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
         "root": str(snap.root),
         "path": str(run_dir),
         "run_id": str(snap.run_id),
+        # 🔴 2026-11-26：**打分模型版本标签**（"V2" 现役 / "V3" 研发）进报告口径表。
+        #    ⚠️ manifest 是**跑完才封存**（`snap.finalize()` 在本函数末尾）⇒ 渲染报告时 manifest **还没落盘**
+        #    ⇒ 这里把**同一个快照对象**上的标签带给报告层。
+        "model_version": str(getattr(snap, "model_version", None) or DC.MODEL_VERSION),
     }
     # 🔴 2026-11-09（独立审计 P1-5）：被 `--full` 覆盖的 skip 开关原先**只进 manifest**、
     #    报告里看不到 ⇒ 「不许静默降级」在交付面失效。
@@ -1007,6 +1023,32 @@ def _run_stages(args: argparse.Namespace, asof: str, snapshot_root: Path, log,
         f"实盘态 live_trade={live_trade}｜"
         f"取数={flags['fetch']}｜S层重算={refresh_scores}｜换库={update_qlib}｜LLM={flags['llm']}"
     )
+    # ---- 🔴 2026-11-27 新增：**评估就绪包**（eval pack）--------------------
+    #    目的：把「事后系统有效性评估」需要的现场证据，落成**机器可读**小表放进
+    #    同一个快照目录 ⇒ 四个维度（等权基线 / 分档单调性 / TA 影子消融 / 真实摩擦）
+    #    不必再回头解析自然语言。
+    #    🔴 **零副作用**：纯派生 —— 不改任何决策、不改任何既有交付件；
+    #    🔴 **fail-soft**：失败只登记进 manifest，**绝不阻断流水线**（研究侧的事）；
+    #    🔴 状态用 ``ok`` / ``absent``（**不用 ``failed``**）⇒ 不污染
+    #        `append_daily_record.py` 的「失败/降级环节」栏（那是给真失败用的）。
+    try:
+        import eval_pack as EVAL_PACK
+        pack_info = EVAL_PACK.write_eval_pack(snap.path, asof=asof, live_trade=live_trade)
+        snap.set_stage(
+            "eval_pack",
+            "ok" if pack_info.get("files") else "absent",
+            files=list(pack_info.get("files") or []),
+            n_pool_rows=pack_info.get("n_pool_rows"),
+            n_warnings=pack_info.get("n_warnings"),
+        )
+        for _warn in pack_info.get("warnings") or []:
+            snap.add_note(f"评估就绪包：{_warn}")
+        log_stage.info("评估就绪包已落盘：%s", ", ".join(pack_info.get("files") or []))
+    except Exception as exc:  # noqa: BLE001
+        snap.set_stage("eval_pack", "absent", error=f"{type(exc).__name__}: {exc}")
+        snap.add_note(f"🔴 评估就绪包生成失败（**不影响任何交付件**）：{type(exc).__name__}: {exc}")
+        log_stage.warning("🔴 评估就绪包生成失败（不影响任何交付件）：%s", exc)
+
     manifest_path = snap.finalize()
     log_stage.info("快照 manifest 已写：%s", manifest_path)
     if failed_stages and flags.get("full"):

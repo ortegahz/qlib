@@ -1,0 +1,28 @@
+{
+  "_comment": "V2 冻结件 md5 基线清单（**V3 隔离探针的主判据**）。\n【为什么用它当判据】mtime 会被 checkout / rsync 刷新；git 内容口径在服务器上天然显示 ` M`（服务器检出落后于开发仓）⇒ 两者都会**常年红**。md5 基线清单**对环境免疫**：不需要 git、不看 mtime ⇒ 服务器没 git 也有牙齿。\n【冻结集】manu/etf_rotation/v2/ 下的 **9 个关键文件**（配置 / 标签 / 特征 / 切分 / ETF 层 / S 层训练 / 回测 / 指标 / 入口）—— 🔴 **V3 绝不许就地改写 V2**（V2 是**现役**口径；用户 2026-11-26 原话「注意 v2 还保留，我目前在用」）。\n🔴 **改了怎么办**：必须走**显式重生成流程**（下面的命令）并在 commit / 报告里写明「V2 冻结件已被改动 + 原因」；**不许**让清单与磁盘悄悄漂移（那等于把牙齿自己拔了）。\n【路径口径】files 的键相对**项目根**（qlib 仓库根）。\n【重新生成】改完冻结件后**必须显式**执行下面这行（不许让清单与磁盘漂移 ⇒ 探针 / 测试会红）：\ncd <项目根> && python3 -c \"import hashlib,json,pathlib,datetime;base=pathlib.Path('manu/etf_rotation/v2');ps=[base/n for n in ('config_v2.py','labels.py','features.py','splits.py','etf_layer.py','train_s.py','backtest_v2.py','metrics.py','run_v2.py')];p=pathlib.Path('manu/etf_rotation/v3/probes/v2_frozen_md5.json');m=json.loads(p.read_text(encoding='utf-8'));m['files']={str(x):hashlib.md5(x.read_bytes()).hexdigest() for x in ps};m['generated_at']=datetime.datetime.now().astimezone().isoformat(timespec='seconds');p.write_text(json.dumps(m,ensure_ascii=False,indent=2)+chr(10),encoding='utf-8')\"\n【只读核对】\ncd <项目根> && md5sum manu/etf_rotation/v2/config_v2.py manu/etf_rotation/v2/labels.py manu/etf_rotation/v2/features.py manu/etf_rotation/v2/splits.py manu/etf_rotation/v2/etf_layer.py manu/etf_rotation/v2/train_s.py manu/etf_rotation/v2/backtest_v2.py manu/etf_rotation/v2/metrics.py manu/etf_rotation/v2/run_v2.py\n【怎么改】只改 files 里的 md5 值（路径集合不许增删），其余字段保持不动。",
+  "generated_at": "2026-11-26T14:12:14+08:00",
+  "frozen_set_note": "V2 现役口径的关键文件（配置 / 标签 / 特征 / 切分 / ETF 层 / S 层训练 / 回测 / 指标 / 入口）——V3 是研发分支，**绝不许就地改写 V2**；改了必须走显式重生成流程并在报告里写明原因。",
+  "owner": "V3 研发分支（manu/etf_rotation/v3/probes/probe_v3_isolation.py 判红）",
+  "files": {
+    "manu/etf_rotation/v2/config_v2.py": "54019ca82edd82417f1b9f7cfe69bd0e",
+    "manu/etf_rotation/v2/labels.py": "934fc1af775263cc7f2e04f702ed43b5",
+    "manu/etf_rotation/v2/features.py": "9b535eb54790da19dbbac376c81e617f",
+    "manu/etf_rotation/v2/splits.py": "025c4dc1ffbbeb0e73c54f73ad2ab556",
+    "manu/etf_rotation/v2/etf_layer.py": "516cbfe2b67c6e9718ccc62831be1561",
+    "manu/etf_rotation/v2/train_s.py": "942f146243ee7b1c445fdec6b7041956",
+    "manu/etf_rotation/v2/backtest_v2.py": "d9e436785208f089edfcd2b8c9082139",
+    "manu/etf_rotation/v2/metrics.py": "9abe00432ab48d6893e39e73d2d9226d",
+    "manu/etf_rotation/v2/run_v2.py": "fce3bf9a69d2b10d60e424bd060890cf"
+  },
+  "baseline_history": [
+    {
+      "file": "manu/etf_rotation/v2/etf_layer.py",
+      "old_md5": "35a5590a3fdeb7e8e70be422a688ff6a",
+      "new_md5": "516cbfe2b67c6e9718ccc62831be1561",
+      "changed_at": "2026-11-26T11:18:00+08:00",
+      "reason": "V2 侧新增**可选**动量窗口覆盖（`momentum_weights` 参数，默认 None）⇒ 供 V2 自身的参数邻域扰动探针（v2_plateau_probe / v2_overfit_trial_adjustment）使用。🔴 **默认路径逐位不变**：`momentum_weights=None` ⇒ 直接返回 `MOMENTUM_WEIGHTS` **本体**（不复制、不重排）⇒ 迭代顺序与浮点求和顺序与改前完全一致；V2 现役跑批（2026-11-26 full mode）即在此版本上执行。🔴 本次改动**不是为了 V3**（V3 只读 V2），但仍属「V2 冻结件被改写」⇒ 按 §十四.143 登记旧值与原因，不许静默重钉。",
+      "default_path_equivalent": true,
+      "note": "基线仍以**当前磁盘版本**为活动判据（后续漂移照样判红）；本条历史只保证「改过什么、为什么」可追溯。"
+    }
+  ]
+}

@@ -413,3 +413,57 @@ cd /media/manu/1TB-Volume/workspace/qlib
 > 退出码：**0** 成功（含非交易日静默退出）· **1** 失败 · **2** 用法或环境错误（含 `--mode` 被拒、`--live-trade` 与 `--dry-run` 互斥、锁冲突）。
 > ⚠️ **看门狗当前不部署**：`manu/tools/etf_watchdog.py` 保留在仓库（纯标准库），但它的守护对象是 cron ⇒ 取消定时后**没有守护对象**；服务器持久盘 `/mnt/data/siping/apps/etf_watchdog.py` 的旧副本保留未删（无害）。
 > 🔴 **`install_schedule.sh` 已删除**（2026-11-05）：它唯一的用途是往用户 crontab 装那 5 条定时任务 ⇒ 取消定时后即死代码 ⇒ 删除，**不要再往 crontab 装本工程任何条目**。
+
+---
+
+## V3 打分模型（研发线 · 只读复核工具）
+
+> 🔴 V3 是**研发分支**，**V2 是现役生产**（§十四.140）；V1 已弃用。
+> 以下工具**只读**跑批产物，不跑训练、不碰 qlib 数据。
+
+```bash
+# ---- 成对段级统计复核（§十四.150：替换判据要用「臂 vs V2」的成对统计）----
+#    纯标准库 ⇒ 本机无 pandas 的 /usr/bin/python3 也能跑
+python3 manu/tools/v3_paired_segment_check.py \
+    --results-dir /home/manu/mnt/data/siping/runs/etf_rotation_results/v3/_comparison_20261126 \
+    --price-panel /home/manu/mnt/data/siping/datasets/manu/etf_rotation/datasets/etf_ext/etf_prices_merged_2018.csv
+#    口径：① 复原报告的分段口径（与公布值逐位对拍，误差 < 1e-6 才出结论）
+#          ② 单样本 t（原报告口径，保留披露）③ 成对 t（臂 − control_v2）＋ Holm 校正
+#    可选 --json-out <路径> 把结果写成 JSON
+```
+
+---
+
+## 事后系统有效性评估（四维度 · 研究线 · 只读）
+
+> 🔴 对应 `rules.md §十四.152`：评估所需的现场证据**必须落进快照**（`eval pack`，6 件过程件），
+> 本组命令是它的**唯一执行器**。**只读**：不改任何生产件、不跑跑批、不动账户。
+
+```bash
+# ---- 评估就绪包（每日链自动落进快照，无需手工调用）----
+#    快照目录里会多出这 6 件（契约 16 件之外的过程件）：
+#      eval_candidate_pool.csv / eval_ta_shadow_ledger.csv / live_fills.csv
+#      cost_assumption.json / nav_history_snapshot.csv / eval_pack_manifest.json
+#    单独重生成（就地重生成，只改快照内）：
+/home/manu/anaconda3/bin/python - <<'PY'
+import sys; sys.path.insert(0, "manu/etf_rotation/daily")
+import eval_pack as EP
+print(EP.write_eval_pack("<快照目录>", asof="2026-11-26"))
+PY
+
+# ---- 四维度评估：等权池基准 / 蒙特卡洛盲选 / 三档单调性 / TA 消融 / 实盘摩擦----
+#    ⚠️ --prices 必须覆盖 asof **之后**的窗口（否则前瞻收益算不出来 ⇒ 报告如实报「缺」）
+/home/manu/anaconda3/bin/python manu/tools/live_eval_attribution.py \
+    --snapshots-root /home/manu/mnt/data/siping/runs/etf_rotation_results/snapshots \
+    --prices <覆盖 asof 之后的 etf_prices_effective_*.csv> \
+    --horizon 20 --n-sims 1000 --out-dir /tmp/eval_report
+#    产出：live_eval_report.md（结论先行）+ live_eval_report.json（结构化）
+#    判据：① 扣费后跑赢等权池且进随机盲选前 10% ② 高>中>低且档差 > 噪声地板
+#          ③ 被 TA 否决的确实更差 ④ 月均超额 > 真实摩擦（≈ 单边 14.4 bp）
+#    🔴 单期只当方向性证据 ⇒ 至少 6~12 期再下策略结论
+
+# ---- 实盘成交回填（唯一需要人工的输入）----
+#    编辑 <快照>/live_fills.csv 的 actual_shares/actual_price/actual_amount/
+#    actual_commission/actual_transfer_fee（只认券商成交回单，不许用参考价回填）
+#    ⇒ 重跑上面同一条命令，摩擦维度才会亮
+```

@@ -282,6 +282,40 @@ def _ranking_basis(result: Mapping) -> str:
     return f"{core}（alpha={_text(alpha) if alpha is not None else PLACEHOLDER}）"
 
 
+def _resolve_model_version(result: Mapping) -> str:
+    """**打分模型版本标签**（"V2" 现役 / "V3" 研发）。
+
+    🔴 回落链（**绝不编造**）：
+    1. ``result["snapshot"]["model_version"]``（本轮快照对象上的标签）；
+    2. 快照目录里的 ``snapshot_manifest.json``
+       （**老快照没这个键** ⇒ 继续回落）；
+    3. ``daily_config.MODEL_VERSION``（缺省 = "V2"）。
+
+    ⚠️ 本模块的职责是**纯渲染**（不碰业务逻辑）
+    ⇒ 业务模块在**函数内**按需导入（快照层 / 口径常量）。
+    """
+    meta = _get(result, "snapshot")
+    version = _get(meta, "model_version")
+    if version:
+        return str(version)
+    path = _text(_get(meta, "path"))
+    if path and path != PLACEHOLDER:
+        try:
+            import snapshot as snap_mod
+
+            version = snap_mod.manifest_model_version(path, default=None)
+            if version:
+                return str(version)
+        except Exception:  # noqa: BLE001 —— 读不到标签不许炸报告
+            pass
+    try:
+        import daily_config as DC
+
+        return str(DC.MODEL_VERSION)
+    except Exception:  # noqa: BLE001 —— 口径常量也读不到 ⇒ 占位符
+        return PLACEHOLDER
+
+
 def _provenance_rows(result: Mapping, live_trade: bool) -> list[list[str]]:
     """快照 / 运行态 / ``live_trade`` 的**显式披露**行（缺 ⇒「—」，**不编造**）。"""
     has_raw_live = isinstance(result, Mapping) and "live_trade" in result
@@ -305,6 +339,9 @@ def _provenance_rows(result: Mapping, live_trade: bool) -> list[list[str]]:
         ["本轮状态", state_text],
         ["live_trade", _yn(raw_live) if has_raw_live else PLACEHOLDER],
         ["本轮被覆盖的开关", _skipped_text],
+        # 🔴 2026-11-26：**打分模型版本**（用户要求：「生成 snapshot 的时候要区分
+        #    是哪个版本的输出」）⇒ 报告必须自带标签。
+        ["打分模型版本", _resolve_model_version(result)],
     ]
 
 
@@ -362,6 +399,9 @@ def _render_pipeline(result: Mapping, account: object,
     constraints = _get(card, "constraints")
     reserve_ratio = _pick("cash_reserve_ratio", post_trade, constraints)
     reserve_required = _get(post_trade, "cash_reserve_required")
+    #: 🔴 2026-11-27（用户拍板）：**执行缓冲**口径（每日链唯一被强制的现金下限）
+    exec_buf_ratio = _pick("execution_buffer_ratio", post_trade, constraints)
+    exec_buf_required = _get(post_trade, "execution_buffer_required")
     buf_min_eff = _pick("cash_buffer_min_eff", constraints)
     buy_codes = "、".join(str(_get(o, "code")) for o in buckets["buy"]) or "无"
     sell_codes = "、".join(str(_get(o, "code")) for o in buckets["sell"]) or "无"
@@ -375,8 +415,10 @@ def _render_pipeline(result: Mapping, account: object,
             ["价格口径", _text(_get(card, "price_basis_note"))],
             ["调仓后现金（元）", _fmt(cash_end, money=True)],
             ["可行性", feasible_text],
-            ["现金预留比例", _fmt(reserve_ratio, pct=True)],
+            ["现金预留比例（规则层权益预算）", _fmt(reserve_ratio, pct=True)],
             ["现金预留下限（元）", _fmt(reserve_required, money=True)],
+            ["执行缓冲比例", _fmt(exec_buf_ratio, pct=True)],
+            ["执行缓冲下限（元）", _fmt(exec_buf_required, money=True)],
             [
                 "现金缓冲达标？",
                 f"{_yn(_get(post_trade, 'cash_buffer_ok'))}"

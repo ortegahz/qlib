@@ -439,11 +439,24 @@ python manu/etf_rotation/daily/main.py --asof 2026-11-05 --send-only --live-trad
   account_snapshot.csv                   # 账户快照（本轮实盘口径）
   account_context.json                   # 账户上下文（喂 LLM 的那份）
   stock_scores.csv.bak-<时间戳>          # S 层底座备份（合并前原样留存）
+  # ── 评估就绪包（2026-11-27 新增；过程件，同样不在契约 16 件里）──
+  eval_candidate_pool.csv                # 候选池归因表（等权基线 / 三档单调性的输入）
+  eval_ta_shadow_ledger.csv              # TA 逐票影子账本（模块消融的输入）
+  live_fills.csv                         # 实盘成交台账（actual_* 五列**人工回填**）
+  cost_assumption.json                   # 成本口径单一权威出处（三档并列 + 缺口量化）
+  nav_history_snapshot.csv               # 净值序列副本（脏点已标 is_future）
+  eval_pack_manifest.json                # 本包的口径说明 + 仍未闭合的缺口
 ```
 
 - `<SNAPSHOT_ROOT>` 缺省 = `daily_config.SNAPSHOT_ROOT`（env `ETF_ROTATION_SNAPSHOT_ROOT`，
   缺省 `ETF_ROTATION_RESULTS_ROOT/"snapshots"`），可用 `--snapshot-root PATH` 覆盖；
 - `snapshot_manifest.json` 里记 `stages` / `skipped` / `notes` / `live_trade` / `artifacts`（字节数 ＋ sha1）；
+- 🔴 **2026-11-27 新增 `stages` 里的 `eval_pack` 条目**：评估就绪包（`daily/eval_pack.py`）
+  在**快照冻结前**落盘 ⇒ 状态 `ok`（生成成功）或 `absent`（失败/不可读）。
+  🔴 **刻意不用 `failed`** ⇒ 不污染 `manu/tools/append_daily_record.py` 的
+  「失败/降级环节」栏（那一栏留给**真失败**：决策链跑挂了）。
+  **零副作用**：纯派生，不改任何决策、不改任何既有交付件、不写根目录全局文件；
+  失败**只登记**（manifest `notes`），**绝不阻断流水线**（评估是研究侧的事）；
 - 🔴 **canonical 永远不被每日链写**：只作为「还没有任何快照时的一次性只读种子」；
 - 🔴 **口径**：快照 = **契约 16 件 ＋ `snapshot_manifest.json` ＋ 若干过程件**（**不是**「只有 16 件」）：
   契约校验只看那 16 条；过程件**确实落在快照目录里**（`diff -r` 两份快照时会看到），

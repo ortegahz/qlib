@@ -206,35 +206,70 @@ def test_card_cash_buffer_infeasible_is_reported():
     assert any("不可行" in w for w in card["warnings"])
 
 
-def test_card_cash_reserve_ratio_floor_shrinks_buy():
-    """🔴 2026-11-10：**比例下限生效** —— 现金只剩 20.5%，绝对 200 元根本拦不住
-    ⇒ 买入必须被缩减，且调仓后现金 ≥ 总资产 × 现金预留比例。
+def test_card_execution_buffer_floor_shrinks_buy():
+    """🔴 2026-11-27（用户拍板）：**执行缓冲**比例下限生效 —— 硬性现金底线从 20% 降到 5%。
 
-    夹具：总资产 100,000 元、现金 20,500 元
-    （比例下限 20% = 20,000 元 **>** 绝对下限 200 元 ⇒ 生效下限 = 20,000 元）
-    ⇒ 4,000 元的买单必须被砍到只剩几百元。
+    夹具：总资产 100,000 元、现金 8,000 元
+    （执行缓冲比例下限 5% = 5,000 元 **>** 绝对下限 400 元 ⇒ 生效下限 = 5,000 元）
+    ⇒ 4,000 元的买单必须被砍（不砍的话调仓后现金只剩 ~4,000 元 < 5,000 元下限）。
     """
     total_assets = 100_000.0
-    cash_begin = 20_500.0
-    reserve_floor = total_assets * DC.CASH_RESERVE_RATIO
+    cash_begin = 8_000.0
+    buf_floor = total_assets * DC.EXECUTION_BUFFER_RATIO
     card = _card(
         [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
           "price": 1.0, "target_amount": 4000.0}],
         account={"total_assets": total_assets, "cash": cash_begin},
     )
-    # 生效下限 = 比例下限（> 绝对下限 200 元）
-    assert card["constraints"]["cash_buffer_min_eff"] == pytest.approx(reserve_floor)
-    assert card["constraints"]["cash_reserve_ratio"] == DC.CASH_RESERVE_RATIO
-    # 买入被缩减（不缩减就会击穿 20% 现金预留）
-    assert card["cash_flow"]["scaled_down"], "比例下限生效时必须缩减买入"
+    # 生效下限 = 执行缓冲比例下限（> 绝对下限 400 元）
+    assert card["constraints"]["cash_buffer_min_eff"] == pytest.approx(buf_floor)
+    assert card["constraints"]["execution_buffer_ratio"] == DC.EXECUTION_BUFFER_RATIO
+    # 买入被缩减（不缩减就会击穿执行缓冲）
+    assert card["cash_flow"]["scaled_down"], "执行缓冲下限生效时必须缩减买入"
     order = card["orders"][0]
     assert order["delta_shares"] < 4000
-    # 调仓后现金守住 20% 预留
-    assert card["post_trade"]["cash"] >= reserve_floor
-    assert card["post_trade"]["cash_reserve_ok"] is True
-    assert card["post_trade"]["cash_reserve_ratio"] == DC.CASH_RESERVE_RATIO
-    assert card["post_trade"]["cash_reserve_required"] == pytest.approx(reserve_floor, abs=0.01)
+    # 调仓后现金守住执行缓冲
+    assert card["post_trade"]["cash"] >= buf_floor
+    assert card["post_trade"]["execution_buffer_ok"] is True
+    assert card["post_trade"]["execution_buffer_required"] == pytest.approx(buf_floor, abs=0.01)
     assert card["cash_flow"]["feasible"] is True
+
+
+def test_card_cash_reserve_ratio_is_disclosure_only():
+    """🔴 2026-11-27（用户拍板）：20% **硬性现金底线已移除** ⇒ 只剩「规则层披露 + 告警」。
+
+    🔴 旧口径把「总资产 × 20%」当**硬下限**（与规则层权益上限**重复约束**），
+       且在「生效权益上限 ≤ 35%」时（现金 ≥ 65%）**完全被遮蔽** ⇒ 纯死代码。
+    ⇒ 现在：执行缓冲 5% 才被强制；20% 降级为**披露**，击穿它要**显式告警**。
+
+    夹具：总资产 100,000 元、现金 20,500 元、买单 4,000 元
+    ⇒ 旧口径：调仓后现金 16,494.6 < 20,000 ⇒ **买单会被砍**；
+    ⇒ 新口径：16,494.6 ≥ 执行缓冲 5,000 ⇒ **不砍**（= 硬性底线确已移除的实证）。
+    """
+    total_assets = 100_000.0
+    cash_begin = 20_500.0
+    rule_floor = total_assets * DC.CASH_RESERVE_RATIO
+    card = _card(
+        [{"code": "512800", "name": "银行ETF华宝", "current_shares": 0,
+          "price": 1.0, "target_amount": 4000.0}],
+        account={"total_assets": total_assets, "cash": cash_begin},
+    )
+    # 生效下限已经**不是** 20% 了
+    assert card["constraints"]["cash_buffer_min_eff"] == pytest.approx(
+        total_assets * DC.EXECUTION_BUFFER_RATIO)
+    assert card["constraints"]["cash_buffer_min_eff"] < rule_floor
+    # 20% 仍在披露里（数值口径不变）
+    assert card["constraints"]["cash_reserve_ratio"] == DC.CASH_RESERVE_RATIO
+    assert card["post_trade"]["cash_reserve_ratio"] == DC.CASH_RESERVE_RATIO
+    assert card["post_trade"]["cash_reserve_required"] == pytest.approx(rule_floor, abs=0.01)
+    # 关键实证：**买单不再被砍**（旧口径会砍）
+    assert not card["cash_flow"]["scaled_down"], "20% 硬性现金底线必须已移除"
+    assert card["orders"][0]["delta_shares"] == 4000
+    # 调仓后现金落在 [执行缓冲, 规则层预留) 区间 ⇒ 规则层预留被击穿 ⇒ 必须告警
+    assert card["post_trade"]["cash"] >= card["constraints"]["cash_buffer_min_eff"]
+    assert card["post_trade"]["cash"] < rule_floor
+    assert card["post_trade"]["cash_reserve_ok"] is False
+    assert any("权益超配" in w for w in card["warnings"]), "击穿规则层预留必须显式告警"
 
 
 def test_card_sell_fee_includes_stamp_duty():

@@ -118,7 +118,12 @@ POSITION_SCAN_FILES = (
 )
 
 #: 检查 D：`manu/tools/*.sh` 里不许写死的标签
-HARDCODE_LABEL = re.compile(r"全量闸门（(\d+) 阶段）")
+#: 🔴 2026-11-27（活闸门切 V2 后新增口径）：编排器的闸门步标签有两个合法形态 ——
+#:   ① `活闸门（V2 · ${V2_STAGES} 阶段）`（**活闸门**，唯一活的入口 = V2）
+#:   ② `V1 全量闸门（已弃用 · 归因留档 · ${GATES_STAGES} 阶段）`（**已弃用**，仅归因留档）
+#:   两者都**必须**从闸门脚本动态派生阶段数 ⇒ 写成**字面数字**一律判红。
+#:   ⇒ 正则同时覆盖三种前缀（`全量闸门` / `V1 全量闸门` / `活闸门`）。
+HARDCODE_LABEL = re.compile(r"(?:V1 )?(?:全量闸门|活闸门)（[^）]*?(\d+) 阶段")
 
 #: 检查 C：`run_gates.sh` 头注释里声明的阶段总数（头 12 行内）
 HEADER_SCAN_LINES = 12
@@ -438,7 +443,8 @@ def check_tool_labels(project_dir: str) -> list[Defect]:
                     f"{TOOLS_DIR_REL}/{path.name}",
                     line_no,
                     "D-标签不许写死",
-                    f"写死了「{matched.group(0)}」⇒ 必须从 `run_gates.sh` 动态派生",
+                    f"写死了「{matched.group(0)}」⇒ 阶段数必须从闸门脚本动态派生"
+                    f"（活闸门 = `v2/run_gates_v2.sh`；V1 已弃用 = `run_gates.sh`）",
                     _line_preview(text, line_no),
                 )
             )

@@ -28,11 +28,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 __all__ = [
+    "DEFAULT_MODEL_VERSION",
     "MANIFEST_NAME",
     "RUN_ID_FORMAT",
     "Snapshot",
     "create_snapshot",
     "latest_snapshot",
+    "manifest_asof",
+    "manifest_model_version",
     "resolve_scores_base",
     "root_global_fingerprint",
     "sha1_of",
@@ -42,6 +45,11 @@ __all__ = [
 
 #: manifest 文件名（快照目录里**唯一**由本模块自己写的文件）
 MANIFEST_NAME = "snapshot_manifest.json"
+
+#: 🔴 **打分模型版本标签**的缺省值（读侧兜底口径）。
+#:    本字段 2026-11-26 才加 ⇒ **老快照的 manifest 没有这个键**
+#:    ⇒ 读侧一律按 "V2"（现役口径）解读 ⇒ **V2 的现有判定零影响**。
+DEFAULT_MODEL_VERSION = "V2"
 
 #: 快照目录名格式（``YYYYMMDD_HHMMSS`` ⇒ 字典序 == 时间序）
 RUN_ID_FORMAT = "%Y%m%d_%H%M%S"
@@ -106,11 +114,15 @@ class Snapshot:
     """
 
     def __init__(self, root: str | Path, *, asof: str, run_id: str,
-                 live_trade: bool = False, created_at: datetime | None = None) -> None:
+                 live_trade: bool = False, created_at: datetime | None = None,
+                 model_version: str = DEFAULT_MODEL_VERSION) -> None:
         self.root = Path(root)
         self.asof = str(asof)
         self.run_id = str(run_id)
         self.live_trade = bool(live_trade)
+        #: 🔴 **打分模型版本标签**（"V2" 现役 / "V3" 研发）⇒ 写进 manifest。
+        #:    ⚠️ **只标记、不切换**：改它不会换任何模型/参数。
+        self.model_version = str(model_version or DEFAULT_MODEL_VERSION)
         self.created_at = created_at or _now()
         self.path = self.root / self.run_id
         self._stages: list[dict] = []
@@ -207,6 +219,7 @@ class Snapshot:
             "snapshot_root": str(self.root),
             "snapshot_path": str(self.path),
             "live_trade": self.live_trade,
+            "model_version": self.model_version,
             "stages": list(self._stages),
             "skipped": list(self._skipped),
             "notes": list(self._notes),
@@ -237,14 +250,20 @@ class Snapshot:
 
 
 def create_snapshot(root: str | Path, *, asof: str, live_trade: bool = False,
-                    run_id: str | None = None, now: datetime | None = None) -> Snapshot:
-    """建一个新快照目录（**不写任何文件**，只 mkdir）。"""
+                    run_id: str | None = None, now: datetime | None = None,
+                    model_version: str = DEFAULT_MODEL_VERSION) -> Snapshot:
+    """建一个新快照目录（**不写任何文件**，只 mkdir）。
+
+    🔴 ``model_version``：**只标记**（默认 "V2" = 现役口径），不切换任何模型/参数
+       ⇒ 现有调用方**不改**也仍是 V2 ⇒ **零行为变化**。
+    """
     base = Path(root)
     base.mkdir(parents=True, exist_ok=True)
     stamp = now or _now()
     wanted = str(run_id) if run_id else stamp.strftime(RUN_ID_FORMAT)
     unique = _unique_run_id(base, wanted)
-    snap = Snapshot(base, asof=asof, run_id=unique, live_trade=live_trade, created_at=stamp)
+    snap = Snapshot(base, asof=asof, run_id=unique, live_trade=live_trade, created_at=stamp,
+                    model_version=model_version)
     snap.path.mkdir(parents=True, exist_ok=True)
     return snap
 
@@ -258,6 +277,24 @@ def manifest_asof(path: str | Path) -> str | None:
         return None
     value = payload.get("asof")
     return str(value) if value else None
+
+
+def manifest_model_version(path: str | Path, *,
+                           default: str | None = DEFAULT_MODEL_VERSION) -> str | None:
+    """读某份快照 manifest 里的 ``model_version``（**缺 ⇒ 回落**）。
+
+    🔴 **老快照兼容**：本字段 2026-11-26 才加 ⇒ 之前落下的 manifest **没有**这个键
+       ⇒ 读侧一律回落 ``default``（缺省 = ``"V2"`` 现役口径）⇒ **V2 的现有判定零影响**。
+    🔴 坏文件 / 读不到 ⇒ 同样回落（**不许**因为读不到标签就炸掉整条链）。
+    🔴 ``default=None`` ⇒ 缺键时返回 ``None``（调用方自己决定回落口径）。
+    """
+    manifest = Path(path) / MANIFEST_NAME
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    value = payload.get("model_version")
+    return str(value) if value else default
 
 
 def latest_snapshot(root: str | Path, *, exclude: str | Path | None = None,

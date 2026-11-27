@@ -137,10 +137,26 @@ def _ma_panel(px: pd.DataFrame, window: int) -> pd.DataFrame:
     return px.rolling(win, min_periods=win).mean()
 
 
+def _momentum_weight_set(
+    momentum_weights: Mapping[int, float] | None = None,
+) -> dict[int, float]:
+    """动量窗口 → 权重（**默认 = 模块常量** ⇒ 默认路径逐位不变）。
+
+    🔴 ``None`` ⇒ 直接返回 :data:`MOMENTUM_WEIGHTS` **本体**（不复制、不重排）
+       ⇒ 迭代顺序与浮点求和顺序都与旧口径**逐位一致**。
+    🔴 给了覆盖 ⇒ 按**传入顺序**返回（求和顺序 = 调用方给定的顺序 ⇒ 可复现）。
+    """
+    if momentum_weights is None:
+        return MOMENTUM_WEIGHTS
+    return {int(k): float(v) for k, v in momentum_weights.items()}
+
+
 def compute_features(
     close: pd.DataFrame,
     amount: pd.DataFrame | None = None,
     ma_windows: Sequence[int] = (MA_TREND_WINDOW,),
+    *,
+    momentum_weights: Mapping[int, float] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """按**全历史**向量化算特征（全部只含回看窗口 ⇒ 无未来函数）。
 
@@ -149,10 +165,14 @@ def compute_features(
     （趋势调整 ``momentum_score_trend_adj`` 恒用它 ⇒ 既有调用方行为不变）。
 
     返回 ``{"mom20","mom60","mom120","ma{w}","above_ma{w}","amount20d"}``（都是宽表）。
+
+    🔴 ``momentum_weights`` = **动量窗口的可选显式覆盖**（``None`` = 用模块常量
+       :data:`MOMENTUM_WEIGHTS` ⇒ **默认路径逐位不变**）；给了覆盖时 ``mom{w}``
+       按**覆盖里的窗口**产出（供参数邻域扰动探针用）。
     """
     px = close.astype("float64").sort_index()
     out: dict[str, pd.DataFrame] = {}
-    for win in MOMENTUM_WEIGHTS:
+    for win in _momentum_weight_set(momentum_weights):
         out[f"mom{win}"] = px / px.shift(win) - 1.0
     for win in _ma_window_set(ma_windows):
         ma = _ma_panel(px, win)
@@ -326,6 +346,8 @@ def build_targets(
     smoothing_history_span_days: int | None = None,
     # ---- 调仓栅格步长（= cadence // SIGNAL_STRIDE_N_DAYS；默认 = V1 同口径的 20 天档）----
     rebalance_signal_stride: int = C.REBALANCE_SIGNAL_STRIDE,
+    # ---- 动量窗口的**可选显式覆盖**（``None`` = 模块常量 ⇒ 默认路径逐位不变）----
+    momentum_weights: Mapping[int, float] | None = None,
 ) -> tuple[dict[str, dict[str, float]], pd.DataFrame]:
     """逐调仓日算出目标权重（**已含 Rank Buffer**）。
 
@@ -356,6 +378,10 @@ def build_targets(
        （入场 = ``above_ma{entry}``、退场 = ``ma{exit}``）；``<= 0`` 表示**不启用**该闸门。
        特征里没有对应均线 ⇒ **按需补算**（绝不退回 ``ma60``）。
 
+    🔴 **动量窗口覆盖**：``momentum_weights`` = ``{窗口: 权重}``（``None`` = 模块常量
+       :data:`MOMENTUM_WEIGHTS` ⇒ **默认路径逐位不变**）；给了覆盖时，动量分
+       ``Σ w·z(mom{w})`` 按**覆盖的窗口与权重**算（特征里必须已有对应的 ``mom{w}``）。
+
     🔴 **负分空仓保护**（2026-11-18 新增，**默认关闭**）：
        当**候选 ETF 的穿透分 E 普遍转负**（横截面统计量 ``stat`` < 0）时，
        按比例把**权益敞口**削减到现金（剩余权重 ⇒ 回测里就是现金，收益率 0）：
@@ -370,6 +396,8 @@ def build_targets(
     px = close.astype("float64").sort_index()
     scores = scores.copy()
     scores["date"] = pd.to_datetime(scores["date"]).dt.normalize()
+    # 🔴 动量窗口覆盖（``None`` ⇒ 模块常量本体 ⇒ 默认路径逐位不变）
+    mom_weights = _momentum_weight_set(momentum_weights)
 
     # ---- 均线窗口（入场 / 退场 / 趋势调整）：**不许静默退回 ma60** ----
     entry_win = int(entry_ma_window)
@@ -449,7 +477,7 @@ def build_targets(
             continue
         n_days = hist.notna().sum(axis=0)
         feats: dict[str, Any] = {}
-        for win in MOMENTUM_WEIGHTS:
+        for win in mom_weights:
             col = f"mom{win}"
             src = features[col]
             feats[col] = src.loc[src.index <= day].iloc[-1] if len(src.loc[src.index <= day]) else None
@@ -468,9 +496,8 @@ def build_targets(
             val = obj[code]
             return float(val) if np.isfinite(val) else np.nan
 
-        pool_all["mom20"] = [_row("mom20", c) for c in pool_all["code"]]
-        pool_all["mom60"] = [_row("mom60", c) for c in pool_all["code"]]
-        pool_all["mom120"] = [_row("mom120", c) for c in pool_all["code"]]
+        for win in mom_weights:
+            pool_all[f"mom{win}"] = [_row(f"mom{win}", c) for c in pool_all["code"]]
         pool_all["amount20d"] = [_row("amount20d", c) for c in pool_all["code"]]
         # 用当日收盘价与 MA 比较（严格用 <= day 的数据）
         # 🔴 2026-11-18：面板起点之前的日子已在上面 `if hist.empty: continue` 整日跳过
@@ -538,7 +565,7 @@ def build_targets(
         # ---- 分数合成（V1 同口径）----
         pool["z_alpha"] = zscore(pool["alpha_score"].fillna(pool["alpha_score"].mean()))
         z_mom = pd.Series(0.0, index=pool.index)
-        for win, w in MOMENTUM_WEIGHTS.items():
+        for win, w in mom_weights.items():
             z_mom = z_mom + w * zscore(pool[f"mom{win}"])
         pool["momentum_score"] = z_mom
         pool["momentum_score_trend_adj"] = pool["momentum_score"] * np.where(

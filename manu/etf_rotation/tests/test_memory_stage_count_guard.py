@@ -180,18 +180,41 @@ def test_m3_script_header_total_must_match(sandbox: Path) -> None:
 
 
 def test_m4_hardcoded_tool_label_must_be_flagged(sandbox: Path) -> None:
-    """M4：把动态标签改回写死的「全量闸门（26 阶段）」⇒ 必须报红。"""
+    """M4：把**活闸门**动态标签改回写死的「活闸门（V2 · 4 阶段）」⇒ 必须报红。
+
+    🔴 2026-11-27（活闸门切 V2）：编排器的闸门步现在有**两个**标签形态 ——
+    ① `活闸门（V2 · ${V2_STAGES} 阶段）`（**活闸门** = 唯一活的入口）
+    ② `V1 全量闸门（已弃用 · 归因留档 · ${GATES_STAGES} 阶段）`（**已弃用**）
+    两者都**必须**动态派生阶段数 ⇒ M4/M4b 各钉一个。
+    """
     target = sandbox / "manu" / "tools" / "server_full_pipeline_run.sh"
     text = target.read_text(encoding="utf-8")
+    anchor = 'record "活闸门（V2 · ${V2_STAGES} 阶段）"'
+    assert anchor in text, "活闸门动态标签不在编排器里 ⇒ 锚点过期（先订正锚点）"
     target.write_text(
-        text.replace(
-            'record "全量闸门（${GATES_STAGES} 阶段）"',
-            'record "全量闸门（26 阶段）"',
-        ),
+        text.replace(anchor, 'record "活闸门（V2 · 4 阶段）"'),
         encoding="utf-8",
     )
     defects = TOOL.analyze(str(sandbox))
     assert defects, "写死标签却没人报错 ⇒ 守卫没牙"
+    assert "D-标签不许写死" in _defect_checks(defects), _reasons(defects)
+
+
+def test_m4b_hardcoded_v1_label_must_be_flagged(sandbox: Path) -> None:
+    """M4b：把 **V1（已弃用）** 标签写死 ⇒ 同样必须报红（不许只护活闸门）。"""
+    target = sandbox / "manu" / "tools" / "server_full_pipeline_run.sh"
+    text = target.read_text(encoding="utf-8")
+    anchor = 'record "V1 全量闸门（已弃用 · 归因留档 · ${GATES_STAGES} 阶段）"'
+    assert anchor in text, "V1 归因留档标签不在编排器里 ⇒ 锚点过期（先订正锚点）"
+    target.write_text(
+        text.replace(
+            anchor,
+            'record "V1 全量闸门（已弃用 · 归因留档 · 28 阶段）"',
+        ),
+        encoding="utf-8",
+    )
+    defects = TOOL.analyze(str(sandbox))
+    assert defects, "写死 V1 标签却没人报错 ⇒ 守卫没牙"
     assert "D-标签不许写死" in _defect_checks(defects), _reasons(defects)
 
 

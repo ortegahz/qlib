@@ -22,7 +22,10 @@
 【组合构造约束（研究链里没有的硬约束，本模块新增）】
 * 目标资产**等权 5 份**（权益上限 80% ⇒ 每只 16%），单只标的**金额上限 6,000 元**；
 * 买卖数量**向下取整**到 100 股（手）的整数倍；
-* 调仓后**必须保留现金**：生效下限 = 「绝对下限 400 元」与「比例下限（总资产 × 20%）」**取大者**；
+* 调仓后**必须保留现金**：生效下限 = 「绝对下限 400 元」与「比例下限（总资产 × 5% 执行缓冲）」**取大者**
+  （🔴 2026-11-27 用户拍板：**20% 硬性现金底线已移除** —— 它与「规则层权益上限 80%」
+    是同一条约束的两次表达（重复约束）⇒ 下限只承担**工程容错**：整手凑整 + T+1 尾盘跳空；
+    **风控职责仍归规则层权益上限**（`config.CASH_RESERVE_RATIO` ⇒ `_EQUITY_CAP`，本链不碰））；
 * **货基碎屑过滤**：场内货基（511880/511990 单价约 100 元/份，一手需 10,000 元）
   超出单标的 6,000 元限额 ⇒ **严禁下单**，自动归入可用现金躺平。
 
@@ -520,10 +523,88 @@ def _scores_max_date(scores_path: Path) -> str | None:
     return pd.Timestamp(dates.max()).date().isoformat()
 
 
+#: 🔴 **分数版本旁挂文件**名（V2/V3 标签的**权威落点**）。
+#:    🔴 **绝不许改** ``stock_scores.fingerprint.json``
+#:       （它被 V1 md5 基线锁死 ⇒ 不能加字段）
+#:       ⇒ 版本标签**另起文件**落（不覆盖、不改写指纹）。
+SCORES_VERSION_NAME = "stock_scores.version.json"
+
 #: 🔴 **分数指纹旁挂文件**名（与 ``qlib_scores.py`` 写出的同名）。
 #:   单一事实源在 ``qlib_scores.py::SCORES_FINGERPRINT_NAME``（两边必须同名，
 #:   否则守卫会因为「读不到指纹」而永远判定为「不可增量」⇒ 白跑全量）。
 SCORES_FINGERPRINT_NAME = "stock_scores.fingerprint.json"
+
+
+def write_scores_version(
+    snapshot_dir: str | Path,
+    *,
+    model_version: str | None = None,
+    scores_file: str = "stock_scores.csv",
+    notes: list[str] | None = None,
+    now: datetime | None = None,
+) -> Path:
+    """在快照目录里**补写** ``stock_scores.version.json``（**只读指纹 · 幂等**）。
+
+    🔴 为什么另起文件：``stock_scores.fingerprint.json`` 被 **V1 md5 基线锁死**
+       （``qlib_scores.py`` 不许动）⇒ 版本标签只能**旁挂**，**不覆盖、不改写**指纹。
+
+    🔴 幂等口径（**行为确定**）：
+    * 已存在且标签**一致** ⇒ **不重写**（连 ``written_at`` 都不刷新）；
+    * 已存在且标签**不一致** ⇒ **保留首次**（不覆盖历史标签）
+      ＋ 在 ``notes`` 里**显式披露**（不静默、不覆盖）。
+    """
+    import hashlib
+
+    out_dir = Path(snapshot_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    version = str(model_version or DC.MODEL_VERSION)
+    target = out_dir / SCORES_VERSION_NAME
+    if target.is_file():
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 —— 坏标签文件 ⇒ 当作「没有标签」
+            existing = {}
+        if str(existing.get("model_version") or "") == version:
+            return target
+        if notes is not None:
+            notes.append(
+                f"🔴 快照内已有版本标签 {existing.get('model_version')!r}，"
+                f"本轮口径是 {version!r} ⇒ **保留首次标签**（不覆盖历史）"
+            )
+        return target
+    fingerprint = out_dir / SCORES_FINGERPRINT_NAME
+    source_md5 = None
+    if fingerprint.is_file():
+        source_md5 = hashlib.md5(fingerprint.read_bytes()).hexdigest()
+    payload = {
+        "model_version": version,
+        "scores_file": scores_file,
+        "source_fingerprint_md5": source_md5,
+        "written_at": (now or datetime.now().astimezone()).isoformat(timespec="seconds"),
+    }
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    if notes is not None:
+        notes.append(
+            f"ℹ️ 分数版本标签已写入：{target}（model_version={version}）"
+        )
+    return target
+
+
+def _resolve_model_version(model_version: str | None, snapshot_dir: str | Path) -> str:
+    """解析本轮**打分模型版本标签**（显式值 → 快照 manifest → 缺省值）。
+
+    🔴 回落口径：**显式传入** → **快照 manifest** → ``daily_config.MODEL_VERSION``
+       （缺省 = "V2"）。
+    🔴 老快照（manifest 没这个键）⇒ 一律按**现役口径**读（不得炸）。
+    """
+    if model_version:
+        return str(model_version)
+    version = snap_mod.manifest_model_version(Path(snapshot_dir), default=None)
+    if version:
+        return str(version)
+    return str(DC.MODEL_VERSION)
 
 
 def _scores_fingerprint(scores_path: Path) -> dict | None:
@@ -744,7 +825,8 @@ def _export_stock_prices(analysis_asof: str, notes: list[str],
 
 
 def _refresh_scores(*, scores_path: Path, notes: list[str],
-                    end_date: str | None = None) -> None:
+                    end_date: str | None = None,
+                    model_version: str | None = None) -> None:
     """重跑 S 层（**阶段 2**：全市场个股 Alpha 推断）⇒ **只写快照目录**。
 
     🔴 ``qlib_scores.py`` 的落盘是 ``scores.to_csv(out_dir/"stock_scores.csv")``
@@ -845,6 +927,10 @@ def _refresh_scores(*, scores_path: Path, notes: list[str],
     if produced_fp.is_file():
         shutil.copy2(produced_fp, scores_path.parent / SCORES_FINGERPRINT_NAME)
         notes.append(f"ℹ️ 分数指纹已写入：{scores_path.parent / SCORES_FINGERPRINT_NAME}")
+    # 🔴 2026-11-26：**版本标签**跟着分数走
+    #    ⇒ 快照目录里的 ``stock_scores.version.json`` 标着「这份分数是哪一版算的」。
+    #    🔴 不动指纹文件（它被 V1 md5 基线锁死）。
+    write_scores_version(scores_path.parent, model_version=model_version, notes=notes)
     shutil.rmtree(tmp_dir, ignore_errors=True)
     new_max = _scores_max_date(scores_path)
     after_canonical = (
@@ -1217,8 +1303,12 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
     # ---- 快照（本轮唯一产物根）--------------------------------------------
     if snapshot is None:
         snapshot = snap_mod.create_snapshot(
-            DC.SNAPSHOT_ROOT, asof=signal_date, live_trade=live_trade)
+            DC.SNAPSHOT_ROOT, asof=signal_date, live_trade=live_trade,
+            model_version=DC.MODEL_VERSION)
     run_path = Path(snapshot.path)
+    # 🔴 2026-11-26：本轮**打分模型版本标签**（"V2" 现役 / "V3" 研发）
+    #    ⇒ 从**快照对象**上取（与 manifest / 报告口径表 / 执行卡**同一个值**）。
+    model_version = str(getattr(snapshot, "model_version", None) or DC.MODEL_VERSION)
     # 🔴 2026-11-09（独立审计 P1-6）：原先这几处写死「daily_config 里的默认快照根常量」
     #    ⇒ CLI 的 ``--snapshot-root PATH`` 被**忽略** ⇒ 自定义根下
     #    「底座链」断裂（退回 canonical 一次性种子）、``--skip-llm`` 复用不到上一轮决策。
@@ -1326,6 +1416,7 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
         asof=signal_date, prices_csv=prices_csv, account=account_summary, notes=notes)
 
     # ---- 阶段 2：S 层（底座链式 ⇒ 增量重算 ⇒ 只落快照）---------------------
+    refreshed = bool(refresh_scores)
     if not scores_path.exists():
         base_path, base_note = snap_mod.resolve_scores_base(
             snap_root, DC.STOCK_SCORES_CSV, exclude=run_path, asof=signal_date)
@@ -1349,9 +1440,29 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
                     "⚠️ 底座**没有模型指纹**旁挂文件（老底座）⇒ 本轮会**整段重算**"
                     "（指纹对不上 ⇒ 不许把两套模型的分数拼在一起）"
                 )
-    refreshed = bool(refresh_scores)
+            # 🔴 2026-11-26：**版本标签**跟着分数走（底座是上一份快照的分数 ⇒ 标签也是那一份的）
+            base_version_src = base_path.parent / SCORES_VERSION_NAME
+            base_version = None
+            if base_version_src.is_file():
+                try:
+                    raw_version = json.loads(base_version_src.read_text(encoding="utf-8"))
+                    base_version = str(raw_version.get("model_version") or "")
+                except Exception:  # noqa: BLE001 —— 坏标签文件 ⇒ 当作「没有标签」
+                    base_version = None
+            if base_version and base_version != model_version and not refreshed:
+                # 🔴 本轮**不重跑 S 层** ⇒ 分数仍是底座那一版
+                #    ⇒ 标签**跟着底座走**（不覆盖、不写成本轮口径）。
+                shutil.copy2(base_version_src, scores_path.parent / SCORES_VERSION_NAME)
+                notes.append(
+                    f"ℹ️ 底座**版本标签**已一并拷贝：{scores_path.parent / SCORES_VERSION_NAME}"
+                    f"（model_version={base_version}；🔴 与本轮 {model_version} 不同"
+                    " ⇒ 本轮**未重跑 S 层** ⇒ 分数仍是底座那一版）"
+                )
+            else:
+                write_scores_version(scores_path.parent, model_version=model_version, notes=notes)
     if refreshed:
-        _refresh_scores(scores_path=scores_path, notes=notes, end_date=signal_date)
+        _refresh_scores(scores_path=scores_path, notes=notes, end_date=signal_date,
+                         model_version=model_version)
 
     analysis = _resolve_analysis_asof(
         signal_date=signal_date, scores_path=scores_path, calendar_path=calendar_path)
@@ -1628,7 +1739,8 @@ def run_pipeline(*, asof: object = None, snapshot: Any = None,
     )
 
     # ---- 执行卡落盘（🔴 审计用：信号日决策必须留一份**可复查**的执行卡） ----
-    card_path = persist_execution_card(card, run_path, signal_date)
+    card_path = persist_execution_card(card, run_path, signal_date,
+                                       model_version=model_version)
     notes.append(f"✅ 执行卡片已落盘：{card_path}")
 
     return {
@@ -1823,15 +1935,19 @@ def _aggregate_cash(orders: list[dict]) -> dict[str, float]:
 
 
 def persist_execution_card(
-    card: dict, run_path: str | Path, signal_date: str
+    card: dict, run_path: str | Path, signal_date: str,
+    *, model_version: str | None = None,
 ) -> Path:
     """把执行卡落盘 ⇒ `<run_path>/execution_card_<YYYYMMDD>.json`。
 
     🔴 **审计用**：信号日的执行卡必须留一份**可复查**的产物 —— 邮件正文会被
     排版吃掉，原始结构化决策才有追溯价值。
+    🔴 2026-11-26：执行卡原本**完全无版本字段** ⇒ 事后分不清「这张卡是哪一版算的」
+       ⇒ 卡里**必须带 ``model_version``**（取值：显式传入 → 快照 manifest → ``daily_config.MODEL_VERSION``）。
     """
     out_dir = Path(run_path)
     out_dir.mkdir(parents=True, exist_ok=True)
+    card["model_version"] = _resolve_model_version(model_version, out_dir)
     path = out_dir / f"execution_card_{str(signal_date).replace('-', '')}.json"
     path.write_text(
         json.dumps(card, ensure_ascii=False, indent=2, default=str),
@@ -1928,23 +2044,35 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         market_value = total_assets - cash
 
     # 🔴 2026-11-10：**生效的现金下限** = 「绝对下限」与「比例下限」**取大者**
-    #    （比例下限 = 总资产 × 现金预留比例 ⇒ 权益上限 = 1 - 预留比例 = 80%）。
-    #    旧口径只看绝对 200 元 ⇒ 允许权益配到 100%（不留现金）⇒ 与规则层不一致。
-    reserve_req = (total_assets * float(DC.CASH_RESERVE_RATIO)) if total_assets else None
+    # 🔴 2026-11-27（用户拍板）：比例下限的**比例**由「现金预留比例 20%」改成
+    #    **执行缓冲比例 5%**（`DC.EXECUTION_BUFFER_RATIO`）。
+    #    【为什么】旧口径把「总资产 × 20%」当**硬性现金底线** ⇒ 与**规则层权益上限**
+    #    （= 1 − 20% = 80%；单一事实源 `config.CASH_RESERVE_RATIO` ⇒ `_EQUITY_CAP`）
+    #    **重复约束**（同一个比例被缩放两次）；且在「生效权益上限 ≤ 35%」时（现金 ≥ 65%）
+    #    **完全被遮蔽** ⇒ 纯死代码，却平白锁死 6,092.86 元可用资金（3 万体量下更易撞
+    #    5 元最低佣金）。⇒ 现在下限只承担**工程容错**（整手凑整 + T+1 尾盘跳空）；
+    #    **风控职责仍归规则层权益上限**（本链不碰）。
+    #: 执行缓冲比例下限（**唯一被强制**的现金下限）
+    reserve_req = (total_assets * float(DC.EXECUTION_BUFFER_RATIO)) if total_assets else None
     buf_min_eff = max(buf_min, reserve_req) if reserve_req is not None else buf_min
+    #: 🔴 2026-11-27：规则层权益预算派生的**现金预留**（20%）—— 只作**披露 + 告警**，
+    #:    **不再**由每日链强制（强制下限 = 上面的执行缓冲）。
+    rule_reserve_req = (
+        (total_assets * float(DC.CASH_RESERVE_RATIO)) if total_assets else None
+    )
     #: 生效下限的**可读说明**（绝对下限 vs 比例下限）⇒ 告警文案里必须能看出是哪一个在起作用
     if reserve_req is None:
         buf_min_note = f"绝对下限 {buf_min:.2f} 元（账户缺 total_assets ⇒ 比例下限不参与）"
     elif reserve_req > buf_min:
         buf_min_note = (
             f"生效下限 {buf_min_eff:.2f} 元"
-            f"（比例下限 {reserve_req:.2f} 元 = 总资产 × {DC.CASH_RESERVE_RATIO:.0%}"
+            f"（执行缓冲比例下限 {reserve_req:.2f} 元 = 总资产 × {DC.EXECUTION_BUFFER_RATIO:.0%}"
             f" > 绝对下限 {buf_min:.2f} 元 ⇒ 取比例下限）"
         )
     else:
         buf_min_note = (
             f"生效下限 {buf_min_eff:.2f} 元"
-            f"（绝对下限 {buf_min:.2f} 元 ≥ 比例下限 {reserve_req:.2f} 元 ⇒ 取绝对下限）"
+            f"（绝对下限 {buf_min:.2f} 元 ≥ 执行缓冲比例下限 {reserve_req:.2f} 元 ⇒ 取绝对下限）"
         )
 
     orders: list[dict] = []
@@ -2277,9 +2405,11 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
         if cash_end > buf_max + 1e-9:
             # 🔴 2026-11-10：现金里**有一部分是规则要求的预留**（不是「多余资金」）
             #    ⇒ 告警必须把这两部分分开说，否则每张卡都在报假警。
+            # 🔴 2026-11-27：口径随「执行缓冲」改写 —— 这里引用的是**执行缓冲**（5%）；
+            #    20% 已降级为**规则层披露**，不再是被强制的下限。
             _reserve_note = (
-                f"｜其中现金预留 {reserve_req:.2f} 元"
-                f"（总资产 × {DC.CASH_RESERVE_RATIO:.0%}）是**规则要求**，不属于多余资金"
+                f"｜其中执行缓冲 {reserve_req:.2f} 元"
+                f"（总资产 × {DC.EXECUTION_BUFFER_RATIO:.0%}）是**执行容错要求**，不属于多余资金"
                 if (reserve_req is not None and cash_end >= reserve_req - 1e-9) else ""
             )
             warnings.append(
@@ -2408,6 +2538,18 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
                     warnings.append(text)
 
     cash_end_value = _f(cash_flow.get("cash_end"))
+    # 🔴 2026-11-27：20% 硬性现金底线已移除 ⇒ 「规则层权益上限隐含的 20% 预留」若被击穿，
+    #    **必须显式告警**（否则等于把风控线静默降级成一张披露表）。
+    if (
+        cash_end_value is not None
+        and rule_reserve_req is not None
+        and cash_end_value < rule_reserve_req - 1e-9
+    ):
+        warnings.append(
+            f"🔴 调仓后现金 {cash_end_value:.2f} 元 < 规则层权益上限隐含的预留 "
+            f"{rule_reserve_req:.2f} 元（总资产 × {DC.CASH_RESERVE_RATIO:.0%}）"
+            f" ⇒ **权益超配**（每日链不再强制该线 ⇒ 由规则层/交付闸门判红）"
+        )
     card = {
         "asof": run_paths.normalize_date(asof),
         "execution_date": run_paths.normalize_date(execution_date),
@@ -2433,9 +2575,22 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
                 cash_end_value >= buf_min_eff - 1e-9 if cash_end_value is not None else None
             ),
             # 🔴 2026-11-10：现金**预留**口径（比例 / 比例下限金额 / 是否达标）
+            # 🔴 2026-11-27：这里的 20% **降级为「规则层权益预算的镜像披露」**（不再被强制）；
+            #    真正被强制的是下面的**执行缓冲**（5%）。**数值口径与旧版一致**（同一条 20%）。
             "cash_reserve_ratio": float(DC.CASH_RESERVE_RATIO),
-            "cash_reserve_required": (round(reserve_req, 2) if reserve_req is not None else None),
+            "cash_reserve_required": (
+                round(rule_reserve_req, 2) if rule_reserve_req is not None else None
+            ),
             "cash_reserve_ok": (
+                cash_end_value >= rule_reserve_req - 1e-9
+                if (cash_end_value is not None and rule_reserve_req is not None) else None
+            ),
+            # 🔴 2026-11-27（用户拍板）：**执行缓冲**口径（每日链**唯一被强制**的现金下限）
+            "execution_buffer_ratio": float(DC.EXECUTION_BUFFER_RATIO),
+            "execution_buffer_required": (
+                round(reserve_req, 2) if reserve_req is not None else None
+            ),
+            "execution_buffer_ok": (
                 cash_end_value >= reserve_req - 1e-9
                 if (cash_end_value is not None and reserve_req is not None) else None
             ),
@@ -2450,8 +2605,11 @@ def build_execution_card(*, actions: list[dict] | None = None, account: Any = No
             "cash_buffer_min": buf_min,
             "cash_buffer_max": buf_max,
             # 🔴 2026-11-10：**生效下限**（绝对 vs 比例取大者）+ 现金预留比例
+            # 🔴 2026-11-27：生效下限的**比例**由 20% 改成 **执行缓冲 5%**
+            #    （本账户 6,092.86 元 ⇒ **1,523.21 元**）⇒ 20% 硬性现金底线**已移除**。
             "cash_buffer_min_eff": buf_min_eff,
             "cash_reserve_ratio": float(DC.CASH_RESERVE_RATIO),
+            "execution_buffer_ratio": float(DC.EXECUTION_BUFFER_RATIO),
             "commission_rate": float(DC.COMMISSION_RATE),
             "min_commission": float(DC.MIN_COMMISSION),
             "stamp_duty_rate": float(DC.STAMP_DUTY_RATE),
